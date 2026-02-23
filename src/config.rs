@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use rand::seq::IndexedRandom;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// ~/.siki/ ディレクトリのパスを返す
@@ -34,27 +35,27 @@ pub fn ensure_dirs() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     pub siki: SikiConfig,
     pub projects: Vec<ProjectConfig>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct SikiConfig {
     pub shell: Option<String>,
     #[serde(default)]
     pub shared_dirs: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct ProjectConfig {
     pub name: String,
     pub path: String,
     pub worktrees: Vec<WorktreeConfig>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct WorktreeConfig {
     pub name: String,
     pub branch: String,
@@ -75,6 +76,121 @@ pub fn load_config(path: &Path) -> Result<Config> {
 /// TOML 文字列から設定をパースする
 pub fn parse_config(content: &str) -> Result<Config> {
     toml::from_str(content).context("設定ファイルのパースに失敗しました")
+}
+
+/// 設定をファイルに保存する
+pub fn save_config(path: &Path, config: &Config) -> Result<()> {
+    let content =
+        toml::to_string_pretty(config).context("設定のシリアライズに失敗しました")?;
+    std::fs::write(path, content)
+        .with_context(|| format!("設定ファイルの保存に失敗: {}", path.display()))?;
+    Ok(())
+}
+
+const CITY_NAMES: &[&str] = &[
+    "amsterdam",
+    "athens",
+    "baghdad",
+    "bangkok",
+    "barcelona",
+    "beijing",
+    "belgrade",
+    "berlin",
+    "bogota",
+    "bratislava",
+    "brussels",
+    "bucharest",
+    "budapest",
+    "buenos-aires",
+    "cairo",
+    "cape-town",
+    "caracas",
+    "chicago",
+    "copenhagen",
+    "dakar",
+    "delhi",
+    "dhaka",
+    "dublin",
+    "durban",
+    "edinburgh",
+    "florence",
+    "geneva",
+    "hanoi",
+    "havana",
+    "helsinki",
+    "ho-chi-minh",
+    "hong-kong",
+    "istanbul",
+    "jakarta",
+    "jerusalem",
+    "johannesburg",
+    "karachi",
+    "kathmandu",
+    "kuala-lumpur",
+    "kyoto",
+    "lagos",
+    "lima",
+    "lisbon",
+    "london",
+    "madrid",
+    "manila",
+    "marrakech",
+    "melbourne",
+    "mexico-city",
+    "milan",
+    "montreal",
+    "moscow",
+    "mumbai",
+    "munich",
+    "nairobi",
+    "new-york",
+    "osaka",
+    "oslo",
+    "ottawa",
+    "paris",
+    "prague",
+    "quito",
+    "reykjavik",
+    "rio-de-janeiro",
+    "rome",
+    "santiago",
+    "sao-paulo",
+    "sarajevo",
+    "seoul",
+    "shanghai",
+    "singapore",
+    "stockholm",
+    "sydney",
+    "taipei",
+    "tallinn",
+    "tehran",
+    "tokyo",
+    "toronto",
+    "vancouver",
+    "vienna",
+    "warsaw",
+    "washington",
+    "wellington",
+    "zurich",
+];
+
+/// 既存の worktree 名と重複しないランダムな都市名を生成する
+pub fn generate_worktree_name(existing_names: &[String]) -> String {
+    let mut rng = rand::rng();
+    let available: Vec<&str> = CITY_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !existing_names.iter().any(|e| e == name))
+        .collect();
+
+    if let Some(&name) = available.choose(&mut rng) {
+        name.to_string()
+    } else {
+        // 全都市名が使用済みの場合はサフィックス付きで生成
+        let base = CITY_NAMES.choose(&mut rng).unwrap_or(&"worktree");
+        let suffix: u16 = rand::random_range(100..999);
+        format!("{}-{}", base, suffix)
+    }
 }
 
 /// ユーザーのデフォルトシェルを検出する
@@ -285,5 +401,68 @@ worktrees = [
         let path = default_config_path();
         assert!(path.starts_with(siki_home()));
         assert!(path.ends_with("config.toml"));
+    }
+
+    #[test]
+    fn test_generate_worktree_name_no_conflicts() {
+        let name = generate_worktree_name(&[]);
+        assert!(!name.is_empty());
+        assert!(CITY_NAMES.contains(&name.as_str()));
+    }
+
+    #[test]
+    fn test_generate_worktree_name_avoids_existing() {
+        let existing = vec!["tokyo".to_string(), "osaka".to_string()];
+        for _ in 0..20 {
+            let name = generate_worktree_name(&existing);
+            assert_ne!(name, "tokyo");
+            assert_ne!(name, "osaka");
+        }
+    }
+
+    #[test]
+    fn test_generate_worktree_name_all_used() {
+        let existing: Vec<String> = CITY_NAMES.iter().map(|s| s.to_string()).collect();
+        let name = generate_worktree_name(&existing);
+        // サフィックス付きの名前が生成される
+        assert!(name.contains('-'));
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn test_save_config_roundtrip() {
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/zsh".to_string()),
+                shared_dirs: vec!["node_modules".to_string()],
+            },
+            projects: vec![ProjectConfig {
+                name: "myproject".to_string(),
+                path: "/tmp/myproject".to_string(),
+                worktrees: vec![WorktreeConfig {
+                    name: "tokyo".to_string(),
+                    branch: "feature/auth".to_string(),
+                }],
+            }],
+        };
+
+        let tmpfile = NamedTempFile::new().unwrap();
+        save_config(tmpfile.path(), &config).unwrap();
+
+        let loaded = load_config(tmpfile.path()).unwrap();
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn test_save_config_invalid_path() {
+        let config = Config {
+            siki: SikiConfig {
+                shell: None,
+                shared_dirs: vec![],
+            },
+            projects: vec![],
+        };
+        let result = save_config(Path::new("/nonexistent/dir/config.toml"), &config);
+        assert!(result.is_err());
     }
 }

@@ -105,6 +105,12 @@ pub struct App {
     pub show_help: bool,
     pub show_message_popup: bool,
     pub popup_input: String,
+    pub show_add_worktree_popup: bool,
+    pub add_worktree_input: String,
+    pub add_worktree_project_index: usize,
+    pub add_worktree_name: String,
+    pub show_add_project_popup: bool,
+    pub add_project_input: String,
     pub running: bool,
 }
 
@@ -126,6 +132,12 @@ impl App {
             show_help: false,
             show_message_popup: false,
             popup_input: String::new(),
+            show_add_worktree_popup: false,
+            add_worktree_input: String::new(),
+            add_worktree_project_index: 0,
+            add_worktree_name: String::new(),
+            show_add_project_popup: false,
+            add_project_input: String::new(),
             running: true,
         }
     }

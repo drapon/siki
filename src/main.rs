@@ -153,6 +153,14 @@ async fn handle_event(
                 handle_popup_key(app, sessions, event_tx, key).await;
                 return;
             }
+            if app.show_add_worktree_popup {
+                handle_add_worktree_popup_key(app, key);
+                return;
+            }
+            if app.show_add_project_popup {
+                handle_add_project_popup_key(app, key);
+                return;
+            }
 
             // Terminal パネルフォーカス中は特別処理
             if app.focused_panel == app::Panel::Terminal {
@@ -235,7 +243,7 @@ async fn handle_event(
         AppEvent::Mouse(mouse) => {
             use crossterm::event::MouseEventKind;
             // ポップアップ表示中はマウスクリック無視
-            if app.show_help || app.show_message_popup {
+            if app.show_help || app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup {
                 return;
             }
             if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind {
@@ -296,6 +304,157 @@ async fn handle_popup_key(
             app.popup_input.pop();
         }
         _ => {}
+    }
+}
+
+fn handle_add_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Esc => {
+            app.show_add_project_popup = false;
+            app.add_project_input.clear();
+        }
+        KeyCode::Enter => {
+            let path_str = app.add_project_input.trim().to_string();
+            if path_str.is_empty() {
+                return;
+            }
+
+            let path = std::path::PathBuf::from(&path_str);
+            if !path.is_dir() {
+                app.show_error(format!("ディレクトリが存在しません: {}", path_str));
+                app.show_add_project_popup = false;
+                app.add_project_input.clear();
+                return;
+            }
+
+            // ディレクトリ名からプロジェクト名を自動生成
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_str.clone());
+
+            // 重複チェック
+            if app.projects.iter().any(|p| p.name == name) {
+                app.show_error(format!("同名のプロジェクトが既に存在します: {}", name));
+                app.show_add_project_popup = false;
+                app.add_project_input.clear();
+                return;
+            }
+
+            app.projects.push(app::Project {
+                name: name.clone(),
+                path,
+                worktrees: Vec::new(),
+                collapsed: false,
+            });
+
+            // config.toml に保存
+            let config_path = config::default_config_path();
+            let config = build_config_from_app(app);
+            if let Err(e) = config::save_config(&config_path, &config) {
+                app.show_error(format!("設定の保存に失敗: {}", e));
+            } else {
+                app.show_info(format!("プロジェクト追加完了: {}", name));
+            }
+
+            app.show_add_project_popup = false;
+            app.add_project_input.clear();
+        }
+        KeyCode::Char(c) => {
+            app.add_project_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.add_project_input.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_add_worktree_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Esc => {
+            app.show_add_worktree_popup = false;
+            app.add_worktree_input.clear();
+        }
+        KeyCode::Enter => {
+            let branch = app.add_worktree_input.trim().to_string();
+            if branch.is_empty() {
+                return;
+            }
+            let pi = app.add_worktree_project_index;
+            let wt_name = app.add_worktree_name.clone();
+
+            // メモリ上に worktree を追加
+            let project_name = app.projects[pi].name.clone();
+            app.projects[pi].worktrees.push(app::Worktree {
+                name: wt_name.clone(),
+                branch: branch.clone(),
+                path: config::worktree_path(&project_name, &wt_name),
+                status: app::WorktreeStatus::Idle,
+                chat_history: Vec::new(),
+                open_files: Vec::new(),
+                active_tab: 0,
+                claude_tabs: 0,
+                right_panel_mode: app::RightPanelMode::Tree,
+                active_terminal: 0,
+                chat_scroll_offset: 0,
+            });
+
+            // config.toml に保存
+            let config_path = config::default_config_path();
+            let config = build_config_from_app(app);
+            if let Err(e) = config::save_config(&config_path, &config) {
+                app.show_error(format!("設定の保存に失敗: {}", e));
+            } else {
+                app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
+            }
+
+            app.show_add_worktree_popup = false;
+            app.add_worktree_input.clear();
+        }
+        KeyCode::Char(c) => {
+            app.add_worktree_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.add_worktree_input.pop();
+        }
+        _ => {}
+    }
+}
+
+/// App の現在の状態から Config を構築する（既存の siki 設定を保持）
+fn build_config_from_app(app: &app::App) -> config::Config {
+    // 既存の設定ファイルから siki セクションを読み込み保持する
+    let config_path = config::default_config_path();
+    let siki = config::load_config(&config_path)
+        .map(|c| c.siki)
+        .unwrap_or(config::SikiConfig {
+            shell: None,
+            shared_dirs: vec![],
+        });
+
+    config::Config {
+        siki,
+        projects: app
+            .projects
+            .iter()
+            .map(|p| config::ProjectConfig {
+                name: p.name.clone(),
+                path: p.path.to_string_lossy().to_string(),
+                worktrees: p
+                    .worktrees
+                    .iter()
+                    .map(|wt| config::WorktreeConfig {
+                        name: wt.name.clone(),
+                        branch: wt.branch.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -462,6 +621,36 @@ fn handle_left_panel_key(
             left_panel.toggle_collapse(app, &entries);
             let new_entries = LeftPanel::build_entries(&app.projects);
             left_panel.clamp_cursor(new_entries.len());
+        }
+        KeyCode::Char('a') => {
+            // カーソル位置からプロジェクトインデックスを特定
+            let project_index = match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
+                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => {
+                    Some(*project_index)
+                }
+                None => None,
+            };
+            if let Some(pi) = project_index {
+                // 既存 worktree 名を収集して重複しない都市名を生成
+                let existing_names: Vec<String> = app.projects[pi]
+                    .worktrees
+                    .iter()
+                    .map(|wt| wt.name.clone())
+                    .collect();
+                let city_name = config::generate_worktree_name(&existing_names);
+                app.add_worktree_project_index = pi;
+                app.add_worktree_name = city_name;
+                app.add_worktree_input.clear();
+                app.show_add_worktree_popup = true;
+            }
+        }
+        KeyCode::Char('A') => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            app.add_project_input = cwd;
+            app.show_add_project_popup = true;
         }
         KeyCode::Enter => {
             if let Some(wt_id) = left_panel.select_worktree(&entries) {
@@ -1533,6 +1722,512 @@ mod tests {
         .await;
         // ポップアップ表示中はフォーカス変わらない
         assert_eq!(app.focused_panel, app::Panel::Left);
+    }
+
+    // --- Worktree 追加ポップアップのテスト ---
+
+    #[tokio::test]
+    async fn test_a_key_opens_add_worktree_popup_on_project() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // カーソルはプロジェクト行 (index 0)
+        assert!(!app.show_add_worktree_popup);
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('a'))),
+            None,
+        )
+        .await;
+        assert!(app.show_add_worktree_popup);
+        assert_eq!(app.add_worktree_project_index, 0);
+        assert!(!app.add_worktree_name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_key_opens_add_worktree_popup_on_worktree() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // カーソルを worktree 行に移動
+        left_panel.cursor_index = 1;
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('a'))),
+            None,
+        )
+        .await;
+        assert!(app.show_add_worktree_popup);
+        assert_eq!(app.add_worktree_project_index, 0);
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_esc_cancels() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_input = "feature/test".to_string();
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Esc)),
+            None,
+        )
+        .await;
+        assert!(!app.show_add_worktree_popup);
+        assert!(app.add_worktree_input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_char_input() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        for c in "abc".chars() {
+            handle_event(
+                &mut app,
+                &mut left_panel,
+                &mut source_tree,
+                &mut diff_view,
+                &mut sessions,
+                &mut terminals,
+                &mut claude_terms,
+                &tx,
+                "/bin/sh",
+                event::AppEvent::Key(key(KeyCode::Char(c))),
+                None,
+            )
+            .await;
+        }
+        assert_eq!(app.add_worktree_input, "abc");
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_backspace() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_input = "ab".to_string();
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Backspace)),
+            None,
+        )
+        .await;
+        assert_eq!(app.add_worktree_input, "a");
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_enter_empty_branch_does_nothing() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_input.clear();
+        let worktree_count = app.projects[0].worktrees.len();
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+        )
+        .await;
+        // ポップアップは閉じず、worktree も追加されない
+        assert!(app.show_add_worktree_popup);
+        assert_eq!(app.projects[0].worktrees.len(), worktree_count);
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_blocks_global_keys() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        // ポップアップ中に q を押してもアプリは終了しない
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('q'))),
+            None,
+        )
+        .await;
+        assert!(app.running);
+        assert_eq!(app.add_worktree_input, "q");
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_enter_adds_worktree() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_project_index = 0;
+        app.add_worktree_name = "tokyo".to_string();
+        app.add_worktree_input = "feature/auth".to_string();
+        let initial_count = app.projects[0].worktrees.len();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+        )
+        .await;
+
+        assert!(!app.show_add_worktree_popup);
+        assert_eq!(app.projects[0].worktrees.len(), initial_count + 1);
+        let new_wt = app.projects[0].worktrees.last().unwrap();
+        assert_eq!(new_wt.name, "tokyo");
+        assert_eq!(new_wt.branch, "feature/auth");
+        assert_eq!(new_wt.status, app::WorktreeStatus::Idle);
+    }
+
+    // --- プロジェクト追加ポップアップのテスト ---
+
+    #[tokio::test]
+    async fn test_shift_a_opens_add_project_popup() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(!app.show_add_project_popup);
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('A'))),
+            None,
+        )
+        .await;
+        assert!(app.show_add_project_popup);
+        // カレントディレクトリが初期値として入る
+        assert!(!app.add_project_input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_project_popup_esc_cancels() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_project_popup = true;
+        app.add_project_input = "/tmp/test".to_string();
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Esc)),
+            None,
+        )
+        .await;
+        assert!(!app.show_add_project_popup);
+        assert!(app.add_project_input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_project_popup_char_input() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_project_popup = true;
+        for c in "/tmp".chars() {
+            handle_event(
+                &mut app,
+                &mut left_panel,
+                &mut source_tree,
+                &mut diff_view,
+                &mut sessions,
+                &mut terminals,
+                &mut claude_terms,
+                &tx,
+                "/bin/sh",
+                event::AppEvent::Key(key(KeyCode::Char(c))),
+                None,
+            )
+            .await;
+        }
+        assert_eq!(app.add_project_input, "/tmp");
+    }
+
+    #[tokio::test]
+    async fn test_add_project_popup_enter_empty_does_nothing() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_project_popup = true;
+        app.add_project_input.clear();
+        let project_count = app.projects.len();
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+        )
+        .await;
+        assert!(app.show_add_project_popup);
+        assert_eq!(app.projects.len(), project_count);
+    }
+
+    #[tokio::test]
+    async fn test_add_project_popup_enter_nonexistent_path_shows_error() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_project_popup = true;
+        app.add_project_input = "/nonexistent/path/12345".to_string();
+        let project_count = app.projects.len();
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+        )
+        .await;
+        assert!(!app.show_add_project_popup);
+        assert_eq!(app.projects.len(), project_count);
+        assert!(app.status_message.is_some());
+        assert_eq!(
+            app.status_message.as_ref().unwrap().level,
+            app::StatusLevel::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_project_popup_enter_valid_path_adds_project() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // /tmp は実在するディレクトリ
+        app.show_add_project_popup = true;
+        app.add_project_input = "/tmp".to_string();
+        let initial_count = app.projects.len();
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+        )
+        .await;
+        assert!(!app.show_add_project_popup);
+        assert_eq!(app.projects.len(), initial_count + 1);
+        let new_project = app.projects.last().unwrap();
+        assert_eq!(new_project.name, "tmp");
+        assert!(new_project.worktrees.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_project_popup_blocks_global_keys() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_project_popup = true;
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('q'))),
+            None,
+        )
+        .await;
+        assert!(app.running);
+        assert_eq!(app.add_project_input, "q");
     }
 
     #[tokio::test]

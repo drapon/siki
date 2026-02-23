@@ -73,6 +73,16 @@ pub fn render(
         render_message_popup(frame, app);
     }
 
+    // Worktree 追加ポップアップ
+    if app.show_add_worktree_popup {
+        render_add_worktree_popup(frame, app);
+    }
+
+    // プロジェクト追加ポップアップ
+    if app.show_add_project_popup {
+        render_add_project_popup(frame, app);
+    }
+
     areas
 }
 
@@ -102,6 +112,8 @@ fn render_help_popup(frame: &mut Frame) {
         "  k/↑      : カーソル上",
         "  Space    : 折りたたみ/展開",
         "  Enter    : worktree 選択",
+        "  a        : worktree 追加",
+        "  A        : プロジェクト追加",
         "",
         "[中央パネル]",
         "  Tab      : 次のタブ",
@@ -150,6 +162,49 @@ fn render_message_popup(frame: &mut Frame, app: &App) {
 
     let input_text = format!("{}_", app.popup_input);
     let paragraph = Paragraph::new(input_text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_add_project_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 30, frame.area());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("プロジェクト追加")
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let text = format!(
+        "\n  パス: {}_\n\n  Enter: 追加  Esc: キャンセル",
+        app.add_project_input,
+    );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 30, frame.area());
+    let project_name = app
+        .projects
+        .get(app.add_worktree_project_index)
+        .map(|p| p.name.as_str())
+        .unwrap_or("???");
+
+    let title = format!("Worktree 追加: {}", project_name);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let text = format!(
+        "\n  名前: {}\n  ブランチ: {}_\n\n  Enter: 追加  Esc: キャンセル",
+        app.add_worktree_name, app.add_worktree_input,
+    );
+    let paragraph = Paragraph::new(text).block(block);
 
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
