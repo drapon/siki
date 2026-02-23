@@ -1,0 +1,858 @@
+use crate::config::{self, Config, ProjectConfig};
+use crate::event::ClaudeStreamEvent;
+use chrono::{DateTime, Utc};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// Worktree の識別子 (project_index, worktree_index)
+pub type WorktreeId = (usize, usize);
+
+/// パネルフォーカス
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Left,
+    Main,
+    Right,
+    Terminal,
+}
+
+/// Worktree のステータス
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeStatus {
+    Idle,
+    Running,
+    Done,
+}
+
+/// 右パネル上部のモード
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightPanelMode {
+    Tree,
+    Diff,
+}
+
+/// チャットメッセージのロール
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+/// チャットメッセージ
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// 開いているファイル
+#[derive(Debug, Clone)]
+pub struct OpenFile {
+    pub path: PathBuf,
+    pub content: String,
+    pub scroll_offset: usize,
+}
+
+/// ステータスメッセージのレベル
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusLevel {
+    Info,
+    Error,
+}
+
+/// ステータスメッセージ
+#[derive(Debug, Clone)]
+pub struct StatusMessage {
+    pub text: String,
+    pub level: StatusLevel,
+}
+
+/// Worktree の状態
+#[derive(Debug)]
+pub struct Worktree {
+    pub name: String,
+    pub branch: String,
+    pub path: PathBuf,
+    pub status: WorktreeStatus,
+    pub chat_history: Vec<ChatMessage>,
+    pub open_files: Vec<OpenFile>,
+    pub active_tab: usize,
+    /// 起動中の Claude Code タブ数（タブ 0..claude_tabs-1 が Claude）
+    pub claude_tabs: usize,
+    pub right_panel_mode: RightPanelMode,
+    pub active_terminal: usize,
+    pub chat_scroll_offset: usize,
+}
+
+/// プロジェクトの状態
+#[derive(Debug)]
+pub struct Project {
+    pub name: String,
+    pub path: PathBuf,
+    pub worktrees: Vec<Worktree>,
+    pub collapsed: bool,
+}
+
+/// アプリケーション全体の状態
+#[derive(Debug)]
+pub struct App {
+    pub projects: Vec<Project>,
+    pub selected_worktree: Option<WorktreeId>,
+    pub focused_panel: Panel,
+    pub status_message: Option<StatusMessage>,
+    pub status_set_at: Option<Instant>,
+    pub show_help: bool,
+    pub show_message_popup: bool,
+    pub popup_input: String,
+    pub running: bool,
+}
+
+impl App {
+    /// Config から App の初期状態を構築する
+    pub fn new(config: &Config) -> Self {
+        let projects = config
+            .projects
+            .iter()
+            .map(|pc| Project::from_config(pc))
+            .collect();
+
+        Self {
+            projects,
+            selected_worktree: None,
+            focused_panel: Panel::Left,
+            status_message: None,
+            status_set_at: None,
+            show_help: false,
+            show_message_popup: false,
+            popup_input: String::new(),
+            running: true,
+        }
+    }
+
+    /// フォーカスを次のパネルに切り替える
+    ///
+    /// Left → Main → Right → Terminal → Left の順で循環する。
+    pub fn cycle_focus(&mut self, reverse: bool) {
+        self.focused_panel = if reverse {
+            match self.focused_panel {
+                Panel::Left => Panel::Terminal,
+                Panel::Main => Panel::Left,
+                Panel::Right => Panel::Main,
+                Panel::Terminal => Panel::Right,
+            }
+        } else {
+            match self.focused_panel {
+                Panel::Left => Panel::Main,
+                Panel::Main => Panel::Right,
+                Panel::Right => Panel::Terminal,
+                Panel::Terminal => Panel::Left,
+            }
+        };
+    }
+
+    /// 選択中の worktree への参照を取得
+    pub fn selected_worktree(&self) -> Option<&Worktree> {
+        let (pi, wi) = self.selected_worktree?;
+        self.projects.get(pi)?.worktrees.get(wi)
+    }
+
+    /// 選択中の worktree への可変参照を取得
+    pub fn selected_worktree_mut(&mut self) -> Option<&mut Worktree> {
+        let (pi, wi) = self.selected_worktree?;
+        self.projects.get_mut(pi)?.worktrees.get_mut(wi)
+    }
+
+    /// ステータスメッセージの自動クリア時間
+    const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// ステータスバーにエラーメッセージを表示
+    pub fn show_error(&mut self, message: String) {
+        self.status_message = Some(StatusMessage {
+            text: message,
+            level: StatusLevel::Error,
+        });
+        self.status_set_at = Some(Instant::now());
+    }
+
+    /// ステータスバーに情報メッセージを表示
+    pub fn show_info(&mut self, message: String) {
+        self.status_message = Some(StatusMessage {
+            text: message,
+            level: StatusLevel::Info,
+        });
+        self.status_set_at = Some(Instant::now());
+    }
+
+    /// タイムアウト経過済みのステータスメッセージをクリアする
+    ///
+    /// Tick イベントから呼ばれ、設定時刻から STATUS_TIMEOUT 経過していれば消去する。
+    pub fn clear_expired_status(&mut self) {
+        if let Some(set_at) = self.status_set_at {
+            if set_at.elapsed() >= Self::STATUS_TIMEOUT {
+                self.status_message = None;
+                self.status_set_at = None;
+            }
+        }
+    }
+
+    /// WorktreeId で worktree を取得する
+    pub fn worktree_by_id(&self, id: WorktreeId) -> Option<&Worktree> {
+        let (pi, wi) = id;
+        self.projects.get(pi)?.worktrees.get(wi)
+    }
+
+    /// WorktreeId で worktree の可変参照を取得する
+    pub fn worktree_by_id_mut(&mut self, id: WorktreeId) -> Option<&mut Worktree> {
+        let (pi, wi) = id;
+        self.projects.get_mut(pi)?.worktrees.get_mut(wi)
+    }
+
+    /// Claude Code のストリームイベントを処理する
+    pub fn handle_claude_output(&mut self, worktree_id: WorktreeId, event: ClaudeStreamEvent) {
+        let Some(wt) = self.worktree_by_id_mut(worktree_id) else {
+            return;
+        };
+
+        match event {
+            ClaudeStreamEvent::Init { .. } => {
+                // セッション初期化完了。特に表示しない
+            }
+            ClaudeStreamEvent::ContentDelta { text } => {
+                // 最後のメッセージが Assistant なら追記、なければ新規作成
+                if let Some(last) = wt.chat_history.last_mut() {
+                    if last.role == Role::Assistant {
+                        last.content.push_str(&text);
+                        wt.chat_scroll_offset = usize::MAX;
+                        return;
+                    }
+                }
+                wt.chat_history.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: text,
+                    timestamp: Utc::now(),
+                });
+                wt.chat_scroll_offset = usize::MAX;
+            }
+            ClaudeStreamEvent::ToolUse { tool, .. } => {
+                // ツール使用をチャットに表示
+                if let Some(last) = wt.chat_history.last_mut() {
+                    if last.role == Role::Assistant {
+                        last.content.push_str(&format!("\n[Tool: {}]", tool));
+                        wt.chat_scroll_offset = usize::MAX;
+                        return;
+                    }
+                }
+                wt.chat_history.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: format!("[Tool: {}]", tool),
+                    timestamp: Utc::now(),
+                });
+                wt.chat_scroll_offset = usize::MAX;
+            }
+            ClaudeStreamEvent::Result { text } => {
+                // 最終結果。内容があれば表示
+                if !text.is_empty() {
+                    if let Some(last) = wt.chat_history.last_mut() {
+                        if last.role == Role::Assistant && last.content.is_empty() {
+                            last.content = text;
+                            wt.chat_scroll_offset = usize::MAX;
+                            return;
+                        }
+                    }
+                }
+            }
+            ClaudeStreamEvent::Error { .. } => {
+                // ClaudeError イベント経由で処理される
+            }
+        }
+    }
+
+    /// Claude Code の応答完了を処理する
+    pub fn handle_claude_complete(&mut self, worktree_id: WorktreeId) {
+        if let Some(wt) = self.worktree_by_id_mut(worktree_id) {
+            wt.status = WorktreeStatus::Idle;
+        }
+    }
+
+    /// Claude Code のエラーを処理する
+    pub fn handle_claude_error(&mut self, worktree_id: WorktreeId, error: &str) {
+        if let Some(wt) = self.worktree_by_id_mut(worktree_id) {
+            wt.status = WorktreeStatus::Idle;
+        }
+        self.show_error(format!("Claude Code エラー: {}", error));
+    }
+}
+
+impl Project {
+    fn from_config(pc: &ProjectConfig) -> Self {
+        let worktrees = pc
+            .worktrees
+            .iter()
+            .map(|wc| Worktree {
+                name: wc.name.clone(),
+                branch: wc.branch.clone(),
+                path: config::worktree_path(&pc.name, &wc.name),
+                status: WorktreeStatus::Idle,
+                chat_history: Vec::new(),
+                open_files: Vec::new(),
+                active_tab: 0,
+                claude_tabs: 0,
+                right_panel_mode: RightPanelMode::Tree,
+                active_terminal: 0,
+                chat_scroll_offset: 0,
+            })
+            .collect();
+
+        Self {
+            name: pc.name.clone(),
+            path: PathBuf::from(&pc.path),
+            worktrees,
+            collapsed: false,
+        }
+    }
+}
+
+impl WorktreeStatus {
+    /// ステータスアイコンを返す
+    pub fn icon(&self) -> &'static str {
+        match self {
+            WorktreeStatus::Running => "●",
+            WorktreeStatus::Idle => "○",
+            WorktreeStatus::Done => "✓",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{SikiConfig, WorktreeConfig};
+
+    fn sample_config() -> Config {
+        Config {
+            siki: SikiConfig {
+                shell: Some("/bin/zsh".to_string()),
+                shared_dirs: vec!["node_modules".to_string()],
+            },
+            projects: vec![
+                ProjectConfig {
+                    name: "webapp".to_string(),
+                    path: "/home/user/webapp".to_string(),
+                    worktrees: vec![
+                        WorktreeConfig {
+                            name: "feature-auth".to_string(),
+                            branch: "feature/auth".to_string(),
+                        },
+                        WorktreeConfig {
+                            name: "fix-bug".to_string(),
+                            branch: "fix/bug-123".to_string(),
+                        },
+                    ],
+                },
+                ProjectConfig {
+                    name: "api".to_string(),
+                    path: "/home/user/api".to_string(),
+                    worktrees: vec![WorktreeConfig {
+                        name: "refactor".to_string(),
+                        branch: "refactor/db".to_string(),
+                    }],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_app_new_from_config() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.projects[0].name, "webapp");
+        assert_eq!(app.projects[0].worktrees.len(), 2);
+        assert_eq!(app.projects[1].name, "api");
+        assert_eq!(app.projects[1].worktrees.len(), 1);
+        assert!(app.selected_worktree.is_none());
+        assert_eq!(app.focused_panel, Panel::Left);
+        assert!(app.running);
+        assert!(!app.show_help);
+        assert!(!app.show_message_popup);
+    }
+
+    #[test]
+    fn test_worktree_path_construction() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        let wt = &app.projects[0].worktrees[0];
+        assert_eq!(
+            wt.path,
+            crate::config::worktree_path("webapp", "feature-auth")
+        );
+    }
+
+    #[test]
+    fn test_worktree_initial_state() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        let wt = &app.projects[0].worktrees[0];
+        assert_eq!(wt.status, WorktreeStatus::Idle);
+        assert!(wt.chat_history.is_empty());
+        assert!(wt.open_files.is_empty());
+        assert_eq!(wt.active_tab, 0);
+        assert_eq!(wt.right_panel_mode, RightPanelMode::Tree);
+    }
+
+    #[test]
+    fn test_project_not_collapsed_by_default() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert!(!app.projects[0].collapsed);
+        assert!(!app.projects[1].collapsed);
+    }
+
+    #[test]
+    fn test_cycle_focus_forward() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        assert_eq!(app.focused_panel, Panel::Left);
+        app.cycle_focus(false);
+        assert_eq!(app.focused_panel, Panel::Main);
+        app.cycle_focus(false);
+        assert_eq!(app.focused_panel, Panel::Right);
+        app.cycle_focus(false);
+        assert_eq!(app.focused_panel, Panel::Terminal);
+        app.cycle_focus(false);
+        assert_eq!(app.focused_panel, Panel::Left);
+    }
+
+    #[test]
+    fn test_cycle_focus_reverse() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        assert_eq!(app.focused_panel, Panel::Left);
+        app.cycle_focus(true);
+        assert_eq!(app.focused_panel, Panel::Terminal);
+        app.cycle_focus(true);
+        assert_eq!(app.focused_panel, Panel::Right);
+        app.cycle_focus(true);
+        assert_eq!(app.focused_panel, Panel::Main);
+        app.cycle_focus(true);
+        assert_eq!(app.focused_panel, Panel::Left);
+    }
+
+    #[test]
+    fn test_selected_worktree_none() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert!(app.selected_worktree().is_none());
+    }
+
+    #[test]
+    fn test_selected_worktree_some() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.selected_worktree = Some((0, 1));
+        let wt = app.selected_worktree().unwrap();
+        assert_eq!(wt.name, "fix-bug");
+        assert_eq!(wt.branch, "fix/bug-123");
+    }
+
+    #[test]
+    fn test_selected_worktree_mut() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.selected_worktree = Some((1, 0));
+        let wt = app.selected_worktree_mut().unwrap();
+        wt.status = WorktreeStatus::Running;
+
+        let wt = app.selected_worktree().unwrap();
+        assert_eq!(wt.status, WorktreeStatus::Running);
+    }
+
+    #[test]
+    fn test_selected_worktree_out_of_bounds() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.selected_worktree = Some((99, 0));
+        assert!(app.selected_worktree().is_none());
+    }
+
+    #[test]
+    fn test_show_error() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.show_error("テストエラー".to_string());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.text, "テストエラー");
+        assert_eq!(msg.level, StatusLevel::Error);
+    }
+
+    #[test]
+    fn test_show_info() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.show_info("情報メッセージ".to_string());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.text, "情報メッセージ");
+        assert_eq!(msg.level, StatusLevel::Info);
+    }
+
+    #[test]
+    fn test_worktree_status_icon() {
+        assert_eq!(WorktreeStatus::Running.icon(), "●");
+        assert_eq!(WorktreeStatus::Idle.icon(), "○");
+        assert_eq!(WorktreeStatus::Done.icon(), "✓");
+    }
+
+    #[test]
+    fn test_empty_projects_config() {
+        let config = Config {
+            siki: SikiConfig {
+                shell: None,
+                shared_dirs: vec![],
+            },
+            projects: vec![],
+        };
+        let app = App::new(&config);
+        assert!(app.projects.is_empty());
+    }
+
+    #[test]
+    fn test_worktree_by_id() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.name, "feature-auth");
+
+        let wt = app.worktree_by_id((1, 0)).unwrap();
+        assert_eq!(wt.name, "refactor");
+
+        assert!(app.worktree_by_id((99, 0)).is_none());
+    }
+
+    #[test]
+    fn test_worktree_by_id_mut() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        let wt = app.worktree_by_id_mut((0, 1)).unwrap();
+        wt.status = WorktreeStatus::Running;
+
+        assert_eq!(
+            app.worktree_by_id((0, 1)).unwrap().status,
+            WorktreeStatus::Running
+        );
+    }
+
+    #[test]
+    fn test_handle_claude_content_delta_new_message() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+        app.selected_worktree = Some((0, 0));
+
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ContentDelta {
+                text: "Hello".to_string(),
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_history.len(), 1);
+        assert_eq!(wt.chat_history[0].role, Role::Assistant);
+        assert_eq!(wt.chat_history[0].content, "Hello");
+    }
+
+    #[test]
+    fn test_handle_claude_content_delta_append() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // 先にアシスタントメッセージを追加
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ContentDelta {
+                text: "He".to_string(),
+            },
+        );
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ContentDelta {
+                text: "llo".to_string(),
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_history.len(), 1);
+        assert_eq!(wt.chat_history[0].content, "Hello");
+    }
+
+    #[test]
+    fn test_handle_claude_content_delta_after_user_message() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // ユーザーメッセージがある状態
+        if let Some(wt) = app.worktree_by_id_mut((0, 0)) {
+            wt.chat_history.push(ChatMessage {
+                role: Role::User,
+                content: "Hi".to_string(),
+                timestamp: Utc::now(),
+            });
+        }
+
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ContentDelta {
+                text: "Hello!".to_string(),
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_history.len(), 2);
+        assert_eq!(wt.chat_history[0].role, Role::User);
+        assert_eq!(wt.chat_history[1].role, Role::Assistant);
+        assert_eq!(wt.chat_history[1].content, "Hello!");
+    }
+
+    #[test]
+    fn test_handle_claude_tool_use_new_message() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ToolUse {
+                tool: "Read".to_string(),
+                input: serde_json::json!({"path": "/tmp/test.rs"}),
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_history.len(), 1);
+        assert!(wt.chat_history[0].content.contains("[Tool: Read]"));
+    }
+
+    #[test]
+    fn test_handle_claude_tool_use_append() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // 先にテキストを追加
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ContentDelta {
+                text: "Let me check".to_string(),
+            },
+        );
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ToolUse {
+                tool: "Bash".to_string(),
+                input: serde_json::Value::Null,
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_history.len(), 1);
+        assert!(wt.chat_history[0].content.contains("Let me check"));
+        assert!(wt.chat_history[0].content.contains("[Tool: Bash]"));
+    }
+
+    #[test]
+    fn test_handle_claude_init() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // Init イベントはチャットに何も追加しない
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::Init {
+                session_id: "test-session".to_string(),
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert!(wt.chat_history.is_empty());
+    }
+
+    #[test]
+    fn test_handle_claude_complete() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // ステータスを Running にしておく
+        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Running;
+
+        app.handle_claude_complete((0, 0));
+
+        assert_eq!(
+            app.worktree_by_id((0, 0)).unwrap().status,
+            WorktreeStatus::Idle
+        );
+    }
+
+    #[test]
+    fn test_handle_claude_complete_invalid_id() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // 存在しない worktree ID → パニックしない
+        app.handle_claude_complete((99, 99));
+    }
+
+    #[test]
+    fn test_handle_claude_error() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Running;
+
+        app.handle_claude_error((0, 0), "API rate limit");
+
+        assert_eq!(
+            app.worktree_by_id((0, 0)).unwrap().status,
+            WorktreeStatus::Idle
+        );
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, StatusLevel::Error);
+        assert!(msg.text.contains("API rate limit"));
+    }
+
+    #[test]
+    fn test_handle_claude_error_invalid_id() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // 存在しない ID でもエラーメッセージは設定される
+        app.handle_claude_error((99, 99), "error");
+
+        assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn test_handle_claude_result_with_text() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // 空のアシスタントメッセージがある場合
+        if let Some(wt) = app.worktree_by_id_mut((0, 0)) {
+            wt.chat_history.push(ChatMessage {
+                role: Role::Assistant,
+                content: String::new(),
+                timestamp: Utc::now(),
+            });
+        }
+
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::Result {
+                text: "完了しました".to_string(),
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_history[0].content, "完了しました");
+    }
+
+    #[test]
+    fn test_handle_claude_scroll_offset_auto_scroll() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.handle_claude_output(
+            (0, 0),
+            ClaudeStreamEvent::ContentDelta {
+                text: "test".to_string(),
+            },
+        );
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_scroll_offset, usize::MAX);
+    }
+
+    // --- ステータスメッセージ自動クリアテスト ---
+
+    #[test]
+    fn test_show_error_sets_timestamp() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        assert!(app.status_set_at.is_none());
+        app.show_error("error".to_string());
+        assert!(app.status_set_at.is_some());
+    }
+
+    #[test]
+    fn test_show_info_sets_timestamp() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.show_info("info".to_string());
+        assert!(app.status_set_at.is_some());
+        assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn test_clear_expired_status_not_expired() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.show_info("hello".to_string());
+        // 直後はまだクリアされない
+        app.clear_expired_status();
+        assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn test_clear_expired_status_expired() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.show_info("hello".to_string());
+        // タイムスタンプを過去に設定して期限切れをシミュレート
+        app.status_set_at = Some(Instant::now() - Duration::from_secs(10));
+        app.clear_expired_status();
+        assert!(app.status_message.is_none());
+        assert!(app.status_set_at.is_none());
+    }
+
+    #[test]
+    fn test_clear_expired_status_no_message() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        // メッセージがない場合はパニックしない
+        app.clear_expired_status();
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn test_new_message_resets_timer() {
+        let config = sample_config();
+        let mut app = App::new(&config);
+
+        app.show_error("first".to_string());
+        let first_time = app.status_set_at.unwrap();
+
+        // 少し待ってから新しいメッセージを設定
+        std::thread::sleep(Duration::from_millis(10));
+        app.show_info("second".to_string());
+        let second_time = app.status_set_at.unwrap();
+
+        assert!(second_time > first_time);
+        assert_eq!(app.status_message.as_ref().unwrap().text, "second");
+    }
+}
