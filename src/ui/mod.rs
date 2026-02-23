@@ -114,6 +114,7 @@ fn render_help_popup(frame: &mut Frame) {
         "  Enter    : worktree 選択",
         "  a        : worktree 追加",
         "  A        : プロジェクト追加",
+        "  r        : run スクリプト実行",
         "",
         "[中央パネル]",
         "  Tab      : 次のタブ",

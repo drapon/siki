@@ -193,6 +193,28 @@ pub fn generate_worktree_name(existing_names: &[String]) -> String {
     }
 }
 
+/// プロジェクトルートの siki.json を表す構造体
+#[derive(Debug, Deserialize, Default)]
+pub struct SikiJson {
+    #[serde(default)]
+    pub scripts: SikiScripts,
+}
+
+/// siki.json の scripts セクション
+#[derive(Debug, Deserialize, Default)]
+pub struct SikiScripts {
+    pub setup: Option<String>,
+    pub run: Option<String>,
+    pub archive: Option<String>,
+}
+
+/// プロジェクトルートの siki.json を読み込む（なければ None）
+pub fn load_siki_json(project_path: &Path) -> Option<SikiJson> {
+    let path = project_path.join("siki.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 /// ユーザーのデフォルトシェルを検出する
 pub fn detect_default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
@@ -451,6 +473,43 @@ worktrees = [
 
         let loaded = load_config(tmpfile.path()).unwrap();
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn test_load_siki_json_valid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = r#"{"scripts": {"setup": "echo setup", "run": "echo run", "archive": "echo archive"}}"#;
+        std::fs::write(dir.path().join("siki.json"), json).unwrap();
+
+        let siki = load_siki_json(dir.path()).unwrap();
+        assert_eq!(siki.scripts.setup.as_deref(), Some("echo setup"));
+        assert_eq!(siki.scripts.run.as_deref(), Some("echo run"));
+        assert_eq!(siki.scripts.archive.as_deref(), Some("echo archive"));
+    }
+
+    #[test]
+    fn test_load_siki_json_partial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = r#"{"scripts": {"setup": "echo setup"}}"#;
+        std::fs::write(dir.path().join("siki.json"), json).unwrap();
+
+        let siki = load_siki_json(dir.path()).unwrap();
+        assert_eq!(siki.scripts.setup.as_deref(), Some("echo setup"));
+        assert!(siki.scripts.run.is_none());
+        assert!(siki.scripts.archive.is_none());
+    }
+
+    #[test]
+    fn test_load_siki_json_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(load_siki_json(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_load_siki_json_invalid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("siki.json"), "not valid json {{{").unwrap();
+        assert!(load_siki_json(dir.path()).is_none());
     }
 
     #[test]

@@ -154,7 +154,7 @@ async fn handle_event(
                 return;
             }
             if app.show_add_worktree_popup {
-                handle_add_worktree_popup_key(app, key);
+                handle_add_worktree_popup_key(app, terminals, event_tx, shell, key);
                 return;
             }
             if app.show_add_project_popup {
@@ -372,7 +372,13 @@ fn handle_add_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEv
     }
 }
 
-fn handle_add_worktree_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+fn handle_add_worktree_popup_key(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    key: crossterm::event::KeyEvent,
+) {
     use crossterm::event::KeyCode;
 
     match key.code {
@@ -390,10 +396,11 @@ fn handle_add_worktree_popup_key(app: &mut app::App, key: crossterm::event::KeyE
 
             // メモリ上に worktree を追加
             let project_name = app.projects[pi].name.clone();
+            let wt_path = config::worktree_path(&project_name, &wt_name);
             app.projects[pi].worktrees.push(app::Worktree {
                 name: wt_name.clone(),
                 branch: branch.clone(),
-                path: config::worktree_path(&project_name, &wt_name),
+                path: wt_path.clone(),
                 status: app::WorktreeStatus::Idle,
                 chat_history: Vec::new(),
                 open_files: Vec::new(),
@@ -411,6 +418,19 @@ fn handle_add_worktree_popup_key(app: &mut app::App, key: crossterm::event::KeyE
                 app.show_error(format!("設定の保存に失敗: {}", e));
             } else {
                 app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
+            }
+
+            // siki.json の setup スクリプトがあれば実行
+            let project_path = app.projects[pi].path.clone();
+            let wi = app.projects[pi].worktrees.len() - 1;
+            let wt_id = (pi, wi);
+            if let Some(siki_json) = config::load_siki_json(&project_path) {
+                if let Some(ref setup_script) = siki_json.scripts.setup {
+                    run_siki_script(
+                        app, terminals, event_tx, shell,
+                        wt_id, setup_script, &wt_name, &wt_path,
+                    );
+                }
             }
 
             app.show_add_worktree_popup = false;
@@ -567,6 +587,43 @@ fn handle_terminal_key(
     }
 }
 
+/// siki.json のスクリプトをターミナルで実行する
+fn run_siki_script(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    wt_id: app::WorktreeId,
+    script: &str,
+    worktree_name: &str,
+    worktree_path: &std::path::Path,
+) {
+    let (pi, _) = wt_id;
+    let project_path = app.projects[pi].path.clone();
+
+    let active = app
+        .worktree_by_id(wt_id)
+        .map(|wt| wt.active_terminal)
+        .unwrap_or(0);
+
+    // ターミナルがなければ作成
+    if !terminals.contains_key(&(wt_id, active)) {
+        spawn_terminal(app, terminals, event_tx, shell, wt_id, active);
+    }
+
+    if let Some(emu) = terminals.get_mut(&(wt_id, active)) {
+        let env_setup = format!(
+            "export SIKI_PROJECT_PATH=\"{}\" SIKI_WORKTREE_PATH=\"{}\" SIKI_WORKTREE_NAME=\"{}\"\n",
+            project_path.display(),
+            worktree_path.display(),
+            worktree_name,
+        );
+        let _ = emu.write(env_setup.as_bytes());
+        let cmd = format!("{}\n", script);
+        let _ = emu.write(cmd.as_bytes());
+    }
+}
+
 /// ターミナルを新規に作成する
 fn spawn_terminal(
     app: &mut app::App,
@@ -643,6 +700,33 @@ fn handle_left_panel_key(
                 app.add_worktree_name = city_name;
                 app.add_worktree_input.clear();
                 app.show_add_worktree_popup = true;
+            }
+        }
+        KeyCode::Char('r') => {
+            // worktree 行にカーソルがある場合のみ run スクリプトを実行
+            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) =
+                left_panel.current_entry(&entries)
+            {
+                let pi = *project_index;
+                let wi = *worktree_index;
+                let wt_id = (pi, wi);
+                let project_path = app.projects[pi].path.clone();
+                let wt_name = app.projects[pi].worktrees[wi].name.clone();
+                let wt_path = app.projects[pi].worktrees[wi].path.clone();
+
+                if let Some(siki_json) = config::load_siki_json(&project_path) {
+                    if let Some(ref run_script) = siki_json.scripts.run {
+                        run_siki_script(
+                            app, terminals, event_tx, shell,
+                            wt_id, run_script, &wt_name, &wt_path,
+                        );
+                        app.focused_panel = app::Panel::Terminal;
+                    } else {
+                        app.show_info("siki.json に run スクリプトが定義されていません".to_string());
+                    }
+                } else {
+                    app.show_info("siki.json が見つかりません".to_string());
+                }
             }
         }
         KeyCode::Char('A') => {
