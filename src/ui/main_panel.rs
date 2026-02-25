@@ -125,7 +125,7 @@ fn render_claude_terminal(
     frame.render_widget(pseudo_term, area);
 }
 
-/// ファイル内容を描画（シンタックスハイライトは別モジュールで対応予定、ここでは基本表示）
+/// ファイル内容をシンタックスハイライト付きで描画（キャッシュ済みデータを使用）
 fn render_file(frame: &mut Frame, area: Rect, file: &OpenFile, focused: bool) {
     let filename = file
         .path
@@ -143,17 +143,21 @@ fn render_file(frame: &mut Frame, area: Rect, file: &OpenFile, focused: bool) {
         });
 
     let lines: Vec<Line> = file
-        .content
-        .lines()
+        .highlighted
+        .iter()
         .enumerate()
-        .map(|(i, line)| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{:4} ", i + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(line),
-            ])
+        .map(|(i, spans)| {
+            let mut line_spans = vec![Span::styled(
+                format!("{:4} ", i + 1),
+                Style::default().fg(Color::DarkGray),
+            )];
+            for (r, g, b, text) in spans {
+                line_spans.push(Span::styled(
+                    text.clone(),
+                    Style::default().fg(Color::Rgb(*r, *g, *b)),
+                ));
+            }
+            Line::from(line_spans)
         })
         .collect();
 
@@ -218,10 +222,12 @@ pub fn open_file_tab(app: &mut App, path: std::path::PathBuf) {
         let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             format!("ファイルを読み込めません: {}", e)
         });
+        let highlighted = super::syntax::highlight(&content, &path);
         wt.open_files.push(OpenFile {
             path,
             content,
             scroll_offset: 0,
+            highlighted,
         });
         wt.active_tab = wt.claude_tabs + wt.open_files.len() - 1;
     }
@@ -296,11 +302,13 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "fn main() {}".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/lib.rs"),
             content: "pub mod foo;".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
 
         // Claude(0) → test.rs(1) → lib.rs(2) → Claude(0)
@@ -321,11 +329,13 @@ mod tests {
             path: PathBuf::from("/tmp/a.rs"),
             content: "a".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
             content: "b".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
 
         // a.rs(0) → b.rs(1) → a.rs(0)
@@ -356,6 +366,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "fn main() {}".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 0; // claude_tabs=0 なのでファイルタブ
 
@@ -373,6 +384,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "fn main() {}".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 1; // ファイルタブ
 
@@ -390,16 +402,19 @@ mod tests {
             path: PathBuf::from("/tmp/a.rs"),
             content: "a".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
             content: "b".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/c.rs"),
             content: "c".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 2; // b.rs (claude=1, a=1, b=2, c=3)
 
@@ -420,11 +435,13 @@ mod tests {
             path: PathBuf::from("/tmp/a.rs"),
             content: "a".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
             content: "b".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 2; // b.rs (last file tab)
 
@@ -466,6 +483,7 @@ mod tests {
             path: PathBuf::from("/tmp/existing.rs"),
             content: "existing".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 0; // Claude タブ
 
@@ -495,6 +513,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "hello".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 0; // claude_tabs=0 なのでファイルタブ
 
@@ -511,6 +530,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "hello".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 1; // ファイルタブ
 
@@ -526,6 +546,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "hello".to_string(),
             scroll_offset: 3,
+            highlighted: vec![],
         });
         wt.active_tab = 0; // claude_tabs=0 なのでファイルタブ
 
@@ -541,6 +562,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "hello".to_string(),
             scroll_offset: 0,
+            highlighted: vec![],
         });
         wt.active_tab = 0;
 

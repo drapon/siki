@@ -246,12 +246,53 @@ async fn handle_event(
             if app.show_help || app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup {
                 return;
             }
-            if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind {
-                if let Some(layout) = last_layout {
-                    if let Some(panel) = layout.hit_test(mouse.column, mouse.row) {
-                        app.focused_panel = panel;
+            match mouse.kind {
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                    if let Some(layout) = last_layout {
+                        if let Some(panel) = layout.hit_test(mouse.column, mouse.row) {
+                            app.focused_panel = panel;
+                        }
                     }
                 }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if let Some(layout) = last_layout {
+                        let panel = layout.hit_test(mouse.column, mouse.row);
+                        let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                        match panel {
+                            Some(app::Panel::Main) => {
+                                if is_up {
+                                    ui::main_panel::scroll_up(app);
+                                } else {
+                                    ui::main_panel::scroll_down(app);
+                                }
+                            }
+                            Some(app::Panel::Right) => {
+                                let mode = app
+                                    .selected_worktree()
+                                    .map(|wt| wt.right_panel_mode)
+                                    .unwrap_or(app::RightPanelMode::Tree);
+                                match mode {
+                                    app::RightPanelMode::Tree => {
+                                        if is_up {
+                                            source_tree.move_up();
+                                        } else {
+                                            source_tree.move_down();
+                                        }
+                                    }
+                                    app::RightPanelMode::Diff => {
+                                        if is_up {
+                                            diff_view.scroll_up();
+                                        } else {
+                                            diff_view.scroll_down();
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         AppEvent::Resize(_w, _h) => {

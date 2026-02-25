@@ -4,6 +4,7 @@ pub mod left_panel;
 pub mod main_panel;
 pub mod right_panel;
 pub mod source_tree;
+pub mod syntax;
 
 use crate::app::{App, Panel};
 use ratatui::prelude::*;

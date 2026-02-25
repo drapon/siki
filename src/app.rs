@@ -52,6 +52,8 @@ pub struct OpenFile {
     pub path: PathBuf,
     pub content: String,
     pub scroll_offset: usize,
+    /// ハイライト済みスパンのキャッシュ (行ごとに [(R,G,B,text), ...])
+    pub highlighted: Vec<Vec<(u8, u8, u8, String)>>,
 }
 
 /// ステータスメッセージのレベル
