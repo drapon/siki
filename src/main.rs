@@ -435,9 +435,28 @@ fn handle_add_worktree_popup_key(
             let pi = app.add_worktree_project_index;
             let wt_name = app.add_worktree_name.clone();
 
-            // メモリ上に worktree を追加
+            // git worktree を作成
             let project_name = app.projects[pi].name.clone();
+            let project_path = app.projects[pi].path.clone();
             let wt_path = config::worktree_path(&project_name, &wt_name);
+
+            let shared_dirs = config::load_config(&config::default_config_path())
+                .map(|c| c.siki.shared_dirs)
+                .unwrap_or_default();
+
+            if let Err(e) = git::WorktreeManager::create_worktree(
+                &project_path,
+                &wt_path,
+                &branch,
+                &shared_dirs,
+            ) {
+                app.show_error(format!("worktree の作成に失敗: {}", e));
+                app.show_add_worktree_popup = false;
+                app.add_worktree_input.clear();
+                return;
+            }
+
+            // メモリ上に worktree を追加
             app.projects[pi].worktrees.push(app::Worktree {
                 name: wt_name.clone(),
                 branch: branch.clone(),
@@ -462,7 +481,6 @@ fn handle_add_worktree_popup_key(
             }
 
             // siki.json の setup スクリプトがあれば実行
-            let project_path = app.projects[pi].path.clone();
             let wi = app.projects[pi].worktrees.len() - 1;
             let wt_id = (pi, wi);
             if let Some(siki_json) = config::load_siki_json(&project_path) {
@@ -2079,7 +2097,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_worktree_popup_enter_adds_worktree() {
-        let config = sample_config();
+        // git worktree add を実行するため、実際の git リポジトリが必要
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+
+        std::process::Command::new("git").args(["init"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.name", "Test"]).current_dir(project_path).output().unwrap();
+        std::fs::write(project_path.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git").args(["add", "."]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["commit", "-m", "initial"]).current_dir(project_path).output().unwrap();
+
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                shared_dirs: vec![],
+            },
+            projects: vec![ProjectConfig {
+                name: "test-project".to_string(),
+                path: project_path.to_string_lossy().to_string(),
+                worktrees: vec![WorktreeConfig {
+                    name: "feature".to_string(),
+                    branch: "feature/test".to_string(),
+                }],
+            }],
+        };
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
@@ -2116,6 +2158,10 @@ mod tests {
         assert_eq!(new_wt.name, "tokyo");
         assert_eq!(new_wt.branch, "feature/auth");
         assert_eq!(new_wt.status, app::WorktreeStatus::Idle);
+
+        // テスト後に作成された worktree をクリーンアップ
+        let wt_path = config::worktree_path("test-project", "tokyo");
+        let _ = git::WorktreeManager::remove_worktree(project_path, &wt_path);
     }
 
     // --- プロジェクト追加ポップアップのテスト ---

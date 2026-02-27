@@ -100,13 +100,18 @@ impl LeftPanel {
             .iter()
             .enumerate()
             .map(|(i, entry)| {
-                let (text, style) = match entry {
+                let is_cursor = i == self.cursor_index;
+
+                match entry {
                     ListEntry::Project { index } => {
                         let project = &app.projects[*index];
                         let arrow = if project.collapsed { "▸" } else { "▾" };
                         let text = format!("{} {}", arrow, project.name);
-                        let style = Style::default().bold();
-                        (text, style)
+                        let mut style = Style::default().bold();
+                        if is_cursor {
+                            style = style.bg(Color::DarkGray);
+                        }
+                        ListItem::new(text).style(style)
                     }
                     ListEntry::Worktree {
                         project_index,
@@ -117,26 +122,33 @@ impl LeftPanel {
                             == app.projects[*project_index].worktrees.len() - 1;
                         let branch_char = if is_last { "└" } else { "├" };
                         let icon = wt.status.icon();
-                        let text = format!("  {} {} {}", branch_char, icon, wt.name);
 
                         let is_selected = app.selected_worktree == Some((*project_index, *worktree_index));
-                        let style = if is_selected {
-                            Style::default().fg(Color::Green)
+                        let name_fg = if is_selected {
+                            Color::Green
                         } else {
-                            Style::default()
+                            Color::Reset
                         };
-                        (text, style)
+                        let branch_fg = if is_cursor {
+                            Color::Gray
+                        } else {
+                            Color::DarkGray
+                        };
+
+                        let name_part = format!("  {} {} {} ", branch_char, icon, wt.name);
+                        let branch_part = format!(" {}", wt.branch);
+                        let line = Line::from(vec![
+                            Span::styled(name_part, Style::default().fg(name_fg)),
+                            Span::styled(branch_part, Style::default().fg(branch_fg).dim()),
+                        ]);
+
+                        let mut item_style = Style::default();
+                        if is_cursor {
+                            item_style = item_style.bg(Color::DarkGray);
+                        }
+                        ListItem::new(line).style(item_style)
                     }
-                };
-
-                // カーソル行のハイライト
-                let style = if i == self.cursor_index {
-                    style.bg(Color::DarkGray)
-                } else {
-                    style
-                };
-
-                ListItem::new(text).style(style)
+                }
             })
             .collect();
 
