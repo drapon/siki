@@ -38,6 +38,7 @@ pub fn ensure_dirs() -> Result<()> {
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     pub siki: SikiConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectConfig>,
 }
 
@@ -66,11 +67,19 @@ pub fn default_config_path() -> PathBuf {
     siki_home().join("config.toml")
 }
 
-/// 指定パスから設定を読み込む
+/// 指定パスから設定を読み込む（ファイルが存在しない場合はデフォルト設定を返す）
 pub fn load_config(path: &Path) -> Result<Config> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("設定ファイルを読み込めません: {}", path.display()))?;
-    parse_config(&content)
+    match std::fs::read_to_string(path) {
+        Ok(content) => parse_config(&content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config {
+            siki: SikiConfig {
+                shell: None,
+                shared_dirs: vec![],
+            },
+            projects: vec![],
+        }),
+        Err(e) => Err(anyhow::anyhow!("設定ファイルを読み込めません: {}: {}", path.display(), e)),
+    }
 }
 
 /// TOML 文字列から設定をパースする
@@ -193,6 +202,152 @@ pub fn generate_worktree_name(existing_names: &[String]) -> String {
     }
 }
 
+/// プロジェクトメタデータ (~/.siki/workspaces/<project>/project.json)
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProjectMeta {
+    pub path: String,
+}
+
+/// プロジェクトの project.json パスを返す
+pub fn project_meta_path(project_name: &str) -> PathBuf {
+    workspaces_dir().join(project_name).join("project.json")
+}
+
+/// project.json を保存する
+pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
+    let meta = ProjectMeta {
+        path: source_path.to_string_lossy().to_string(),
+    };
+    let dir = workspaces_dir().join(project_name);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("プロジェクトディレクトリの作成に失敗: {}", dir.display()))?;
+    let content =
+        serde_json::to_string_pretty(&meta).context("project.json のシリアライズに失敗")?;
+    let path = project_meta_path(project_name);
+    std::fs::write(&path, content)
+        .with_context(|| format!("project.json の保存に失敗: {}", path.display()))?;
+    Ok(())
+}
+
+/// project.json を読み込む
+pub fn load_project_meta(project_name: &str) -> Option<ProjectMeta> {
+    let path = project_meta_path(project_name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// git worktree の .git ファイルからメインリポジトリのパスを推定する
+fn detect_project_path_from_worktree(worktree_path: &Path) -> Option<PathBuf> {
+    // .git ファイル (not directory) を読み、gitdir パスから元リポジトリを割り出す
+    // 形式: "gitdir: /path/to/main/.git/worktrees/<name>"
+    let git_file = worktree_path.join(".git");
+    let content = std::fs::read_to_string(&git_file).ok()?;
+    let gitdir = content.strip_prefix("gitdir: ")?.trim();
+    let gitdir_path = PathBuf::from(gitdir);
+    // .git/worktrees/<name> → .git → 親ディレクトリ がメインリポジトリ
+    let dot_git = gitdir_path.parent()?.parent()?; // .git
+    Some(dot_git.parent()?.to_path_buf())
+}
+
+/// ~/.siki/workspaces/ をスキャンしてプロジェクト一覧を自動検出する
+pub fn discover_projects() -> Vec<ProjectConfig> {
+    let ws_dir = workspaces_dir();
+    let entries = match std::fs::read_dir(&ws_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut projects = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let project_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        // project.json からソースパスを取得、なければ worktree から推定
+        let source_path = if let Some(meta) = load_project_meta(&project_name) {
+            meta.path
+        } else {
+            // worktree から推定して project.json を自動生成（マイグレーション）
+            let mut detected = None;
+            if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                for sub in sub_entries.flatten() {
+                    let sub_path = sub.path();
+                    if sub_path.is_dir() && sub_path.join(".git").exists() {
+                        if let Some(repo_path) = detect_project_path_from_worktree(&sub_path) {
+                            detected = Some(repo_path);
+                            break;
+                        }
+                    }
+                }
+            }
+            match detected {
+                Some(repo_path) => {
+                    // 検出成功: project.json を自動保存
+                    let _ = save_project_meta(&project_name, &repo_path);
+                    repo_path.to_string_lossy().to_string()
+                }
+                None => {
+                    // 推定できない場合はスキップ
+                    continue;
+                }
+            }
+        };
+
+        // worktree をスキャンしてブランチ情報を取得
+        let mut worktrees = Vec::new();
+        if let Ok(sub_entries) = std::fs::read_dir(&path) {
+            for sub in sub_entries.flatten() {
+                let sub_path = sub.path();
+                if !sub_path.is_dir() {
+                    continue;
+                }
+                let wt_name = match sub_path.file_name().and_then(|n| n.to_str()) {
+                    Some(name) => name.to_string(),
+                    None => continue,
+                };
+
+                // git ブランチ名を取得
+                let branch = std::process::Command::new("git")
+                    .args(["-C", &sub_path.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                worktrees.push(WorktreeConfig {
+                    name: wt_name,
+                    branch,
+                });
+            }
+        }
+
+        // 名前順でソート
+        worktrees.sort_by(|a, b| a.name.cmp(&b.name));
+
+        projects.push(ProjectConfig {
+            name: project_name,
+            path: source_path,
+            worktrees,
+        });
+    }
+
+    // 名前順でソート
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    projects
+}
+
 /// プロジェクトルートの siki.json を表す構造体
 #[derive(Debug, Deserialize, Default)]
 pub struct SikiJson {
@@ -302,14 +457,15 @@ worktrees = []
     }
 
     #[test]
-    fn test_parse_missing_required_fields() {
-        // projects がない
+    fn test_parse_missing_projects_uses_default() {
+        // projects がない場合は空リストになる
         let toml = r#"
 [siki]
 shell = "/bin/bash"
 "#;
-        let result = parse_config(toml);
-        assert!(result.is_err());
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.siki.shell, Some("/bin/bash".to_string()));
+        assert!(config.projects.is_empty());
     }
 
     #[test]
@@ -330,11 +486,11 @@ worktrees = [
     }
 
     #[test]
-    fn test_load_config_file_not_found() {
-        let result = load_config(Path::new("/nonexistent/path/config.toml"));
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("設定ファイルを読み込めません"));
+    fn test_load_config_file_not_found_returns_default() {
+        let config = load_config(Path::new("/nonexistent/path/config.toml")).unwrap();
+        assert_eq!(config.siki.shell, None);
+        assert!(config.siki.shared_dirs.is_empty());
+        assert!(config.projects.is_empty());
     }
 
     #[test]
@@ -523,5 +679,46 @@ worktrees = [
         };
         let result = save_config(Path::new("/nonexistent/dir/config.toml"), &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_and_load_project_meta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // workspaces_dir を直接使うとグローバルに影響するため、
+        // save/load の中身を直接テスト
+        let meta = ProjectMeta {
+            path: "/tmp/my-project".to_string(),
+        };
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let meta_path = dir.path().join("project.json");
+        std::fs::write(&meta_path, &json).unwrap();
+
+        let content = std::fs::read_to_string(&meta_path).unwrap();
+        let loaded: ProjectMeta = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.path, "/tmp/my-project");
+    }
+
+    #[test]
+    fn test_detect_project_path_from_worktree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wt_dir = dir.path().join("my-wt");
+        std::fs::create_dir_all(&wt_dir).unwrap();
+
+        // .git ファイルを作成（git worktree の形式）
+        let gitdir = "/home/user/myproject/.git/worktrees/my-wt";
+        std::fs::write(wt_dir.join(".git"), format!("gitdir: {}", gitdir)).unwrap();
+
+        let result = super::detect_project_path_from_worktree(&wt_dir);
+        assert_eq!(
+            result,
+            Some(PathBuf::from("/home/user/myproject"))
+        );
+    }
+
+    #[test]
+    fn test_detect_project_path_no_git_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = super::detect_project_path_from_worktree(dir.path());
+        assert!(result.is_none());
     }
 }

@@ -6,11 +6,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 pub fn render(
     frame: &mut Frame,
     area: Rect,
-    app: &App,
+    app: &mut App,
     focused: bool,
     claude_screen: Option<&vt100::Screen>,
 ) {
-    let wt = match app.selected_worktree() {
+    let wt = match app.selected_worktree_mut() {
         Some(wt) => wt,
         None => {
             // worktree 未選択時
@@ -51,7 +51,7 @@ pub fn render(
         }
     } else {
         let file_index = wt.active_tab - wt.claude_tabs;
-        if let Some(file) = wt.open_files.get(file_index) {
+        if let Some(file) = wt.open_files.get_mut(file_index) {
             render_file(frame, chunks[1], file, focused);
         }
     }
@@ -126,46 +126,130 @@ fn render_claude_terminal(
 }
 
 /// ファイル内容をシンタックスハイライト付きで描画（キャッシュ済みデータを使用）
-fn render_file(frame: &mut Frame, area: Rect, file: &OpenFile, focused: bool) {
+fn render_file(frame: &mut Frame, area: Rect, file: &mut OpenFile, focused: bool) {
     let filename = file
         .path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "?".to_string());
 
+    // カーソル行の表示（1-indexed）
+    let title = format!("{} L{} (read-only)", filename, file.cursor_line + 1);
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("{} (read-only)", filename))
+        .title(title)
         .border_style(if focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
         });
 
+    // 検索バー用に1行確保（search_active または search_matches が残っている場合）
+    let has_search_bar = file.search_active || !file.search_matches.is_empty();
+    let content_area = if has_search_bar {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // 検索バー
+            Constraint::Min(0),   // ファイル内容
+        ])
+        .split(block.inner(area));
+        let search_area = chunks[0];
+
+        // 検索バーを描画
+        let search_text = if file.search_active {
+            if file.search_matches.is_empty() && !file.search_query.is_empty() {
+                format!("/{}_  [no match]", file.search_query)
+            } else if !file.search_matches.is_empty() {
+                format!(
+                    "/{}_  [{}/{}]",
+                    file.search_query,
+                    file.search_match_idx + 1,
+                    file.search_matches.len()
+                )
+            } else {
+                format!("/{}_ ", file.search_query)
+            }
+        } else {
+            format!(
+                "/{} [{}/{}]  (n/N: next/prev, /: new search)",
+                file.search_query,
+                file.search_match_idx + 1,
+                file.search_matches.len()
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(search_text).style(Style::default().fg(Color::Yellow)),
+            search_area,
+        );
+
+        chunks[1]
+    } else {
+        block.inner(area)
+    };
+
+    // ボーダーを先に描画
+    frame.render_widget(block, area);
+
+    // ビューポート内にカーソルが収まるよう自動スクロール
+    let visible_lines = content_area.height as usize;
+    if visible_lines > 0 {
+        if file.cursor_line < file.scroll_offset {
+            file.scroll_offset = file.cursor_line;
+        } else if file.cursor_line >= file.scroll_offset + visible_lines {
+            file.scroll_offset = file.cursor_line - visible_lines + 1;
+        }
+    }
+
+    // マッチ行のセットを作成
+    let match_set: std::collections::HashSet<usize> =
+        file.search_matches.iter().copied().collect();
+    let current_match_line = file
+        .search_matches
+        .get(file.search_match_idx)
+        .copied();
+
     let lines: Vec<Line> = file
         .highlighted
         .iter()
         .enumerate()
         .map(|(i, spans)| {
+            let is_cursor_line = i == file.cursor_line;
+            let is_current_match = current_match_line == Some(i);
+            let is_other_match = !is_current_match && match_set.contains(&i);
+
+            let line_num_style = if is_cursor_line {
+                Style::default().fg(Color::Yellow)
+            } else if is_current_match {
+                Style::default().fg(Color::Yellow).bg(Color::Rgb(80, 60, 0))
+            } else if is_other_match {
+                Style::default().fg(Color::DarkGray).bg(Color::Rgb(40, 35, 0))
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
             let mut line_spans = vec![Span::styled(
                 format!("{:4} ", i + 1),
-                Style::default().fg(Color::DarkGray),
+                line_num_style,
             )];
             for (r, g, b, text) in spans {
-                line_spans.push(Span::styled(
-                    text.clone(),
-                    Style::default().fg(Color::Rgb(*r, *g, *b)),
-                ));
+                let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
+                if is_cursor_line {
+                    style = style.bg(Color::Rgb(40, 40, 50));
+                } else if is_current_match {
+                    style = style.bg(Color::Rgb(80, 60, 0));
+                } else if is_other_match {
+                    style = style.bg(Color::Rgb(40, 35, 0));
+                }
+                line_spans.push(Span::styled(text.clone(), style));
             }
             Line::from(line_spans)
         })
         .collect();
 
     let paragraph = Paragraph::new(lines)
-        .block(block)
         .scroll((file.scroll_offset as u16, 0));
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, content_area);
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
@@ -227,36 +311,111 @@ pub fn open_file_tab(app: &mut App, path: std::path::PathBuf) {
             path,
             content,
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = wt.claude_tabs + wt.open_files.len() - 1;
     }
 }
 
-/// スクロール下（Claude タブはターミナルが処理するので対象外）
+/// カーソルを下に移動（Claude タブはターミナルが処理するので対象外）
 pub fn scroll_down(app: &mut App) {
     if let Some(wt) = app.selected_worktree_mut() {
         if wt.active_tab < wt.claude_tabs {
-            return; // Claude タブはターミナルがスクロールを処理
+            return;
         }
         let file_index = wt.active_tab - wt.claude_tabs;
         if let Some(file) = wt.open_files.get_mut(file_index) {
-            file.scroll_offset = file.scroll_offset.saturating_add(1);
+            let total_lines = file.highlighted.len();
+            if total_lines > 0 && file.cursor_line < total_lines - 1 {
+                file.cursor_line += 1;
+            }
         }
     }
 }
 
-/// スクロール上（Claude タブはターミナルが処理するので対象外）
+/// カーソルを上に移動（Claude タブはターミナルが処理するので対象外）
 pub fn scroll_up(app: &mut App) {
     if let Some(wt) = app.selected_worktree_mut() {
         if wt.active_tab < wt.claude_tabs {
-            return; // Claude タブはターミナルがスクロールを処理
+            return;
         }
         let file_index = wt.active_tab - wt.claude_tabs;
         if let Some(file) = wt.open_files.get_mut(file_index) {
-            file.scroll_offset = file.scroll_offset.saturating_sub(1);
+            file.cursor_line = file.cursor_line.saturating_sub(1);
         }
     }
+}
+
+/// ファイル内検索モードが有効か
+pub fn is_file_search_active(app: &App) -> bool {
+    let wt = match app.selected_worktree() {
+        Some(wt) => wt,
+        None => return false,
+    };
+    if wt.active_tab < wt.claude_tabs {
+        return false;
+    }
+    let file_index = wt.active_tab - wt.claude_tabs;
+    wt.open_files
+        .get(file_index)
+        .map(|f| f.search_active)
+        .unwrap_or(false)
+}
+
+/// 現在のファイルに対して検索操作を行うヘルパー
+fn with_current_file_mut(app: &mut App, f: impl FnOnce(&mut OpenFile)) {
+    if let Some(wt) = app.selected_worktree_mut() {
+        if wt.active_tab >= wt.claude_tabs {
+            let file_index = wt.active_tab - wt.claude_tabs;
+            if let Some(file) = wt.open_files.get_mut(file_index) {
+                f(file);
+            }
+        }
+    }
+}
+
+pub fn file_search_start(app: &mut App) {
+    with_current_file_mut(app, |f| f.search_start());
+}
+
+pub fn file_search_cancel(app: &mut App) {
+    with_current_file_mut(app, |f| f.search_cancel());
+}
+
+pub fn file_search_confirm(app: &mut App) {
+    with_current_file_mut(app, |f| f.search_confirm());
+}
+
+pub fn file_search_push(app: &mut App, c: char) {
+    with_current_file_mut(app, |f| f.search_push(c));
+}
+
+pub fn file_search_pop(app: &mut App) {
+    with_current_file_mut(app, |f| f.search_pop());
+}
+
+pub fn file_next_match(app: &mut App) {
+    with_current_file_mut(app, |f| f.next_match());
+}
+
+pub fn file_prev_match(app: &mut App) {
+    with_current_file_mut(app, |f| f.prev_match());
+}
+
+/// 現在開いているファイルのパス:行番号を返す（1-indexed）
+pub fn current_file_location(app: &App) -> Option<String> {
+    let wt = app.selected_worktree()?;
+    if wt.active_tab < wt.claude_tabs {
+        return None;
+    }
+    let file_index = wt.active_tab - wt.claude_tabs;
+    let file = wt.open_files.get(file_index)?;
+    Some(format!("{}:{}", file.path.display(), file.cursor_line + 1))
 }
 
 #[cfg(test)]
@@ -302,13 +461,23 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "fn main() {}".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/lib.rs"),
             content: "pub mod foo;".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
 
         // Claude(0) → test.rs(1) → lib.rs(2) → Claude(0)
@@ -329,13 +498,23 @@ mod tests {
             path: PathBuf::from("/tmp/a.rs"),
             content: "a".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
             content: "b".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
 
         // a.rs(0) → b.rs(1) → a.rs(0)
@@ -366,7 +545,12 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "fn main() {}".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = 0; // claude_tabs=0 なのでファイルタブ
 
@@ -384,7 +568,12 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "fn main() {}".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = 1; // ファイルタブ
 
@@ -402,19 +591,34 @@ mod tests {
             path: PathBuf::from("/tmp/a.rs"),
             content: "a".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
             content: "b".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/c.rs"),
             content: "c".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = 2; // b.rs (claude=1, a=1, b=2, c=3)
 
@@ -435,13 +639,23 @@ mod tests {
             path: PathBuf::from("/tmp/a.rs"),
             content: "a".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
             content: "b".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = 2; // b.rs (last file tab)
 
@@ -483,7 +697,12 @@ mod tests {
             path: PathBuf::from("/tmp/existing.rs"),
             content: "existing".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = 0; // Claude タブ
 
@@ -511,14 +730,23 @@ mod tests {
         let wt = app.selected_worktree_mut().unwrap();
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/test.rs"),
-            content: "hello".to_string(),
+            content: "line1\nline2\nline3".to_string(),
             scroll_offset: 0,
-            highlighted: vec![],
+            cursor_line: 0,
+            highlighted: vec![vec![], vec![], vec![]], // 3 行
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
-        wt.active_tab = 0; // claude_tabs=0 なのでファイルタブ
+        wt.active_tab = 0;
 
         scroll_down(&mut app);
-        assert_eq!(app.selected_worktree().unwrap().open_files[0].scroll_offset, 1);
+        assert_eq!(app.selected_worktree().unwrap().open_files[0].cursor_line, 1);
+        scroll_down(&mut app);
+        assert_eq!(app.selected_worktree().unwrap().open_files[0].cursor_line, 2);
+        scroll_down(&mut app);
+        assert_eq!(app.selected_worktree().unwrap().open_files[0].cursor_line, 2); // 末尾で止まる
     }
 
     #[test]
@@ -528,14 +756,19 @@ mod tests {
         wt.claude_tabs = 1;
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/test.rs"),
-            content: "hello".to_string(),
+            content: "line1\nline2".to_string(),
             scroll_offset: 0,
-            highlighted: vec![],
+            cursor_line: 0,
+            highlighted: vec![vec![], vec![]], // 2 行
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = 1; // ファイルタブ
 
         scroll_down(&mut app);
-        assert_eq!(app.selected_worktree().unwrap().open_files[0].scroll_offset, 1);
+        assert_eq!(app.selected_worktree().unwrap().open_files[0].cursor_line, 1);
     }
 
     #[test]
@@ -544,14 +777,19 @@ mod tests {
         let wt = app.selected_worktree_mut().unwrap();
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/test.rs"),
-            content: "hello".to_string(),
-            scroll_offset: 3,
-            highlighted: vec![],
+            content: "line1\nline2\nline3".to_string(),
+            scroll_offset: 0,
+            cursor_line: 2,
+            highlighted: vec![vec![], vec![], vec![]], // 3 行
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
-        wt.active_tab = 0; // claude_tabs=0 なのでファイルタブ
+        wt.active_tab = 0;
 
         scroll_up(&mut app);
-        assert_eq!(app.selected_worktree().unwrap().open_files[0].scroll_offset, 2);
+        assert_eq!(app.selected_worktree().unwrap().open_files[0].cursor_line, 1);
     }
 
     #[test]
@@ -562,12 +800,17 @@ mod tests {
             path: PathBuf::from("/tmp/test.rs"),
             content: "hello".to_string(),
             scroll_offset: 0,
+            cursor_line: 0,
             highlighted: vec![],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         });
         wt.active_tab = 0;
 
         scroll_up(&mut app);
-        assert_eq!(app.selected_worktree().unwrap().open_files[0].scroll_offset, 0);
+        assert_eq!(app.selected_worktree().unwrap().open_files[0].cursor_line, 0); // 0 で止まる
     }
 
     #[test]

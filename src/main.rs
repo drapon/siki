@@ -27,7 +27,14 @@ async fn main() -> Result<()> {
 
     config::ensure_dirs()?;
     let config_path = config::default_config_path();
-    let config = load_config(&config_path)?;
+    let mut config = load_config(&config_path)?;
+
+    // ファイルシステムからプロジェクトを自動検出（config.toml の projects より優先）
+    let discovered = config::discover_projects();
+    if !discovered.is_empty() {
+        config.projects = discovered;
+    }
+
     let shell = config::resolve_shell(&config);
     let mut app = app::App::new(&config);
     let mut left_panel = LeftPanel::new();
@@ -87,7 +94,7 @@ async fn main() -> Result<()> {
         tui_terminal.draw(|frame| {
             last_layout = Some(ui::render(
                 frame,
-                &app,
+                &mut app,
                 &left_panel,
                 &source_tree,
                 &diff_view,
@@ -144,8 +151,13 @@ async fn handle_event(
         AppEvent::Key(key) => {
             // ポップアップ表示中はポップアップ専用の処理
             if app.show_help {
-                if key.code == KeyCode::Esc {
-                    app.show_help = false;
+                match key.code {
+                    KeyCode::Esc => app.show_help = false,
+                    KeyCode::Char('j') | KeyCode::Down => app.help_scroll += 1,
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.help_scroll = app.help_scroll.saturating_sub(1);
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -161,6 +173,10 @@ async fn handle_event(
                 handle_add_project_popup_key(app, key);
                 return;
             }
+            if app.show_grep_popup {
+                handle_grep_popup_key(app, key);
+                return;
+            }
 
             // Terminal パネルフォーカス中は特別処理
             if app.focused_panel == app::Panel::Terminal {
@@ -171,7 +187,10 @@ async fn handle_event(
             // グローバルキー
             match key.code {
                 KeyCode::Char('q') => app.running = false,
-                KeyCode::Char('?') => app.show_help = true,
+                KeyCode::Char('?') | KeyCode::F(1) => {
+                    app.help_scroll = 0;
+                    app.show_help = true;
+                }
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     app.cycle_focus(true);
                 }
@@ -242,8 +261,19 @@ async fn handle_event(
         }
         AppEvent::Mouse(mouse) => {
             use crossterm::event::MouseEventKind;
-            // ポップアップ表示中はマウスクリック無視
-            if app.show_help || app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup {
+            // ヘルプポップアップ表示中はスクロールのみ処理
+            if app.show_help {
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => app.help_scroll += 1,
+                    MouseEventKind::ScrollUp => {
+                        app.help_scroll = app.help_scroll.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // その他のポップアップ表示中はマウスイベント無視
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup {
                 return;
             }
             match mouse.kind {
@@ -386,16 +416,14 @@ fn handle_add_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEv
 
             app.projects.push(app::Project {
                 name: name.clone(),
-                path,
+                path: path.clone(),
                 worktrees: Vec::new(),
                 collapsed: false,
             });
 
-            // config.toml に保存
-            let config_path = config::default_config_path();
-            let config = build_config_from_app(app);
-            if let Err(e) = config::save_config(&config_path, &config) {
-                app.show_error(format!("設定の保存に失敗: {}", e));
+            // project.json を保存（ファイルシステムベースの永続化）
+            if let Err(e) = config::save_project_meta(&name, &path) {
+                app.show_error(format!("project.json の保存に失敗: {}", e));
             } else {
                 app.show_info(format!("プロジェクト追加完了: {}", name));
             }
@@ -471,14 +499,7 @@ fn handle_add_worktree_popup_key(
                 chat_scroll_offset: 0,
             });
 
-            // config.toml に保存
-            let config_path = config::default_config_path();
-            let config = build_config_from_app(app);
-            if let Err(e) = config::save_config(&config_path, &config) {
-                app.show_error(format!("設定の保存に失敗: {}", e));
-            } else {
-                app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
-            }
+            app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
 
             // siki.json の setup スクリプトがあれば実行
             let wi = app.projects[pi].worktrees.len() - 1;
@@ -502,38 +523,6 @@ fn handle_add_worktree_popup_key(
             app.add_worktree_input.pop();
         }
         _ => {}
-    }
-}
-
-/// App の現在の状態から Config を構築する（既存の siki 設定を保持）
-fn build_config_from_app(app: &app::App) -> config::Config {
-    // 既存の設定ファイルから siki セクションを読み込み保持する
-    let config_path = config::default_config_path();
-    let siki = config::load_config(&config_path)
-        .map(|c| c.siki)
-        .unwrap_or(config::SikiConfig {
-            shell: None,
-            shared_dirs: vec![],
-        });
-
-    config::Config {
-        siki,
-        projects: app
-            .projects
-            .iter()
-            .map(|p| config::ProjectConfig {
-                name: p.name.clone(),
-                path: p.path.to_string_lossy().to_string(),
-                worktrees: p
-                    .worktrees
-                    .iter()
-                    .map(|wt| config::WorktreeConfig {
-                        name: wt.name.clone(),
-                        branch: wt.branch.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
     }
 }
 
@@ -692,8 +681,7 @@ fn spawn_terminal(
     wt_id: app::WorktreeId,
     tab_index: usize,
 ) {
-    let (pi, _) = wt_id;
-    let path = app.projects[pi].path.clone();
+    let path = app.worktree_by_id(wt_id).unwrap().path.clone();
 
     // デフォルトサイズ（描画時にリサイズされる）
     let size = (80, 24);
@@ -799,11 +787,10 @@ fn handle_left_panel_key(
             if let Some(wt_id) = left_panel.select_worktree(&entries) {
                 app.selected_worktree = Some(wt_id);
                 app.focused_panel = app::Panel::Main;
-                // プロジェクトの実パスからソースツリーと diff を読み込む
-                let (pi, _) = wt_id;
-                let project_path = app.projects[pi].path.clone();
-                source_tree.load(&project_path);
-                diff_view.load(&project_path);
+                // worktree のパスからソースツリーと diff を読み込む
+                let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+                source_tree.load(&wt_path);
+                diff_view.load(&wt_path);
                 // Claude Code とターミナルを自動起動
                 let has_claude = app
                     .worktree_by_id(wt_id)
@@ -829,6 +816,18 @@ fn handle_main_panel_key(
 ) {
     use crossterm::event::KeyCode;
 
+    // ファイル内検索モード中
+    if ui::main_panel::is_file_search_active(app) {
+        match key.code {
+            KeyCode::Esc => ui::main_panel::file_search_cancel(app),
+            KeyCode::Enter => ui::main_panel::file_search_confirm(app),
+            KeyCode::Backspace => ui::main_panel::file_search_pop(app),
+            KeyCode::Char(c) => ui::main_panel::file_search_push(app, c),
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => {
             ui::main_panel::scroll_down(app);
@@ -839,11 +838,99 @@ fn handle_main_panel_key(
         KeyCode::Char('w') => {
             ui::main_panel::close_current_tab(app);
         }
+        KeyCode::Char('/') => {
+            ui::main_panel::file_search_start(app);
+        }
+        KeyCode::Char('n') => {
+            ui::main_panel::file_next_match(app);
+        }
+        KeyCode::Char('N') => {
+            ui::main_panel::file_prev_match(app);
+        }
+        KeyCode::Char('g') => {
+            if app.selected_worktree.is_some() {
+                app.show_grep_popup = true;
+                app.grep_input.clear();
+                app.grep_results.clear();
+                app.grep_cursor = 0;
+            }
+        }
         KeyCode::Char('i') => {
             // 新しい Claude Code タブを追加
             if let Some(wt_id) = app.selected_worktree {
                 launch_claude(app, claude_terms, event_tx, wt_id);
             }
+        }
+        KeyCode::Char('s') => {
+            // ファイルパス:行番号を最初の Claude Code PTY に送信
+            if let Some(location) = ui::main_panel::current_file_location(app) {
+                if let Some(wt_id) = app.selected_worktree {
+                    if let Some(emu) = claude_terms.get_mut(&(wt_id, 0)) {
+                        let msg = format!("{}\n", location);
+                        if let Err(e) = emu.write(msg.as_bytes()) {
+                            app.show_error(format!("Claude への送信に失敗: {}", e));
+                        } else {
+                            app.show_info(format!("送信: {}", location));
+                        }
+                    } else {
+                        app.show_error("Claude Code が起動していません".to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Grep ポップアップのキー処理
+fn handle_grep_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Esc => {
+            app.show_grep_popup = false;
+        }
+        KeyCode::Enter => {
+            if app.grep_results.is_empty() {
+                // 結果がない → 検索実行
+                app.run_grep();
+            } else {
+                // 結果あり → 選択中のファイルを開く
+                if let Some(result) = app.grep_results.get(app.grep_cursor).cloned() {
+                    app.show_grep_popup = false;
+                    ui::main_panel::open_file_tab(app, result.path);
+                    // 該当行にカーソルを移動
+                    if let Some(wt) = app.selected_worktree_mut() {
+                        let file_index = wt.active_tab.saturating_sub(wt.claude_tabs);
+                        if let Some(file) = wt.open_files.get_mut(file_index) {
+                            let target = result.line_number.saturating_sub(1); // 1-indexed → 0-indexed
+                            if target < file.highlighted.len() {
+                                file.cursor_line = target;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !app.grep_results.is_empty() {
+                app.grep_cursor = (app.grep_cursor + 1).min(app.grep_results.len() - 1);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.grep_cursor = app.grep_cursor.saturating_sub(1);
+        }
+        KeyCode::Backspace => {
+            app.grep_input.pop();
+            // 入力変更時は結果をリセット
+            app.grep_results.clear();
+            app.grep_cursor = 0;
+        }
+        KeyCode::Char(c) => {
+            app.grep_input.push(c);
+            // 入力変更時は結果をリセット
+            app.grep_results.clear();
+            app.grep_cursor = 0;
         }
         _ => {}
     }
@@ -858,8 +945,7 @@ fn launch_claude(
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     wt_id: app::WorktreeId,
 ) {
-    let (pi, _) = wt_id;
-    let project_path = app.projects[pi].path.clone();
+    let project_path = app.worktree_by_id(wt_id).unwrap().path.clone();
     let claude_idx = app
         .worktree_by_id(wt_id)
         .map(|wt| wt.claude_tabs)

@@ -52,8 +52,94 @@ pub struct OpenFile {
     pub path: PathBuf,
     pub content: String,
     pub scroll_offset: usize,
+    /// カーソルが置かれている行（0-indexed）
+    pub cursor_line: usize,
     /// ハイライト済みスパンのキャッシュ (行ごとに [(R,G,B,text), ...])
     pub highlighted: Vec<Vec<(u8, u8, u8, String)>>,
+    /// 検索モード中か
+    pub search_active: bool,
+    /// 検索文字列
+    pub search_query: String,
+    /// マッチした行番号のリスト (0-indexed)
+    pub search_matches: Vec<usize>,
+    /// 現在フォーカス中のマッチインデックス
+    pub search_match_idx: usize,
+}
+
+impl OpenFile {
+    pub fn search_start(&mut self) {
+        self.search_active = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+    }
+
+    pub fn search_cancel(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+    }
+
+    pub fn search_confirm(&mut self) {
+        self.search_active = false;
+        // マッチ結果は保持 (n/N で巡回可能)
+    }
+
+    pub fn search_push(&mut self, c: char) {
+        self.search_query.push(c);
+        self.update_search_matches();
+    }
+
+    pub fn search_pop(&mut self) {
+        self.search_query.pop();
+        self.update_search_matches();
+    }
+
+    fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+        if self.search_query.is_empty() {
+            return;
+        }
+        let query_lower = self.search_query.to_lowercase();
+        for (i, line) in self.content.lines().enumerate() {
+            if line.to_lowercase().contains(&query_lower) {
+                self.search_matches.push(i);
+            }
+        }
+        if let Some(&first) = self.search_matches.first() {
+            self.cursor_line = first;
+        }
+    }
+
+    pub fn next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        self.cursor_line = self.search_matches[self.search_match_idx];
+    }
+
+    pub fn prev_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        if self.search_match_idx == 0 {
+            self.search_match_idx = self.search_matches.len() - 1;
+        } else {
+            self.search_match_idx -= 1;
+        }
+        self.cursor_line = self.search_matches[self.search_match_idx];
+    }
+}
+
+/// grep 検索結果
+#[derive(Debug, Clone)]
+pub struct GrepResult {
+    pub path: PathBuf,
+    pub line_number: usize,
+    pub line_content: String,
 }
 
 /// ステータスメッセージのレベル
@@ -105,6 +191,7 @@ pub struct App {
     pub status_message: Option<StatusMessage>,
     pub status_set_at: Option<Instant>,
     pub show_help: bool,
+    pub help_scroll: usize,
     pub show_message_popup: bool,
     pub popup_input: String,
     pub show_add_worktree_popup: bool,
@@ -113,6 +200,10 @@ pub struct App {
     pub add_worktree_name: String,
     pub show_add_project_popup: bool,
     pub add_project_input: String,
+    pub show_grep_popup: bool,
+    pub grep_input: String,
+    pub grep_results: Vec<GrepResult>,
+    pub grep_cursor: usize,
     pub running: bool,
 }
 
@@ -132,6 +223,7 @@ impl App {
             status_message: None,
             status_set_at: None,
             show_help: false,
+            help_scroll: 0,
             show_message_popup: false,
             popup_input: String::new(),
             show_add_worktree_popup: false,
@@ -140,6 +232,10 @@ impl App {
             add_worktree_name: String::new(),
             show_add_project_popup: false,
             add_project_input: String::new(),
+            show_grep_popup: false,
+            grep_input: String::new(),
+            grep_results: Vec::new(),
+            grep_cursor: 0,
             running: true,
         }
     }
@@ -206,6 +302,55 @@ impl App {
             if set_at.elapsed() >= Self::STATUS_TIMEOUT {
                 self.status_message = None;
                 self.status_set_at = None;
+            }
+        }
+    }
+
+    /// grep 検索を実行する
+    pub fn run_grep(&mut self) {
+        self.grep_results.clear();
+        self.grep_cursor = 0;
+
+        if self.grep_input.is_empty() {
+            return;
+        }
+
+        let wt_path = match self.selected_worktree() {
+            Some(wt) => wt.path.clone(),
+            None => return,
+        };
+
+        let output = std::process::Command::new("grep")
+            .args([
+                "-rn",
+                "--binary-files=without-match",
+                "-I",
+                &self.grep_input,
+                ".",
+            ])
+            .current_dir(&wt_path)
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines().take(200) {
+                // 形式: ./path/to/file:123:line content
+                let parts: Vec<&str> = line.splitn(3, ':').collect();
+                if parts.len() >= 3 {
+                    let file_path = parts[0];
+                    if let Ok(line_number) = parts[1].parse::<usize>() {
+                        let full_path = if file_path.starts_with("./") {
+                            wt_path.join(&file_path[2..])
+                        } else {
+                            wt_path.join(file_path)
+                        };
+                        self.grep_results.push(GrepResult {
+                            path: full_path,
+                            line_number,
+                            line_content: parts[2].to_string(),
+                        });
+                    }
+                }
             }
         }
     }

@@ -23,7 +23,7 @@ pub struct TerminalTabInfo {
 
 pub fn render(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     left_panel: &left_panel::LeftPanel,
     source_tree: &SourceTree,
     diff_view: &DiffView,
@@ -66,7 +66,7 @@ pub fn render(
 
     // ヘルプポップアップ
     if app.show_help {
-        render_help_popup(frame);
+        render_help_popup(frame, app);
     }
 
     // メッセージ入力ポップアップ
@@ -84,6 +84,11 @@ pub fn render(
         render_add_project_popup(frame, app);
     }
 
+    // Grep 検索ポップアップ
+    if app.show_grep_popup {
+        render_grep_popup(frame, app);
+    }
+
     areas
 }
 
@@ -96,54 +101,70 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
     }
 }
 
-fn render_help_popup(frame: &mut Frame) {
+fn render_help_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(60, 70, frame.area());
     let help_text = vec![
         "キーバインド一覧",
         "",
         "[グローバル]",
-        "  q        : 終了",
-        "  ?        : ヘルプ表示",
-        "  Tab      : 次のパネルへ",
-        "  Shift+Tab: 前のパネルへ",
-        "  左クリック : パネル切替",
+        "  q          : 終了",
+        "  ?/F1       : ヘルプ表示",
+        "  Tab        : 次のパネルへ",
+        "  Shift+Tab  : 前のパネルへ",
+        "  クリック    : パネル切替",
+        "  ホイール    : スクロール",
         "",
         "[左パネル]",
-        "  j/↓      : カーソル下",
-        "  k/↑      : カーソル上",
-        "  Space    : 折りたたみ/展開",
-        "  Enter    : worktree 選択",
-        "  a        : worktree 追加",
-        "  A        : プロジェクト追加",
-        "  r        : run スクリプト実行",
+        "  j/↓        : カーソル下",
+        "  k/↑        : カーソル上",
+        "  Space      : 折りたたみ/展開",
+        "  Enter      : worktree 選択",
+        "  a          : worktree 追加",
+        "  A          : プロジェクト追加",
+        "  r          : run スクリプト実行",
         "",
         "[中央パネル]",
-        "  Tab      : 次のタブ",
-        "  w        : タブを閉じる",
-        "  i/Enter  : メッセージ入力",
-        "  j/k      : スクロール",
+        "  Tab        : 次のタブ",
+        "  w          : タブを閉じる",
+        "  i          : Claude Code 起動",
+        "  Ctrl+\\     : Claude タブから離脱",
+        "  j/k/↑/↓    : カーソル行移動",
+        "  /          : ファイル内検索",
+        "  n/N        : 次/前の検索結果",
+        "  g          : 全体検索 (grep)",
+        "  s          : ファイル:行を Claude に送信",
         "",
         "[右パネル上部]",
-        "  t        : Tree/Diff 切替",
-        "  j/k      : カーソル/スクロール",
-        "  h/l      : 折りたたみ/展開",
-        "  Enter    : ファイルを開く",
-        "  /        : ファイル検索",
-        "  n/N      : 次/前の検索結果",
+        "  t          : Tree/Diff 切替",
+        "  j/k/↑/↓    : カーソル/スクロール",
+        "  h/l/←/→    : 折りたたみ/展開",
+        "  Enter      : ファイルを開く",
+        "  /          : ファイル検索",
+        "  n/N        : 次/前の検索結果",
         "",
         "[ターミナル]",
-        "  Ctrl+n   : 新しいタブ",
-        "  Ctrl+1-5 : タブ切替",
-        "  Ctrl+\\   : ターミナルから離脱",
+        "  n          : ターミナル起動",
+        "  Ctrl+n     : 新しいタブ",
+        "  Ctrl+1-5   : タブ切替",
+        "  Ctrl+\\     : ターミナルから離脱",
         "",
-        "Esc で閉じる",
+        "j/k でスクロール  Esc で閉じる",
     ];
+
+    let total_lines = help_text.len() as u16;
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Help")
         .border_style(Style::default().fg(Color::Yellow));
-    let paragraph = Paragraph::new(help_text.join("\n")).block(block);
+    let inner_height = block.inner(area).height;
+
+    let max_scroll = total_lines.saturating_sub(inner_height) as usize;
+    let scroll = app.help_scroll.min(max_scroll);
+
+    let paragraph = Paragraph::new(help_text.join("\n"))
+        .block(block)
+        .scroll((scroll as u16, 0));
 
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
@@ -210,6 +231,97 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
 
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+fn render_grep_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(70, 60, frame.area());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Grep 検索")
+        .border_style(Style::default().fg(Color::Green));
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(block.clone(), area);
+
+    let inner = block.inner(area);
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // 入力行
+        Constraint::Length(1), // 区切り
+        Constraint::Min(0),   // 結果リスト
+    ])
+    .split(inner);
+
+    // 入力行
+    let input_text = if app.grep_results.is_empty() && !app.grep_input.is_empty() {
+        format!("grep: {}_ (Enter で検索)", app.grep_input)
+    } else if !app.grep_results.is_empty() {
+        format!(
+            "grep: {} [{}/{}]",
+            app.grep_input,
+            if app.grep_results.is_empty() { 0 } else { app.grep_cursor + 1 },
+            app.grep_results.len()
+        )
+    } else {
+        format!("grep: {}_", app.grep_input)
+    };
+    frame.render_widget(
+        Paragraph::new(input_text).style(Style::default().fg(Color::Yellow)),
+        chunks[0],
+    );
+
+    // 区切り線
+    frame.render_widget(
+        Paragraph::new("─".repeat(chunks[1].width as usize))
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+
+    // 結果リスト
+    if app.grep_results.is_empty() {
+        if !app.grep_input.is_empty() {
+            frame.render_widget(
+                Paragraph::new("  (マッチなし)")
+                    .style(Style::default().fg(Color::DarkGray)),
+                chunks[2],
+            );
+        }
+    } else {
+        let visible_height = chunks[2].height as usize;
+        // カーソルが見えるようにスクロール
+        let scroll = if app.grep_cursor >= visible_height {
+            app.grep_cursor - visible_height + 1
+        } else {
+            0
+        };
+
+        let lines: Vec<Line> = app
+            .grep_results
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible_height)
+            .map(|(i, result)| {
+                let is_selected = i == app.grep_cursor;
+                let path_str = result
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| result.path.display().to_string());
+                let text = format!(
+                    " {}:{} {}",
+                    path_str, result.line_number, result.line_content
+                );
+                if is_selected {
+                    Line::styled(text, Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 50)))
+                } else {
+                    Line::styled(text, Style::default().fg(Color::White))
+                }
+            })
+            .collect();
+
+        frame.render_widget(Paragraph::new(lines), chunks[2]);
+    }
 }
 
 fn render_terminal(
