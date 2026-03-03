@@ -1,5 +1,5 @@
-pub mod layout;
 pub mod diff_view;
+pub mod layout;
 pub mod left_panel;
 pub mod main_panel;
 pub mod right_panel;
@@ -37,7 +37,13 @@ pub fn render(
     left_panel.render(frame, areas.left, app, app.focused_panel == Panel::Left);
 
     // 中央パネル
-    main_panel::render(frame, areas.main, app, app.focused_panel == Panel::Main, claude_screen);
+    main_panel::render(
+        frame,
+        areas.main,
+        app,
+        app.focused_panel == Panel::Main,
+        claude_screen,
+    );
 
     // 右パネル上部（SourceTree / DiffView）
     right_panel::render_top(
@@ -50,7 +56,13 @@ pub fn render(
     );
 
     // 右パネル下部（ターミナル）
-    render_terminal(frame, areas.right_bottom, app, terminal_screen, terminal_tab_info);
+    render_terminal(
+        frame,
+        areas.right_bottom,
+        app,
+        terminal_screen,
+        terminal_tab_info,
+    );
 
     // ステータスバー
     if let Some(ref msg) = app.status_message {
@@ -89,6 +101,11 @@ pub fn render(
         render_grep_popup(frame, app);
     }
 
+    // アーカイブ確認ダイアログ
+    if app.show_archive_confirm {
+        render_archive_confirm_popup(frame, app);
+    }
+
     areas
 }
 
@@ -122,6 +139,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  a          : worktree 追加",
         "  A          : プロジェクト追加",
         "  r          : run スクリプト実行",
+        "  d          : worktree アーカイブ",
         "",
         "[中央パネル]",
         "  Tab        : 次のタブ",
@@ -248,7 +266,7 @@ fn render_grep_popup(frame: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // 入力行
         Constraint::Length(1), // 区切り
-        Constraint::Min(0),   // 結果リスト
+        Constraint::Min(0),    // 結果リスト
     ])
     .split(inner);
 
@@ -259,7 +277,11 @@ fn render_grep_popup(frame: &mut Frame, app: &App) {
         format!(
             "grep: {} [{}/{}]",
             app.grep_input,
-            if app.grep_results.is_empty() { 0 } else { app.grep_cursor + 1 },
+            if app.grep_results.is_empty() {
+                0
+            } else {
+                app.grep_cursor + 1
+            },
             app.grep_results.len()
         )
     } else {
@@ -281,8 +303,7 @@ fn render_grep_popup(frame: &mut Frame, app: &App) {
     if app.grep_results.is_empty() {
         if !app.grep_input.is_empty() {
             frame.render_widget(
-                Paragraph::new("  (マッチなし)")
-                    .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new("  (マッチなし)").style(Style::default().fg(Color::DarkGray)),
                 chunks[2],
             );
         }
@@ -313,7 +334,10 @@ fn render_grep_popup(frame: &mut Frame, app: &App) {
                     path_str, result.line_number, result.line_content
                 );
                 if is_selected {
-                    Line::styled(text, Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 50)))
+                    Line::styled(
+                        text,
+                        Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 50)),
+                    )
                 } else {
                     Line::styled(text, Style::default().fg(Color::White))
                 }
@@ -322,6 +346,30 @@ fn render_grep_popup(frame: &mut Frame, app: &App) {
 
         frame.render_widget(Paragraph::new(lines), chunks[2]);
     }
+}
+
+fn render_archive_confirm_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(40, 20, frame.area());
+
+    let (wt_name, wt_branch) = app
+        .archive_target
+        .and_then(|id| app.worktree_by_id(id))
+        .map(|wt| (wt.name.as_str(), wt.branch.as_str()))
+        .unwrap_or(("???", "???"));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Worktree アーカイブ")
+        .border_style(Style::default().fg(Color::Red));
+
+    let text = format!(
+        "\n  \"{}\" ({})\n  をアーカイブしますか？\n\n  y: アーカイブ  n: キャンセル",
+        wt_name, wt_branch,
+    );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_terminal(

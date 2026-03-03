@@ -204,6 +204,8 @@ pub struct App {
     pub grep_input: String,
     pub grep_results: Vec<GrepResult>,
     pub grep_cursor: usize,
+    pub show_archive_confirm: bool,
+    pub archive_target: Option<WorktreeId>,
     pub running: bool,
 }
 
@@ -236,6 +238,8 @@ impl App {
             grep_input: String::new(),
             grep_results: Vec::new(),
             grep_cursor: 0,
+            show_archive_confirm: false,
+            archive_target: None,
             running: true,
         }
     }

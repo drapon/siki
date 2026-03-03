@@ -104,6 +104,16 @@ async fn main() -> Result<()> {
             ));
         })?;
 
+        // PTY のサイズを描画エリアに合わせてリサイズ
+        if let Some(ref layout) = last_layout {
+            resize_terminals(
+                &app,
+                &mut terminals,
+                &mut claude_terms,
+                layout,
+            );
+        }
+
         // イベント待受と処理
         let ev = events.next().await?;
         handle_event(
@@ -175,6 +185,10 @@ async fn handle_event(
             }
             if app.show_grep_popup {
                 handle_grep_popup_key(app, key);
+                return;
+            }
+            if app.show_archive_confirm {
+                handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, key);
                 return;
             }
 
@@ -273,7 +287,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_archive_confirm {
                 return;
             }
             match mouse.kind {
@@ -776,6 +790,15 @@ fn handle_left_panel_key(
                 }
             }
         }
+        KeyCode::Char('d') => {
+            // worktree 行にカーソルがある場合のみアーカイブ確認を表示
+            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) =
+                left_panel.current_entry(&entries)
+            {
+                app.archive_target = Some((*project_index, *worktree_index));
+                app.show_archive_confirm = true;
+            }
+        }
         KeyCode::Char('A') => {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
@@ -933,6 +956,133 @@ fn handle_grep_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
             app.grep_cursor = 0;
         }
         _ => {}
+    }
+}
+
+/// アーカイブ確認ダイアログのキー処理
+fn handle_archive_confirm_key(
+    app: &mut app::App,
+    sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+            if let Some((pi, wi)) = app.archive_target {
+                let project_path = app.projects[pi].path.clone();
+                let wt_name = app.projects[pi].worktrees[wi].name.clone();
+                let wt_path = app.projects[pi].worktrees[wi].path.clone();
+                let wt_id = (pi, wi);
+
+                // siki.json の archive スクリプトがあれば実行
+                if let Some(siki_json) = config::load_siki_json(&project_path) {
+                    if let Some(ref archive_script) = siki_json.scripts.archive {
+                        run_siki_script(
+                            app, terminals, event_tx, shell,
+                            wt_id, archive_script, &wt_name, &wt_path,
+                        );
+                    }
+                }
+
+                // 関連する Claude セッションをクリーンアップ
+                sessions.remove(&wt_id);
+
+                // 関連するターミナルをクリーンアップ
+                let term_keys: Vec<_> = terminals
+                    .keys()
+                    .filter(|k| k.0 == wt_id)
+                    .cloned()
+                    .collect();
+                for key in term_keys {
+                    terminals.remove(&key);
+                }
+
+                // 関連する Claude ターミナルをクリーンアップ
+                let claude_keys: Vec<_> = claude_terms
+                    .keys()
+                    .filter(|k| k.0 == wt_id)
+                    .cloned()
+                    .collect();
+                for key in claude_keys {
+                    claude_terms.remove(&key);
+                }
+
+                // git worktree を削除
+                match git::WorktreeManager::remove_worktree(&project_path, &wt_path) {
+                    Ok(()) => {
+                        // メモリから worktree を削除
+                        app.projects[pi].worktrees.remove(wi);
+
+                        // selected_worktree をリセット（削除対象 or インデックスずれ対応）
+                        if let Some((sel_pi, sel_wi)) = app.selected_worktree {
+                            if sel_pi == pi && sel_wi == wi {
+                                app.selected_worktree = None;
+                            } else if sel_pi == pi && sel_wi > wi {
+                                app.selected_worktree = Some((sel_pi, sel_wi - 1));
+                            }
+                        }
+
+                        app.show_info(format!("worktree を削除しました: {}", wt_name));
+                    }
+                    Err(e) => {
+                        app.show_error(format!("worktree の削除に失敗: {}", e));
+                    }
+                }
+            }
+
+            app.show_archive_confirm = false;
+            app.archive_target = None;
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            app.show_archive_confirm = false;
+            app.archive_target = None;
+        }
+        _ => {}
+    }
+}
+
+/// PTY ターミナルを実際の描画エリアに合わせてリサイズする
+fn resize_terminals(
+    app: &app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    layout: &ui::layout::AppLayout,
+) {
+    // Claude ターミナル: main パネルからタブバー(2行) + ボーダー(2行2列) を引いた内部サイズ
+    let claude_cols = layout.main.width.saturating_sub(2);
+    let claude_rows = layout.main.height.saturating_sub(4); // tab bar 2 + border 2
+
+    // 右下ターミナル: ボーダー(2行2列) を引いた内部サイズ
+    let term_cols = layout.right_bottom.width.saturating_sub(2);
+    let term_rows = layout.right_bottom.height.saturating_sub(2);
+
+    if claude_cols > 0 && claude_rows > 0 {
+        for emu in claude_terms.values_mut() {
+            let screen = emu.screen();
+            let (cur_rows, cur_cols) = screen.size();
+            if cur_cols != claude_cols || cur_rows != claude_rows {
+                let _ = emu.resize(claude_cols, claude_rows);
+            }
+        }
+    }
+
+    if term_cols > 0 && term_rows > 0 {
+        if let Some(wt_id) = app.selected_worktree {
+            for (key, emu) in terminals.iter_mut() {
+                if key.0 == wt_id {
+                    let screen = emu.screen();
+                    let (cur_rows, cur_cols) = screen.size();
+                    if cur_cols != term_cols || cur_rows != term_rows {
+                        let _ = emu.resize(term_cols, term_rows);
+                    }
+                }
+            }
+        }
     }
 }
 
