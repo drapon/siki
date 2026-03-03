@@ -2,6 +2,9 @@
 name = "siki"
 version = "0.1.0"
 edition = "2024"
+description = "TUI orchestrator for managing multiple Claude Code sessions across git worktrees"
+license = "MIT"
+repository = "https://github.com/drapon/siki"
 
 [dependencies]
 anyhow = "1.0.102"
