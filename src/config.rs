@@ -363,6 +363,40 @@ pub struct SikiScripts {
     pub archive: Option<String>,
 }
 
+/// プロジェクトルートに siki.json が存在するかチェック
+pub fn siki_json_exists(project_path: &Path) -> bool {
+    project_path.join("siki.json").exists()
+}
+
+/// Claude に渡す siki.json 作成用プロンプトを返す
+pub fn siki_json_init_prompt() -> String {
+    r#"このプロジェクトを分析して、siki.json を作成してください。
+
+siki.json は以下のフォーマットです:
+{
+  "scripts": {
+    "setup": "worktree作成後に実行するセットアップコマンド（例: npm install, cargo build）",
+    "run": "開発サーバー起動などの実行コマンド（例: npm run dev）",
+    "archive": "worktreeアーカイブ前に実行するクリーンアップコマンド（任意）"
+  }
+}
+
+手順:
+1. プロジェクトの構成ファイル（package.json, Cargo.toml, pyproject.toml, Makefile 等）を確認
+2. 使用しているパッケージマネージャーやビルドツールを特定
+3. 各スクリプト（setup, run, archive）の内容を提案
+4. 確認を取りながら siki.json をプロジェクトルートに書き出す
+
+注意:
+- setup は依存パッケージのインストールなど、worktreeを使い始める前に必要な処理
+- run は開発中によく使うコマンド（dev server, watch mode 等）
+- archive は任意（不要なら null にする）
+- 各スクリプトは単一のシェルコマンド文字列で記述
+
+プロジェクトのファイルを確認して、適切な siki.json を提案してください。"#
+        .to_string()
+}
+
 /// プロジェクトルートの siki.json を読み込む（なければ None）
 pub fn load_siki_json(project_path: &Path) -> Option<SikiJson> {
     let path = project_path.join("siki.json");

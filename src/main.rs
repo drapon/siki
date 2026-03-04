@@ -130,6 +130,18 @@ async fn main() -> Result<()> {
             last_layout.as_ref(),
         )
         .await;
+
+        // siki.json 作成のための TUI 一時停止処理
+        if let Some(project_path) = app.suspend_claude_init.take() {
+            tui::restore()?;
+            let prompt = config::siki_json_init_prompt();
+            let _ = std::process::Command::new("claude")
+                .arg(&prompt)
+                .current_dir(&project_path)
+                .status();
+            tui_terminal = tui::init()?;
+            tui_terminal.clear()?;
+        }
     }
 
     // クリーンアップ: 全セッションを終了
@@ -189,6 +201,10 @@ async fn handle_event(
             }
             if app.show_archive_confirm {
                 handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, key);
+                return;
+            }
+            if app.show_siki_json_confirm {
+                handle_siki_json_confirm_key(app, key);
                 return;
             }
 
@@ -287,7 +303,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_archive_confirm {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_archive_confirm || app.show_siki_json_confirm {
                 return;
             }
             match mouse.kind {
@@ -444,6 +460,12 @@ fn handle_add_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEv
 
             app.show_add_project_popup = false;
             app.add_project_input.clear();
+
+            // siki.json が無ければ作成確認ポップアップを表示
+            if !config::siki_json_exists(&path) {
+                app.siki_json_confirm_project_path = Some(path);
+                app.show_siki_json_confirm = true;
+            }
         }
         KeyCode::Char(c) => {
             app.add_project_input.push(c);
@@ -750,6 +772,15 @@ fn handle_left_panel_key(
                 None => None,
             };
             if let Some(pi) = project_index {
+                let project_path = &app.projects[pi].path;
+
+                // siki.json が無ければ作成確認ポップアップを表示
+                if !config::siki_json_exists(project_path) {
+                    app.siki_json_confirm_project_path = Some(project_path.clone());
+                    app.show_siki_json_confirm = true;
+                    return;
+                }
+
                 // 既存 worktree 名を収集して重複しない都市名を生成
                 let existing_names: Vec<String> = app.projects[pi]
                     .worktrees
@@ -900,6 +931,23 @@ fn handle_main_panel_key(
                     }
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+/// siki.json 作成確認ダイアログのキー処理
+fn handle_siki_json_confirm_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.suspend_claude_init = app.siki_json_confirm_project_path.take();
+            app.show_siki_json_confirm = false;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.siki_json_confirm_project_path = None;
+            app.show_siki_json_confirm = false;
         }
         _ => {}
     }
@@ -1266,6 +1314,23 @@ mod tests {
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
                 path: "/tmp/test-project".to_string(),
+                worktrees: vec![WorktreeConfig {
+                    name: "feature".to_string(),
+                    branch: "feature/test".to_string(),
+                }],
+            }],
+        }
+    }
+
+    fn sample_config_with_path(path: String) -> Config {
+        Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                shared_dirs: vec![],
+            },
+            projects: vec![ProjectConfig {
+                name: "test-project".to_string(),
+                path,
                 worktrees: vec![WorktreeConfig {
                     name: "feature".to_string(),
                     branch: "feature/test".to_string(),
@@ -2107,7 +2172,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_key_opens_add_worktree_popup_on_project() {
-        let config = sample_config();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("siki.json"), r#"{"scripts":{}}"#).unwrap();
+        let config = sample_config_with_path(dir.path().to_string_lossy().to_string());
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
@@ -2140,7 +2207,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_key_opens_add_worktree_popup_on_worktree() {
-        let config = sample_config();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("siki.json"), r#"{"scripts":{}}"#).unwrap();
+        let config = sample_config_with_path(dir.path().to_string_lossy().to_string());
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
@@ -2168,6 +2237,38 @@ mod tests {
         .await;
         assert!(app.show_add_worktree_popup);
         assert_eq!(app.add_worktree_project_index, 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_key_shows_siki_json_confirm_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // siki.json を作成しない
+        let config = sample_config_with_path(dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('a'))),
+            None,
+        )
+        .await;
+        assert!(app.show_siki_json_confirm);
+        assert!(!app.show_add_worktree_popup);
     }
 
     #[tokio::test]

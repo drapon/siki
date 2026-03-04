@@ -106,6 +106,11 @@ pub fn render(
         render_archive_confirm_popup(frame, app);
     }
 
+    // siki.json 作成確認ダイアログ
+    if app.show_siki_json_confirm {
+        render_siki_json_confirm_popup(frame);
+    }
+
     areas
 }
 
@@ -366,6 +371,21 @@ fn render_archive_confirm_popup(frame: &mut Frame, app: &App) {
         "\n  \"{}\" ({})\n  をアーカイブしますか？\n\n  y: アーカイブ  n: キャンセル",
         wt_name, wt_branch,
     );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_siki_json_confirm_popup(frame: &mut Frame) {
+    let area = centered_rect(40, 20, frame.area());
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("siki.json")
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let text = "\n  siki.json が見つかりません。\n  Claude で対話的に作成しますか？\n\n  y: 作成  n: スキップ";
     let paragraph = Paragraph::new(text).block(block);
 
     frame.render_widget(ratatui::widgets::Clear, area);

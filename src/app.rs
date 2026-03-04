@@ -206,6 +206,10 @@ pub struct App {
     pub grep_cursor: usize,
     pub show_archive_confirm: bool,
     pub archive_target: Option<WorktreeId>,
+    pub show_siki_json_confirm: bool,
+    pub siki_json_confirm_project_path: Option<std::path::PathBuf>,
+    /// TUI一時停止用: claude実行後にmainループで処理
+    pub suspend_claude_init: Option<std::path::PathBuf>,
     pub running: bool,
 }
 
@@ -240,6 +244,9 @@ impl App {
             grep_cursor: 0,
             show_archive_confirm: false,
             archive_target: None,
+            show_siki_json_confirm: false,
+            siki_json_confirm_project_path: None,
+            suspend_claude_init: None,
             running: true,
         }
     }
