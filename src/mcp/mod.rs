@@ -69,7 +69,7 @@ fn handle_request(
                     "name": "siki",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "You are connected to siki, a multi-session orchestrator.\n\nAt the start of every new conversation:\n1. Call `list_sessions` to check for pending messages and see other active sessions.\n2. If there are other active sessions in the SAME worktree (same worktree_name), call `get_context` for that worktree and briefly tell the user what the other session was working on. Ask: 'アクティブなセッションがあります。引き継いで続けますか？それとも新しいタスクを始めますか？'\n3. Call `set_summary` with a brief description of your current task.\n\nWhen you finish a task that another session should continue, use `handoff`.\nTo pull context from another session at any time, use `get_context`."
+                "instructions": "You are connected to siki, a multi-session orchestrator.\n\nOn every new conversation:\n1. Call `list_sessions` silently.\n2. If active sessions exist in the same worktree, ask:\n   'Active session(s) found. [1] Start new  [2] Reference existing'\n   Default is 1. If user picks 2, list the active sessions with their summaries and let user choose which to `get_context` from.\n3. Call `set_summary` with a short task description once work begins."
             }),
         ),
 
