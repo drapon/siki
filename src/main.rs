@@ -1,8 +1,11 @@
 mod app;
+mod broker;
 mod claude;
 mod config;
 mod event;
 mod git;
+mod hooks;
+mod session;
 mod terminal;
 mod tui;
 mod ui;
@@ -10,6 +13,7 @@ mod ui;
 use anyhow::Result;
 use config::load_config;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use ui::diff_view::DiffView;
 use ui::left_panel::LeftPanel;
 use ui::source_tree::SourceTree;
@@ -50,10 +54,24 @@ async fn main() -> Result<()> {
         HashMap::new();
     let mut siki_init_terminal: Option<terminal::TerminalEmulator> = None;
 
+    // セッションレジストリと broker の起動
+    let session_registry = Arc::new(Mutex::new(session::SessionRegistry::new()));
+    let sock_path = config::sock_path();
+
     let mut tui_terminal = tui::init()?;
     let mut events = event::EventHandler::new();
     let event_tx = events.sender();
     let mut last_layout: Option<ui::layout::AppLayout> = None;
+
+    // broker タスクを起動（hook イベントを受信）
+    match broker::Broker::new(&sock_path, Arc::clone(&session_registry), event_tx.clone()) {
+        Ok(b) => {
+            tokio::spawn(b.run());
+        }
+        Err(e) => {
+            eprintln!("broker の起動に失敗（セッション監視は無効）: {}", e);
+        }
+    }
 
     // 起動時に全 worktree の PR 情報を非同期取得
     for (pi, project) in app.projects.iter().enumerate() {
@@ -178,6 +196,9 @@ async fn main() -> Result<()> {
     for (_id, mut session) in sessions.drain() {
         let _ = session.kill().await;
     }
+
+    // ソケットファイルを削除
+    broker::cleanup_socket(&sock_path);
 
     tui::restore()?;
     Ok(())
@@ -436,6 +457,10 @@ async fn handle_event(
         }
         AppEvent::Resize(_w, _h) => {
             // ratatui が自動的にリサイズを処理する
+        }
+        AppEvent::SessionUpdate { .. } => {
+            // セッション状態の変化 — レジストリは broker 側で既に更新済み
+            // TUI は次の描画サイクルでレジストリを参照して表示を更新する
         }
         AppEvent::Tick => {
             app.clear_expired_status();
@@ -1411,6 +1436,12 @@ fn launch_claude_with_args(
     args: &[&str],
 ) {
     let project_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+
+    // worktree に siki 用 hook を注入
+    let sock = config::sock_path();
+    if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock) {
+        app.show_error(format!("hook 注入に失敗: {}", e));
+    }
     let claude_idx = app
         .worktree_by_id(wt_id)
         .map(|wt| wt.claude_tabs)
