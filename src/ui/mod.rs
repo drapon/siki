@@ -151,7 +151,7 @@ fn render_session_choice_popup(frame: &mut Frame) {
         .borders(Borders::ALL)
         .title("Active Session Found")
         .border_style(Style::default().fg(Color::Yellow));
-    let text = " [1] Start new (default)\n [2] Resume existing (claude -c)";
+    let text = " [1] Start new (default)\n [2] Continue with context";
     frame.render_widget(
         Paragraph::new(text).block(block).style(Style::default().fg(Color::White)),
         popup_area,
