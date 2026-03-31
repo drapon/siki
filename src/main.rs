@@ -285,15 +285,15 @@ async fn handle_event(
                                     .filter(|o| o.status.success())
                                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                                     .unwrap_or_default();
-                                // サマリーを一時ファイルに書き込む
-                                let context_path = wt_path.join(".claude/siki-handoff.md");
-                                let _ = std::fs::create_dir_all(wt_path.join(".claude"));
+                                // サマリーを handoff ディレクトリに書き込む
+                                let handoff_dir = wt_path.join(".claude/handoff");
+                                let _ = std::fs::create_dir_all(&handoff_dir);
                                 let context = if summary.is_empty() {
                                     "# Previous Session\n\nNo context available.\n".to_string()
                                 } else {
                                     format!("# Previous Session Summary\n\n{}\n", summary)
                                 };
-                                let _ = std::fs::write(&context_path, &context);
+                                let _ = std::fs::write(handoff_dir.join("context.md"), &context);
                                 let _ = tx.send(event::AppEvent::SessionContext {
                                     worktree_id: wt_id,
                                 });
@@ -525,9 +525,8 @@ async fn handle_event(
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
         AppEvent::SessionContext { worktree_id } => {
-            // サマリーが .claude/siki-handoff.md に書き込み済み
-            // --add-file で参照ファイルとして渡して起動
-            launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &["--add-file", ".claude/siki-handoff.md"]);
+            app.show_info("Launching Claude with previous context...".to_string());
+            launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &["--add-dir", ".claude/handoff"]);
         }
         AppEvent::Tick => {
             app.clear_expired_status();
