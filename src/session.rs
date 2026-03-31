@@ -11,26 +11,42 @@ pub enum SessionState {
     Waiting,
     /// 待機中
     Idle,
+    /// 放置中（タイムアウト間近）
+    Stale,
     /// セッション終了
     Dead,
 }
 
 impl SessionState {
     /// 状態バッジ文字を返す
-    pub fn badge(&self) -> &'static str {
+    pub fn badge_char(&self) -> &'static str {
         match self {
-            Self::Working => "🟡",
-            Self::Waiting => "🔴",
-            Self::Idle => "⚪",
-            Self::Dead => "💀",
+            Self::Working => "●",
+            Self::Waiting => "●",
+            Self::Idle => "○",
+            Self::Stale => "◷",
+            Self::Dead => "✕",
+        }
+    }
+
+    /// 状態バッジの色を返す
+    pub fn badge_color(&self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            Self::Working => Color::Yellow,
+            Self::Waiting => Color::Red,
+            Self::Idle => Color::DarkGray,
+            Self::Stale => Color::DarkGray,
+            Self::Dead => Color::DarkGray,
         }
     }
 
     /// 集約表示用の優先度（大きいほど優先）
     pub fn priority(&self) -> u8 {
         match self {
-            Self::Waiting => 4,
-            Self::Working => 3,
+            Self::Waiting => 5,
+            Self::Working => 4,
+            Self::Stale => 3,
             Self::Idle => 2,
             Self::Dead => 1,
         }
@@ -149,14 +165,32 @@ impl SessionRegistry {
             .max_by_key(|s| s.priority())
     }
 
-    /// タイムアウトしたセッションを Dead にする
-    pub fn expire_stale_sessions(&mut self, timeout: std::time::Duration) {
+    /// タイムアウトしたセッションを段階的に劣化させる
+    ///
+    /// - `stale_timeout`（15秒）を超えたら Stale（◷）
+    /// - `dead_timeout`（30秒）を超えたら Dead（✕）
+    pub fn expire_stale_sessions(
+        &mut self,
+        stale_timeout: std::time::Duration,
+        dead_timeout: std::time::Duration,
+    ) {
         let now = Instant::now();
         for session in self.sessions.values_mut() {
-            if session.state != SessionState::Dead
-                && now.duration_since(session.last_seen) > timeout
-            {
-                session.state = SessionState::Dead;
+            let elapsed = now.duration_since(session.last_seen);
+            match session.state {
+                SessionState::Dead => {}
+                SessionState::Stale if elapsed > dead_timeout => {
+                    session.state = SessionState::Dead;
+                }
+                _ if elapsed > dead_timeout => {
+                    session.state = SessionState::Dead;
+                }
+                SessionState::Working | SessionState::Waiting | SessionState::Idle
+                    if elapsed > stale_timeout =>
+                {
+                    session.state = SessionState::Stale;
+                }
+                _ => {}
             }
         }
     }
@@ -230,17 +264,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_session_state_badge() {
-        assert_eq!(SessionState::Working.badge(), "🟡");
-        assert_eq!(SessionState::Waiting.badge(), "🔴");
-        assert_eq!(SessionState::Idle.badge(), "⚪");
-        assert_eq!(SessionState::Dead.badge(), "💀");
+    fn test_session_state_badge_char() {
+        assert_eq!(SessionState::Working.badge_char(), "●");
+        assert_eq!(SessionState::Waiting.badge_char(), "●");
+        assert_eq!(SessionState::Idle.badge_char(), "○");
+        assert_eq!(SessionState::Stale.badge_char(), "◷");
+        assert_eq!(SessionState::Dead.badge_char(), "✕");
+    }
+
+    #[test]
+    fn test_session_state_badge_color() {
+        use ratatui::style::Color;
+        assert_eq!(SessionState::Working.badge_color(), Color::Yellow);
+        assert_eq!(SessionState::Waiting.badge_color(), Color::Red);
+        assert_eq!(SessionState::Idle.badge_color(), Color::DarkGray);
+        assert_eq!(SessionState::Stale.badge_color(), Color::DarkGray);
+        assert_eq!(SessionState::Dead.badge_color(), Color::DarkGray);
     }
 
     #[test]
     fn test_session_state_priority() {
         assert!(SessionState::Waiting.priority() > SessionState::Working.priority());
-        assert!(SessionState::Working.priority() > SessionState::Idle.priority());
+        assert!(SessionState::Working.priority() > SessionState::Stale.priority());
+        assert!(SessionState::Stale.priority() > SessionState::Idle.priority());
         assert!(SessionState::Idle.priority() > SessionState::Dead.priority());
     }
 

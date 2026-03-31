@@ -131,10 +131,13 @@ impl LeftPanel {
                             == app.projects[*project_index].worktrees.len() - 1;
                         let branch_char = if is_last { "└" } else { "├" };
                         // セッションレジストリから状態バッジを取得（なければ既存アイコン）
-                        let icon = session_registry
-                            .and_then(|reg| reg.aggregate_state(project_name, &wt.name))
-                            .map(|s| s.badge())
-                            .unwrap_or_else(|| wt.status.icon());
+                        let session_state = session_registry
+                            .and_then(|reg| reg.aggregate_state(project_name, &wt.name));
+                        let (icon, icon_color) = if let Some(state) = session_state {
+                            (state.badge_char(), state.badge_color())
+                        } else {
+                            (wt.status.icon(), Color::DarkGray)
+                        };
 
                         let is_selected = app.selected_worktree == Some((*project_index, *worktree_index));
                         let name_fg = if is_selected {
@@ -148,9 +151,12 @@ impl LeftPanel {
                             Color::DarkGray
                         };
 
-                        let name_part = format!("  {} {} {} ", branch_char, icon, wt.name);
+                        let prefix = format!("  {} ", branch_char);
+                        let name_part = format!(" {} ", wt.name);
                         let branch_part = format!(" {}", wt.branch);
                         let mut spans = vec![
+                            Span::styled(prefix, Style::default().fg(name_fg)),
+                            Span::styled(icon, Style::default().fg(icon_color)),
                             Span::styled(name_part, Style::default().fg(name_fg)),
                             Span::styled(branch_part, Style::default().fg(branch_fg).dim()),
                         ];

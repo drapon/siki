@@ -480,10 +480,13 @@ async fn handle_event(
             if app.show_siki_json_init_terminal {
                 app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
             }
-            // ハートビートタイムアウト: 30秒間更新がないセッションを Dead にする
+            // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
             if let Some(registry) = session_registry {
                 let mut reg = registry.lock().unwrap();
-                reg.expire_stale_sessions(std::time::Duration::from_secs(30));
+                reg.expire_stale_sessions(
+                    std::time::Duration::from_secs(15),
+                    std::time::Duration::from_secs(30),
+                );
             }
         }
     }
