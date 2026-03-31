@@ -1127,21 +1127,7 @@ fn handle_main_panel_key(
             // 新しい Claude Code タブを追加
             if let Some(wt_id) = app.selected_worktree {
                 // 同じ worktree にアクティブセッションがあるかチェック
-                let has_active = session_registry.as_ref().and_then(|reg| {
-                    let reg = reg.lock().ok()?;
-                    let wt = app.worktree_by_id(wt_id)?;
-                    let project = &app.projects[wt_id.0].name;
-                    let sessions: Vec<_> = reg.by_worktree(project, &wt.name)
-                        .into_iter()
-                        .filter(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
-                        .map(|s| {
-                            let summary = s.role.clone();
-                            (s.session_id.clone(), summary)
-                        })
-                        .collect();
-                    if sessions.is_empty() { None } else { Some(sessions) }
-                });
-
+                let has_active = find_active_sessions(session_registry, app, wt_id);
                 if let Some(sessions) = has_active {
                     app.show_session_choice = true;
                     app.session_choice_wt_id = Some(wt_id);
@@ -1531,6 +1517,42 @@ fn resize_terminals(
 /// Claude Code を中央パネルで起動する
 ///
 /// プロジェクトのパスで `claude` をインタラクティブに起動する。
+/// 同じ worktree 内のアクティブセッションを検索する
+/// 表示用に (session_id, 表示ラベル) のペアを返す
+fn find_active_sessions(
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
+    app: &app::App,
+    wt_id: app::WorktreeId,
+) -> Option<Vec<(String, String)>> {
+    let reg = session_registry.as_ref()?.lock().ok()?;
+    let wt = app.worktree_by_id(wt_id)?;
+    let project = &app.projects[wt_id.0].name;
+
+    // DB から summary を取得
+    let db_path = config::db_path();
+    let db_sessions = db::init(&db_path)
+        .ok()
+        .and_then(|conn| db::list_sessions(&conn).ok())
+        .unwrap_or_default();
+
+    let sessions: Vec<_> = reg
+        .by_worktree(project, &wt.name)
+        .into_iter()
+        .filter(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
+        .map(|s| {
+            // DB から summary を探す
+            let label = db_sessions
+                .iter()
+                .find(|ds| ds.session_id == s.session_id)
+                .and_then(|ds| ds.summary.clone())
+                .unwrap_or_else(|| s.role.clone());
+            (s.session_id.clone(), label)
+        })
+        .collect();
+
+    if sessions.is_empty() { None } else { Some(sessions) }
+}
+
 /// 選択されたセッションを参照するためのプロンプトを組み立てる
 fn build_session_context(
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
@@ -1656,18 +1678,7 @@ fn handle_claude_terminal_key(
 
     // Ctrl+t で新しい Claude タブを追加（アクティブセッションチェック付き）
     if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        let has_active = session_registry.as_ref().and_then(|reg| {
-            let reg = reg.lock().ok()?;
-            let wt = app.worktree_by_id(wt_id)?;
-            let project = &app.projects[wt_id.0].name;
-            let sessions: Vec<_> = reg.by_worktree(project, &wt.name)
-                .into_iter()
-                .filter(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
-                .map(|s| (s.session_id.clone(), s.role.clone()))
-                .collect();
-            if sessions.is_empty() { None } else { Some(sessions) }
-        });
-
+        let has_active = find_active_sessions(session_registry, app, wt_id);
         if let Some(sessions) = has_active {
             app.show_session_choice = true;
             app.session_choice_wt_id = Some(wt_id);

@@ -181,8 +181,9 @@ fn render_session_list_popup(frame: &mut Frame, app: &App) {
     let items: Vec<ListItem> = app
         .session_list_items
         .iter()
-        .map(|(id, role)| {
-            let text = format!(" {} ({})", &id[..8.min(id.len())], role);
+        .map(|(id, label)| {
+            let short_id = &id[..8.min(id.len())];
+            let text = format!(" {} — {}", short_id, label);
             ListItem::new(text)
         })
         .collect();
