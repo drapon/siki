@@ -108,7 +108,7 @@ fn inject_mcp_json(worktree_path: &Path) {
     // siki が生成したファイルを git 追跡から除外
     exclude_from_git(worktree_path, ".mcp.json");
     exclude_from_git(worktree_path, ".claude/rules/siki.md");
-    exclude_from_git(worktree_path, ".claude/handoff/");
+    exclude_from_git(worktree_path, ".claude/rules/siki-context.md");
 }
 
 /// .claude/rules/siki.md にセッション開始ルールを書き込む

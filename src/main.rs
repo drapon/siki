@@ -274,7 +274,7 @@ async fn handle_event(
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                             let tx = event_tx.clone();
-                            app.show_info("Generating context summary...".to_string());
+                            app.show_info("Generating summary & launching Claude...".to_string());
                             tokio::spawn(async move {
                                 let summary = tokio::process::Command::new("claude")
                                     .args(["-c", "-p", "Summarize what you were working on in detail. Include: the goal, what was done, key files changed, decisions made, current status, and any remaining work. Be specific about file paths and code changes."])
@@ -285,15 +285,15 @@ async fn handle_event(
                                     .filter(|o| o.status.success())
                                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                                     .unwrap_or_default();
-                                // サマリーを handoff ディレクトリに書き込む
-                                let handoff_dir = wt_path.join(".claude/handoff");
-                                let _ = std::fs::create_dir_all(&handoff_dir);
+                                // サマリーを rules ファイルに書き込む（Claude Code が自動でシステムコンテキストとして読み込む）
+                                let rules_dir = wt_path.join(".claude/rules");
+                                let _ = std::fs::create_dir_all(&rules_dir);
                                 let context = if summary.is_empty() {
-                                    "# Previous Session\n\nNo context available.\n".to_string()
+                                    "# Handoff from previous session\n\nNo context available from the previous session.\n".to_string()
                                 } else {
-                                    format!("# Previous Session Summary\n\n{}\n", summary)
+                                    format!("# Handoff from previous session\n\nBelow is a summary of what the previous session was working on. Use this as background context only. Do NOT take any action until the user gives you instructions.\n\n{}\n", summary)
                                 };
-                                let _ = std::fs::write(handoff_dir.join("context.md"), &context);
+                                let _ = std::fs::write(rules_dir.join("siki-context.md"), &context);
                                 let _ = tx.send(event::AppEvent::SessionContext {
                                     worktree_id: wt_id,
                                 });
@@ -525,8 +525,8 @@ async fn handle_event(
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
         AppEvent::SessionContext { worktree_id } => {
-            app.show_info("Launching Claude with previous context...".to_string());
-            launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &["--add-dir", ".claude/handoff"]);
+            // サマリーが .claude/rules/siki-context.md に書き込み済み → Claude が自動で読み込む
+            launch_claude(app, claude_terms, event_tx, worktree_id);
         }
         AppEvent::Tick => {
             app.clear_expired_status();
