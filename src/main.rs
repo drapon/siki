@@ -1436,9 +1436,21 @@ fn handle_claude_terminal_key(
         return;
     }
 
-    // Shift+PageUp/PageDown でスクロールバック操作
+    // Shift+Up/Down/PageUp/PageDown でスクロールバック操作
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         match key.code {
+            KeyCode::Up => {
+                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(1);
+                }
+                return;
+            }
+            KeyCode::Down => {
+                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(1);
+                }
+                return;
+            }
             KeyCode::PageUp => {
                 if let Some(wt) = app.worktree_by_id_mut(wt_id) {
                     wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(10);
@@ -1453,23 +1465,6 @@ fn handle_claude_terminal_key(
             }
             _ => {}
         }
-    }
-
-    // Up/Down キーでスクロールバック操作
-    match key.code {
-        KeyCode::Up => {
-            if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(1);
-            }
-            return;
-        }
-        KeyCode::Down => {
-            if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(1);
-            }
-            return;
-        }
-        _ => {}
     }
 
     // 入力操作時はスクロールを最新に戻す
