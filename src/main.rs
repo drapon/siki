@@ -266,11 +266,29 @@ async fn handle_event(
                         }
                     }
                     KeyCode::Char('2') => {
-                        // Continue with context → 新規セッション + コンパクトなサマリー
+                        // Continue with context:
+                        // 1. claude -c -p で前セッションのサマリーを取得
+                        // 2. そのサマリーで新規セッションを起動
                         app.show_session_choice = false;
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
-                            let summary = build_context_summary(app, wt_id);
-                            launch_claude_with_args(app, claude_terms, event_tx, wt_id, &[&summary]);
+                            let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+                            let tx = event_tx.clone();
+                            app.show_info("Generating context summary...".to_string());
+                            tokio::spawn(async move {
+                                let summary = tokio::process::Command::new("claude")
+                                    .args(["-c", "-p", "Summarize what you were working on, key decisions, and current status in under 200 words. Be specific about file names and changes."])
+                                    .current_dir(&wt_path)
+                                    .output()
+                                    .await
+                                    .ok()
+                                    .filter(|o| o.status.success())
+                                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                    .unwrap_or_default();
+                                let _ = tx.send(event::AppEvent::SessionContext {
+                                    worktree_id: wt_id,
+                                    summary,
+                                });
+                            });
                         }
                     }
                     _ => {}
@@ -496,7 +514,15 @@ async fn handle_event(
         }
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
-            // TUI は次の描画サイクルでレジストリを参照して表示を更新する
+        }
+        AppEvent::SessionContext { worktree_id, summary } => {
+            // 前セッションのサマリーが取得できたら、それを初期プロンプトとして Claude を起動
+            let prompt = if summary.is_empty() {
+                "Continue the previous session's work. Review the codebase and proceed.".to_string()
+            } else {
+                format!("Previous session context:\n{}\n\nContinue from where it left off.", summary)
+            };
+            launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &[&prompt]);
         }
         AppEvent::Tick => {
             app.clear_expired_status();
@@ -1470,52 +1496,6 @@ fn resize_terminals(
 /// Claude Code を中央パネルで起動する
 ///
 /// プロジェクトのパスで `claude` をインタラクティブに起動する。
-/// worktree のコンパクトなコンテキストサマリーを生成する
-fn build_context_summary(app: &app::App, wt_id: app::WorktreeId) -> String {
-    let wt = match app.worktree_by_id(wt_id) {
-        Some(wt) => wt,
-        None => return "Continue previous work.".to_string(),
-    };
-    let path = &wt.path;
-
-    let branch = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    let log = std::process::Command::new("git")
-        .args(["log", "--oneline", "-3"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    let status = std::process::Command::new("git")
-        .args(["diff", "--stat", "--cached"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    let mut summary = format!("Continuing work on branch '{}'. ", branch);
-    if !log.is_empty() {
-        summary.push_str(&format!("Last commits: {}. ", log.replace('\n', "; ")));
-    }
-    if !status.is_empty() {
-        summary.push_str(&format!("Staged: {}. ", status.replace('\n', "; ")));
-    }
-    summary.push_str("Review the codebase and continue.");
-    summary
-}
-
 /// 同じ worktree 内にアクティブセッションがあるか判定する
 fn has_active_sessions(
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,

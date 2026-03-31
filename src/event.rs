@@ -44,6 +44,11 @@ pub enum AppEvent {
         session_id: String,
         state: crate::session::SessionState,
     },
+    /// 前セッションのコンテキストサマリー取得完了
+    SessionContext {
+        worktree_id: WorktreeId,
+        summary: String,
+    },
 }
 
 /// Claude Code ストリームイベント型
