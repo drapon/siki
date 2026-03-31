@@ -149,6 +149,18 @@ impl SessionRegistry {
             .max_by_key(|s| s.priority())
     }
 
+    /// タイムアウトしたセッションを Dead にする
+    pub fn expire_stale_sessions(&mut self, timeout: std::time::Duration) {
+        let now = Instant::now();
+        for session in self.sessions.values_mut() {
+            if session.state != SessionState::Dead
+                && now.duration_since(session.last_seen) > timeout
+            {
+                session.state = SessionState::Dead;
+            }
+        }
+    }
+
     /// HookEvent を処理してレジストリを更新する。変更があれば true を返す。
     pub fn handle_event(&mut self, event: HookEvent) -> bool {
         match event {

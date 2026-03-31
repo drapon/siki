@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
 
         // UI 描画
         tui_terminal.draw(|frame| {
+            let registry = session_registry.lock().unwrap();
             last_layout = Some(ui::render(
                 frame,
                 &mut app,
@@ -159,6 +160,7 @@ async fn main() -> Result<()> {
                 terminal_tab_info.as_ref(),
                 claude_screen,
                 siki_init_screen,
+                Some(&registry),
             ));
         })?;
 
@@ -188,6 +190,7 @@ async fn main() -> Result<()> {
             &shell,
             ev,
             last_layout.as_ref(),
+            &Some(Arc::clone(&session_registry)),
         )
         .await;
     }
@@ -217,6 +220,7 @@ async fn handle_event(
     shell: &str,
     event: event::AppEvent,
     last_layout: Option<&ui::layout::AppLayout>,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
     use event::AppEvent;
@@ -466,6 +470,11 @@ async fn handle_event(
             app.clear_expired_status();
             if app.show_siki_json_init_terminal {
                 app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
+            }
+            // ハートビートタイムアウト: 30秒間更新がないセッションを Dead にする
+            if let Some(registry) = session_registry {
+                let mut reg = registry.lock().unwrap();
+                reg.expire_stale_sessions(std::time::Duration::from_secs(30));
             }
         }
     }
@@ -1766,6 +1775,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(!app.running);
@@ -1798,6 +1808,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('?'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_help);
@@ -1830,6 +1841,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_help);
@@ -1863,6 +1875,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -1896,6 +1909,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Main);
@@ -1928,6 +1942,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
             None,
+            &None,
         )
         .await;
         // Main パネルでは Tab はタブ切替なのでフォーカスは変わらない
@@ -1961,6 +1976,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::BackTab)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Terminal);
@@ -1993,6 +2009,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(shift_key(KeyCode::Tab)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Terminal);
@@ -2028,6 +2045,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_message_popup);
@@ -2062,6 +2080,7 @@ mod tests {
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
+                &None,
             )
             .await;
         }
@@ -2096,6 +2115,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.popup_input, "a");
@@ -2129,6 +2149,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -2165,6 +2186,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(ctrl_key('\\')),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Right);
@@ -2198,6 +2220,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Right);
@@ -2236,6 +2259,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Tick,
             None,
+            &None,
         )
         .await;
         assert!(app.status_message.is_none());
@@ -2269,6 +2293,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Tick,
             None,
+            &None,
         )
         .await;
         assert!(app.status_message.is_some());
@@ -2307,6 +2332,7 @@ mod tests {
                 },
             },
             None,
+            &None,
         )
         .await;
 
@@ -2345,6 +2371,7 @@ mod tests {
                 worktree_id: (0, 0),
             },
             None,
+            &None,
         )
         .await;
 
@@ -2385,6 +2412,7 @@ mod tests {
                 error: "test error".to_string(),
             },
             None,
+            &None,
         )
         .await;
 
@@ -2426,6 +2454,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('j'))),
             None,
+            &None,
         )
         .await;
         assert_eq!(left_panel.cursor_index, 1);
@@ -2460,6 +2489,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('i'))),
             None,
+            &None,
         )
         .await;
         // claude がインストールされていない環境ではエラーが表示される
@@ -2506,6 +2536,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('t'))),
             None,
+            &None,
         )
         .await;
         assert_eq!(
@@ -2554,6 +2585,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
             Some(&layout),
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Main);
@@ -2596,6 +2628,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
             Some(&layout),
+            &None,
         )
         .await;
         // ポップアップ表示中はフォーカス変わらない
@@ -2634,6 +2667,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_worktree_popup);
@@ -2671,6 +2705,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_worktree_popup);
@@ -2705,6 +2740,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_siki_json_confirm);
@@ -2739,6 +2775,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_worktree_popup);
@@ -2773,6 +2810,7 @@ mod tests {
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
+                &None,
             )
             .await;
         }
@@ -2807,6 +2845,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.add_worktree_input, "a");
@@ -2841,6 +2880,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         // ポップアップは閉じず、worktree も追加されない
@@ -2876,6 +2916,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -2938,6 +2979,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
 
@@ -2982,6 +3024,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('A'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_project_popup);
@@ -3017,6 +3060,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3051,6 +3095,7 @@ mod tests {
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
+                &None,
             )
             .await;
         }
@@ -3086,6 +3131,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_project_popup);
@@ -3121,6 +3167,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3162,6 +3209,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3198,6 +3246,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -3239,6 +3288,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Left);

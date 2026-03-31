@@ -1,4 +1,5 @@
 use crate::app::{App, Project, WorktreeId};
+use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
@@ -93,7 +94,14 @@ impl LeftPanel {
     }
 
     /// 左パネルを描画する
-    pub fn render(&self, frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        app: &App,
+        focused: bool,
+        session_registry: Option<&SessionRegistry>,
+    ) {
         let entries = Self::build_entries(&app.projects);
 
         let items: Vec<ListItem> = entries
@@ -118,10 +126,15 @@ impl LeftPanel {
                         worktree_index,
                     } => {
                         let wt = &app.projects[*project_index].worktrees[*worktree_index];
+                        let project_name = &app.projects[*project_index].name;
                         let is_last = *worktree_index
                             == app.projects[*project_index].worktrees.len() - 1;
                         let branch_char = if is_last { "└" } else { "├" };
-                        let icon = wt.status.icon();
+                        // セッションレジストリから状態バッジを取得（なければ既存アイコン）
+                        let icon = session_registry
+                            .and_then(|reg| reg.aggregate_state(project_name, &wt.name))
+                            .map(|s| s.badge())
+                            .unwrap_or_else(|| wt.status.icon());
 
                         let is_selected = app.selected_worktree == Some((*project_index, *worktree_index));
                         let name_fg = if is_selected {
