@@ -44,8 +44,8 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
         "echo '{{\"event\":\"dead\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
     ), true);
 
-    // siki MCP サーバーを自動登録
-    inject_mcp_server(&mut settings);
+    // worktree ルートに .mcp.json を作成して siki MCP サーバーを登録
+    inject_mcp_json(worktree_path);
 
     let content = serde_json::to_string_pretty(&settings)
         .context("settings.json のシリアライズに失敗")?;
@@ -55,29 +55,36 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
     Ok(())
 }
 
-/// siki MCP サーバーの設定を注入する
+/// worktree ルートに .mcp.json を作成して siki MCP サーバーを登録する
 ///
-/// 実行中の siki バイナリのパスを自動検出し、mcpServers に登録する。
-fn inject_mcp_server(settings: &mut Value) {
-    let siki_path = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "siki".to_string());
+/// Claude Code は .claude/settings.json ではなく .mcp.json から MCP 設定を読む。
+/// セッション開始前に存在している必要がある。
+fn inject_mcp_json(worktree_path: &Path) {
+    let mcp_path = worktree_path.join(".mcp.json");
 
-    let mcp_servers = settings
+    let mut config = std::fs::read_to_string(&mcp_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({"mcpServers": {}}));
+
+    let servers = config
         .as_object_mut()
         .unwrap()
         .entry("mcpServers")
         .or_insert_with(|| json!({}));
 
-    let servers = match mcp_servers.as_object_mut() {
+    let servers = match servers.as_object_mut() {
         Some(s) => s,
         None => return,
     };
 
-    // 既に siki が登録済みなら上書きしない
     if servers.contains_key("siki") {
         return;
     }
+
+    let siki_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "siki".to_string());
 
     servers.insert(
         "siki".to_string(),
@@ -87,6 +94,10 @@ fn inject_mcp_server(settings: &mut Value) {
             "args": ["mcp"]
         }),
     );
+
+    if let Ok(content) = serde_json::to_string_pretty(&config) {
+        let _ = std::fs::write(&mcp_path, content);
+    }
 }
 
 /// settings.json を読み込む。なければ空オブジェクトを返す。
