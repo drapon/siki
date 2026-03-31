@@ -144,6 +144,24 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["target"]
             }),
         },
+        ToolDefinition {
+            name: "get_context".to_string(),
+            description: "Fetch context from another session or worktree (pull model). Returns git log, changed files, diff stats, branch, and work summary. Use this to understand what another session has been working on without requiring them to send you anything.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["session", "worktree", "project"] },
+                            "id": { "type": "string", "description": "session_id, worktree name, or project name" }
+                        },
+                        "required": ["type", "id"]
+                    }
+                },
+                "required": ["target"]
+            }),
+        },
     ]
 }
 
@@ -178,7 +196,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub fn execute_tool(
         "broadcast" => broadcast(conn, params, session_id),
         "set_summary" => set_summary(conn, params, session_id),
         "handoff" => handoff(conn, params, session_id),
+        "get_context" => get_context(conn, params),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -198,6 +199,59 @@ fn handoff(conn: &Connection, params: &Value, from_session: &str) -> Result<Valu
     )?;
 
     Ok(json!({ "delivered": true }))
+}
+
+/// 指定セッション/worktreeのコンテキストを取得する（pull型の引き継ぎ）
+fn get_context(conn: &Connection, params: &Value) -> Result<Value> {
+    let target = params.get("target").ok_or_else(|| anyhow::anyhow!("target is required"))?;
+    let target_type = target
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("target.type is required"))?;
+    let target_id = target
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("target.id is required"))?;
+
+    // 対象セッションを検索
+    let sessions = db::list_sessions(conn)?;
+    let targets: Vec<&db::SessionRow> = match target_type {
+        "session" => sessions.iter().filter(|s| s.session_id == target_id).collect(),
+        "worktree" => sessions.iter().filter(|s| s.worktree_name == target_id).collect(),
+        "project" => sessions.iter().filter(|s| s.project_name == target_id).collect(),
+        _ => anyhow::bail!("Invalid target type: {}", target_type),
+    };
+
+    if targets.is_empty() {
+        return Ok(json!({
+            "error": format!("No sessions found for {} '{}'", target_type, target_id),
+            "sessions": []
+        }));
+    }
+
+    let mut contexts = Vec::new();
+    for session in &targets {
+        let cwd = &session.cwd;
+        let git_log = run_git(cwd, &["log", "--oneline", "-10"]);
+        let git_status = run_git(cwd, &["status", "--short"]);
+        let git_diff_stat = run_git(cwd, &["diff", "--stat", "HEAD"]);
+        let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        contexts.push(json!({
+            "session_id": session.session_id,
+            "worktree_name": session.worktree_name,
+            "project_name": session.project_name,
+            "role": session.role,
+            "state": session.state,
+            "summary": session.summary,
+            "branch": branch.trim(),
+            "recent_commits": git_log.lines().collect::<Vec<_>>(),
+            "changed_files": git_status.lines().collect::<Vec<_>>(),
+            "diff_stat": git_diff_stat.trim(),
+        }));
+    }
+
+    Ok(json!({ "contexts": contexts }))
 }
 
 fn run_git(cwd: &str, args: &[&str]) -> String {
