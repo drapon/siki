@@ -285,15 +285,15 @@ async fn handle_event(
                                     .filter(|o| o.status.success())
                                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                                     .unwrap_or_default();
-                                // サマリーを rules ファイルに書き込む（Claude Code が自動でシステムコンテキストとして読み込む）
-                                let rules_dir = wt_path.join(".claude/rules");
-                                let _ = std::fs::create_dir_all(&rules_dir);
+                                // サマリーを一時ファイルに書き込む
+                                let handoff_path = wt_path.join(".claude/siki-handoff.md");
+                                let _ = std::fs::create_dir_all(wt_path.join(".claude"));
                                 let context = if summary.is_empty() {
-                                    "# Handoff from previous session\n\nNo context available from the previous session.\n".to_string()
+                                    "# Previous Session\n\nNo context available.\n".to_string()
                                 } else {
-                                    format!("# Handoff from previous session\n\nBelow is a summary of what the previous session was working on. Use this as background context only. Do NOT take any action until the user gives you instructions.\n\n{}\n", summary)
+                                    format!("# Previous Session Summary\n\n{}\n", summary)
                                 };
-                                let _ = std::fs::write(rules_dir.join("siki-context.md"), &context);
+                                let _ = std::fs::write(&handoff_path, &context);
                                 let _ = tx.send(event::AppEvent::SessionContext {
                                     worktree_id: wt_id,
                                 });
@@ -525,8 +525,28 @@ async fn handle_event(
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
         AppEvent::SessionContext { worktree_id } => {
-            // サマリーが .claude/rules/siki-context.md に書き込み済み → Claude が自動で読み込む
+            // Claude を起動し、起動完了後に @file で添付する
             launch_claude(app, claude_terms, event_tx, worktree_id);
+
+            // Claude PTY に @file を遅延書き込み（起動待ち）
+            let claude_idx = app.worktree_by_id(worktree_id)
+                .map(|wt| wt.claude_tabs.saturating_sub(1))
+                .unwrap_or(0);
+            let wt_id = worktree_id;
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                // Claude 起動待ち
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                let _ = tx.send(AppEvent::SessionContextReady {
+                    worktree_id: wt_id,
+                    claude_idx,
+                });
+            });
+        }
+        AppEvent::SessionContextReady { worktree_id, claude_idx } => {
+            if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
+                let _ = emu.write(b"@.claude/siki-handoff.md\n");
+            }
         }
         AppEvent::Tick => {
             app.clear_expired_status();

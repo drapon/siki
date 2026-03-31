@@ -48,6 +48,11 @@ pub enum AppEvent {
     SessionContext {
         worktree_id: WorktreeId,
     },
+    /// Claude 起動完了 → @file で添付する
+    SessionContextReady {
+        worktree_id: WorktreeId,
+        claude_idx: usize,
+    },
 }
 
 /// Claude Code ストリームイベント型
