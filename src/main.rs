@@ -285,17 +285,9 @@ async fn handle_event(
                                     .filter(|o| o.status.success())
                                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                                     .unwrap_or_default();
-                                // サマリーを一時ファイルに書き込む
-                                let handoff_path = wt_path.join(".claude/siki-handoff.md");
-                                let _ = std::fs::create_dir_all(wt_path.join(".claude"));
-                                let context = if summary.is_empty() {
-                                    "# Previous Session\n\nNo context available.\n".to_string()
-                                } else {
-                                    format!("# Previous Session Summary\n\n{}\n", summary)
-                                };
-                                let _ = std::fs::write(&handoff_path, &context);
                                 let _ = tx.send(event::AppEvent::SessionContext {
                                     worktree_id: wt_id,
+                                    summary,
                                 });
                             });
                         }
@@ -524,14 +516,15 @@ async fn handle_event(
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
-        AppEvent::SessionContext { worktree_id } => {
-            // --append-system-prompt-file でサマリーをシステムプロンプトに追加して起動
-            let handoff_path = app.worktree_by_id(worktree_id)
-                .map(|wt| wt.path.join(".claude/siki-handoff.md").to_string_lossy().to_string())
-                .unwrap_or_default();
+        AppEvent::SessionContext { worktree_id, summary } => {
+            let prompt = if summary.is_empty() {
+                "Previous session had no context available.".to_string()
+            } else {
+                format!("Previous session context:\n{}", summary)
+            };
             launch_claude_with_args(
                 app, claude_terms, event_tx, worktree_id,
-                &["--append-system-prompt-file", &handoff_path],
+                &["--append-system-prompt", &prompt],
             );
         }
         AppEvent::Tick => {

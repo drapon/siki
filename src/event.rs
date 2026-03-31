@@ -47,6 +47,7 @@ pub enum AppEvent {
     /// 前セッションのコンテキストサマリー取得完了 → Claude を起動する
     SessionContext {
         worktree_id: WorktreeId,
+        summary: String,
     },
 }
 
