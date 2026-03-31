@@ -276,7 +276,7 @@ async fn handle_event(
                             app.show_info("Generating context summary...".to_string());
                             tokio::spawn(async move {
                                 let summary = tokio::process::Command::new("claude")
-                                    .args(["-c", "-p", "Summarize what you were working on, key decisions, and current status in under 200 words. Be specific about file names and changes."])
+                                    .args(["-c", "-p", "Summarize what you were working on in detail. Include: the goal, what was done, key files changed, decisions made, current status, and any remaining work. Be specific about file paths and code changes."])
                                     .current_dir(&wt_path)
                                     .output()
                                     .await
@@ -518,9 +518,9 @@ async fn handle_event(
         AppEvent::SessionContext { worktree_id, summary } => {
             // 前セッションのサマリーが取得できたら、それを初期プロンプトとして Claude を起動
             let prompt = if summary.is_empty() {
-                "Continue the previous session's work. Review the codebase and proceed.".to_string()
+                "A previous session was active but no context could be retrieved. Awaiting your instructions.".to_string()
             } else {
-                format!("Previous session context:\n{}\n\nContinue from where it left off.", summary)
+                format!("Here is the context from the previous session:\n\n{}\n\nI've reviewed the above. Ready for your instructions.", summary)
             };
             launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &[&prompt]);
         }
