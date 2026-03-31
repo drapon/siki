@@ -33,7 +33,7 @@ impl SessionState {
     pub fn badge_color(&self) -> ratatui::style::Color {
         use ratatui::style::Color;
         match self {
-            Self::Working => Color::Yellow,
+            Self::Working => Color::Green,
             Self::Waiting => Color::Red,
             Self::Idle => Color::DarkGray,
             Self::Stale => Color::DarkGray,
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn test_session_state_badge_color() {
         use ratatui::style::Color;
-        assert_eq!(SessionState::Working.badge_color(), Color::Yellow);
+        assert_eq!(SessionState::Working.badge_color(), Color::Green);
         assert_eq!(SessionState::Waiting.badge_color(), Color::Red);
         assert_eq!(SessionState::Idle.badge_color(), Color::DarkGray);
         assert_eq!(SessionState::Stale.badge_color(), Color::DarkGray);
