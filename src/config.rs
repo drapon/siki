@@ -419,6 +419,11 @@ pub fn sock_path() -> std::path::PathBuf {
     siki_home().join("sock")
 }
 
+/// SQLite データベースのパスを返す: ~/.siki/siki.db
+pub fn db_path() -> std::path::PathBuf {
+    siki_home().join("siki.db")
+}
+
 /// ユーザーのデフォルトシェルを検出する
 pub fn detect_default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// worktree の `.claude/settings.json` に siki 用 hook を注入する
 ///
@@ -22,21 +22,36 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
 
     let sock = sock_path.to_string_lossy();
 
+    // SIKI_SID: CLAUDE_SESSION_ID があればそれを使い、なければ PID ベースの ID を生成
+    let sid_expr = "${CLAUDE_SESSION_ID:-siki-$$}";
+
     inject_hook(hooks, "SessionStart", &format!(
-        "echo '{{\"event\":\"register\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\",\"cwd\":\"'\"$PWD\"'\",\"role\":\"'\"${{SIKI_ROLE:-default}}\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"register\",\"session_id\":\"'\"{sid_expr}\"'\",\"cwd\":\"'\"$PWD\"'\",\"role\":\"'\"${{SIKI_ROLE:-default}}\"'\"}}' | nc -U {sock}"
     ), false);
 
     inject_hook(hooks, "PreToolUse", &format!(
-        "echo '{{\"event\":\"working\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"working\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
 
-    inject_hook(hooks, "PostToolUse", &format!(
-        "echo '{{\"event\":\"idle\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
+    inject_hook(hooks, "PermissionRequest", &format!(
+        "echo '{{\"event\":\"waiting\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
+
+    // PostToolUse では idle にしない — Stop まで working を維持する
 
     inject_hook(hooks, "Stop", &format!(
-        "echo '{{\"event\":\"idle\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"idle\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
+
+    inject_hook(hooks, "SessionEnd", &format!(
+        "echo '{{\"event\":\"dead\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
+    ), true);
+
+    // worktree ルートに .mcp.json を作成して siki MCP サーバーを登録
+    inject_mcp_json(worktree_path);
+
+    // .claude/rules/siki.md にセッション開始時のルールを書き込む
+    inject_rules(&claude_dir);
 
     let content = serde_json::to_string_pretty(&settings)
         .context("settings.json のシリアライズに失敗")?;
@@ -44,6 +59,114 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
         .with_context(|| format!("settings.json の書き込みに失敗: {}", settings_path.display()))?;
 
     Ok(())
+}
+
+/// worktree ルートに .mcp.json を作成して siki MCP サーバーを登録する
+///
+/// Claude Code は .claude/settings.json ではなく .mcp.json から MCP 設定を読む。
+/// セッション開始前に存在している必要がある。
+fn inject_mcp_json(worktree_path: &Path) {
+    let mcp_path = worktree_path.join(".mcp.json");
+
+    let mut config = std::fs::read_to_string(&mcp_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({"mcpServers": {}}));
+
+    let servers = config
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}));
+
+    let servers = match servers.as_object_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    if servers.contains_key("siki") {
+        return;
+    }
+
+    let siki_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "siki".to_string());
+
+    servers.insert(
+        "siki".to_string(),
+        json!({
+            "type": "stdio",
+            "command": siki_path,
+            "args": ["mcp"]
+        }),
+    );
+
+    if let Ok(content) = serde_json::to_string_pretty(&config) {
+        let _ = std::fs::write(&mcp_path, content);
+    }
+
+    // siki が生成したファイルを git 追跡から除外
+    exclude_from_git(worktree_path, ".mcp.json");
+    exclude_from_git(worktree_path, ".claude/rules/siki.md");
+    exclude_from_git(worktree_path, ".claude/siki-handoff.md");
+}
+
+/// .claude/rules/siki.md にセッション開始ルールを書き込む
+fn inject_rules(claude_dir: &Path) {
+    let rules_dir = claude_dir.join("rules");
+    let _ = std::fs::create_dir_all(&rules_dir);
+    let rules_path = rules_dir.join("siki.md");
+
+    // 既に存在すれば上書きしない
+    if rules_path.exists() {
+        return;
+    }
+
+    let content = r#"# siki session rules
+
+BEFORE responding to the user's first message, you MUST:
+
+1. Call the `list_sessions` MCP tool (siki server).
+2. If the result shows active sessions in the same worktree AND pending_messages is not empty, deliver the messages first.
+3. If active sessions exist in the same worktree (even without messages), show:
+   `Active session(s) found. [1] Start new  [2] Reference existing`
+   Wait for user choice. Default is 1.
+   If user picks 2, list active sessions with summaries, let user pick one, then call `get_context` for it.
+4. Once work begins, call `set_summary` with a short task description.
+"#;
+
+    let _ = std::fs::write(&rules_path, content);
+}
+
+/// .git/info/exclude にパターンを追加して git 追跡から除外する
+fn exclude_from_git(worktree_path: &Path, pattern: &str) {
+    // worktree の .git はファイル（"gitdir: ..." 形式）またはディレクトリ
+    let git_path = worktree_path.join(".git");
+    let info_dir = if git_path.is_dir() {
+        git_path.join("info")
+    } else if let Ok(content) = std::fs::read_to_string(&git_path) {
+        // "gitdir: /path/to/.git/worktrees/<name>"
+        if let Some(gitdir) = content.strip_prefix("gitdir: ") {
+            PathBuf::from(gitdir.trim()).join("info")
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+
+    let _ = std::fs::create_dir_all(&info_dir);
+    let exclude_path = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if !existing.lines().any(|line| line.trim() == pattern) {
+        let mut content = existing;
+        if !content.ends_with('\n') && !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(pattern);
+        content.push('\n');
+        let _ = std::fs::write(&exclude_path, content);
+    }
 }
 
 /// settings.json を読み込む。なければ空オブジェクトを返す。
@@ -182,8 +305,9 @@ mod tests {
         // 各イベントに hook が存在する
         assert!(settings["hooks"]["SessionStart"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().len() > 0);
-        assert!(settings["hooks"]["PostToolUse"].as_array().unwrap().len() > 0);
+        assert!(settings["hooks"]["PermissionRequest"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["Stop"].as_array().unwrap().len() > 0);
+        assert!(settings["hooks"]["SessionEnd"].as_array().unwrap().len() > 0);
     }
 
     #[test]

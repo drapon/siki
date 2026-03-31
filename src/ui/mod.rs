@@ -7,6 +7,7 @@ pub mod source_tree;
 pub mod syntax;
 
 use crate::app::{App, Panel};
+use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -31,11 +32,12 @@ pub fn render(
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
     siki_init_screen: Option<&vt100::Screen>,
+    session_registry: Option<&SessionRegistry>,
 ) -> layout::AppLayout {
     let areas = layout::compute_layout(frame.area());
 
     // 左パネル
-    left_panel.render(frame, areas.left, app, app.focused_panel == Panel::Left);
+    left_panel.render(frame, areas.left, app, app.focused_panel == Panel::Left, session_registry);
 
     // 中央パネル
     main_panel::render(
@@ -117,6 +119,10 @@ pub fn render(
         render_siki_json_confirm_popup(frame);
     }
 
+    if app.show_session_choice {
+        render_session_choice_popup(frame);
+    }
+
     // siki.json 作成オーバーレイターミナル
     if app.show_siki_json_init_terminal {
         render_siki_json_init_terminal(
@@ -128,6 +134,28 @@ pub fn render(
     }
 
     areas
+}
+
+fn render_session_choice_popup(frame: &mut Frame) {
+    use ratatui::widgets::{Clear, Paragraph};
+
+    let area = frame.area();
+    let w = 42.min(area.width);
+    let h = 5.min(area.height);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup_area = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Active Session Found")
+        .border_style(Style::default().fg(Color::Yellow));
+    let text = " [1] Start new (default)\n [2] Continue with context";
+    frame.render_widget(
+        Paragraph::new(text).block(block).style(Style::default().fg(Color::White)),
+        popup_area,
+    );
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {

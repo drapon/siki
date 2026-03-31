@@ -1,10 +1,12 @@
 use anyhow::Result;
+use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
+use crate::db;
 use crate::event::AppEvent;
 use crate::session::{HookEvent, SessionRegistry, SessionState};
 
@@ -12,6 +14,7 @@ use crate::session::{HookEvent, SessionRegistry, SessionState};
 pub struct Broker {
     listener: UnixListener,
     registry: Arc<Mutex<SessionRegistry>>,
+    db: Arc<Mutex<Connection>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 }
 
@@ -20,6 +23,7 @@ impl Broker {
     pub fn new(
         sock_path: &Path,
         registry: Arc<Mutex<SessionRegistry>>,
+        db: Arc<Mutex<Connection>>,
         event_tx: mpsc::UnboundedSender<AppEvent>,
     ) -> Result<Self> {
         // 既存のソケットファイルがあれば削除（前回の異常終了対策）
@@ -37,6 +41,7 @@ impl Broker {
         Ok(Self {
             listener,
             registry,
+            db,
             event_tx,
         })
     }
@@ -47,6 +52,7 @@ impl Broker {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
                     let registry = Arc::clone(&self.registry);
+                    let db = Arc::clone(&self.db);
                     let event_tx = self.event_tx.clone();
 
                     tokio::spawn(async move {
@@ -57,6 +63,10 @@ impl Broker {
                         if let Ok(Some(line)) = lines.next_line().await {
                             if let Ok(hook_event) = serde_json::from_str::<HookEvent>(&line) {
                                 let session_id = hook_event.session_id().to_string();
+
+                                // SQLite にも書き込む
+                                Self::sync_to_db(&db, &hook_event);
+
                                 let changed = {
                                     let mut reg = registry.lock().unwrap();
                                     reg.handle_event(hook_event)
@@ -83,6 +93,32 @@ impl Broker {
             }
         }
     }
+
+    /// hook イベントを SQLite に同期する
+    fn sync_to_db(db: &Arc<Mutex<Connection>>, event: &HookEvent) {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match event {
+            HookEvent::Register { session_id, cwd, role } => {
+                let (project, worktree) = crate::session::guess_names_from_cwd(cwd);
+                let _ = db::upsert_session(&conn, session_id, role, &worktree, &project, cwd, "idle");
+            }
+            HookEvent::Working { session_id } => {
+                let _ = db::update_session_state(&conn, session_id, "working");
+            }
+            HookEvent::Waiting { session_id } => {
+                let _ = db::update_session_state(&conn, session_id, "waiting");
+            }
+            HookEvent::Idle { session_id } => {
+                let _ = db::update_session_state(&conn, session_id, "idle");
+            }
+            HookEvent::Dead { session_id } => {
+                let _ = db::update_session_state(&conn, session_id, "dead");
+            }
+        }
+    }
 }
 
 /// ソケットファイルを削除する（アプリ終了時に呼ぶ）
@@ -95,6 +131,10 @@ mod tests {
     use super::*;
     use crate::session::SessionState;
 
+    fn test_db() -> Arc<Mutex<Connection>> {
+        Arc::new(Mutex::new(db::init(Path::new(":memory:")).unwrap()))
+    }
+
     #[tokio::test]
     async fn test_broker_accepts_register() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -102,7 +142,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(SessionRegistry::new()));
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        let broker = Broker::new(&sock_path, Arc::clone(&registry), event_tx).unwrap();
+        let broker = Broker::new(&sock_path, Arc::clone(&registry), test_db(), event_tx).unwrap();
         let broker_handle = tokio::spawn(broker.run());
 
         // クライアント側: register イベントを送信
@@ -150,7 +190,7 @@ mod tests {
             reg.register("sess-a".into(), "/tmp".into(), "default".into());
         }
 
-        let broker = Broker::new(&sock_path, Arc::clone(&registry), event_tx).unwrap();
+        let broker = Broker::new(&sock_path, Arc::clone(&registry), test_db(), event_tx).unwrap();
         let broker_handle = tokio::spawn(broker.run());
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

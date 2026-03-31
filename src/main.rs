@@ -2,9 +2,11 @@ mod app;
 mod broker;
 mod claude;
 mod config;
+mod db;
 mod event;
 mod git;
 mod hooks;
+mod mcp;
 mod session;
 mod terminal;
 mod tui;
@@ -31,6 +33,13 @@ const SIKI_INIT_TAB_INDEX: usize = usize::MAX;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // サブコマンド: siki mcp → MCP stdio サーバーを起動
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "mcp" {
+        let db_path = config::db_path();
+        return mcp::run_stdio_server(&db_path);
+    }
+
     tui::install_panic_hook();
 
     config::ensure_dirs()?;
@@ -54,9 +63,11 @@ async fn main() -> Result<()> {
         HashMap::new();
     let mut siki_init_terminal: Option<terminal::TerminalEmulator> = None;
 
-    // セッションレジストリと broker の起動
+    // セッションレジストリ・DB・broker の起動
     let session_registry = Arc::new(Mutex::new(session::SessionRegistry::new()));
     let sock_path = config::sock_path();
+    let db_path = config::db_path();
+    let broker_db = Arc::new(Mutex::new(db::init(&db_path)?));
 
     let mut tui_terminal = tui::init()?;
     let mut events = event::EventHandler::new();
@@ -64,7 +75,7 @@ async fn main() -> Result<()> {
     let mut last_layout: Option<ui::layout::AppLayout> = None;
 
     // broker タスクを起動（hook イベントを受信）
-    match broker::Broker::new(&sock_path, Arc::clone(&session_registry), event_tx.clone()) {
+    match broker::Broker::new(&sock_path, Arc::clone(&session_registry), Arc::clone(&broker_db), event_tx.clone()) {
         Ok(b) => {
             tokio::spawn(b.run());
         }
@@ -149,6 +160,7 @@ async fn main() -> Result<()> {
 
         // UI 描画
         tui_terminal.draw(|frame| {
+            let registry = session_registry.lock().unwrap();
             last_layout = Some(ui::render(
                 frame,
                 &mut app,
@@ -159,6 +171,7 @@ async fn main() -> Result<()> {
                 terminal_tab_info.as_ref(),
                 claude_screen,
                 siki_init_screen,
+                Some(&registry),
             ));
         })?;
 
@@ -188,6 +201,7 @@ async fn main() -> Result<()> {
             &shell,
             ev,
             last_layout.as_ref(),
+            &Some(Arc::clone(&session_registry)),
         )
         .await;
     }
@@ -217,6 +231,7 @@ async fn handle_event(
     shell: &str,
     event: event::AppEvent,
     last_layout: Option<&ui::layout::AppLayout>,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
     use event::AppEvent;
@@ -236,6 +251,44 @@ async fn handle_event(
                     KeyCode::Char('j') | KeyCode::Down => app.help_scroll += 1,
                     KeyCode::Char('k') | KeyCode::Up => {
                         app.help_scroll = app.help_scroll.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            if app.show_session_choice {
+                match key.code {
+                    KeyCode::Char('1') | KeyCode::Enter | KeyCode::Esc => {
+                        // Start new（デフォルト）
+                        app.show_session_choice = false;
+                        if let Some(wt_id) = app.session_choice_wt_id.take() {
+                            launch_claude(app, claude_terms, event_tx, wt_id);
+                        }
+                    }
+                    KeyCode::Char('2') => {
+                        // 1. claude -c -p でサマリー生成
+                        // 2. サマリー + 待機指示を新規セッションのプロンプトとして渡す
+                        app.show_session_choice = false;
+                        if let Some(wt_id) = app.session_choice_wt_id.take() {
+                            let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+                            let tx = event_tx.clone();
+                            app.show_info("Generating context summary...".to_string());
+                            tokio::spawn(async move {
+                                let summary = tokio::process::Command::new("claude")
+                                    .args(["-c", "-p", "Summarize what you were working on in detail. Include: the goal, what was done, key files changed, decisions made, current status, and any remaining work. Be specific about file paths and code changes."])
+                                    .current_dir(&wt_path)
+                                    .output()
+                                    .await
+                                    .ok()
+                                    .filter(|o| o.status.success())
+                                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                    .unwrap_or_default();
+                                let _ = tx.send(event::AppEvent::SessionContext {
+                                    worktree_id: wt_id,
+                                    summary,
+                                });
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -283,7 +336,7 @@ async fn handle_event(
                     .map(|wt| wt.active_tab < wt.claude_tabs)
                     .unwrap_or(false);
                 if on_claude_tab {
-                    handle_claude_terminal_key(app, claude_terms, event_tx, key);
+                    handle_claude_terminal_key(app, claude_terms, event_tx, key, session_registry);
                     return;
                 }
             }
@@ -316,7 +369,7 @@ async fn handle_event(
                         }
                         app::Panel::Main => {
                             // Claude タブは上で早期 return 済みなのでここは非 Claude タブのみ
-                            handle_main_panel_key(app, claude_terms, event_tx, key);
+                            handle_main_panel_key(app, claude_terms, event_tx, key, session_registry);
                         }
                         app::Panel::Right => {
                             handle_right_panel_key(app, source_tree, diff_view, key);
@@ -460,12 +513,31 @@ async fn handle_event(
         }
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
-            // TUI は次の描画サイクルでレジストリを参照して表示を更新する
+        }
+        AppEvent::SessionContext { worktree_id, summary } => {
+            app.show_info("Launching Claude with context...".to_string());
+            let prompt = if summary.is_empty() {
+                "[Session Handoff] No context from previous session. Awaiting your instructions.".to_string()
+            } else {
+                format!(
+                    "[Session Handoff]\n{}\n\n---\nSTOP. Do NOT take any action or run any tools. Wait for the operator's instructions.",
+                    summary
+                )
+            };
+            launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &[&prompt]);
         }
         AppEvent::Tick => {
             app.clear_expired_status();
             if app.show_siki_json_init_terminal {
                 app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
+            }
+            // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
+            if let Some(registry) = session_registry {
+                let mut reg = registry.lock().unwrap();
+                reg.expire_stale_sessions(
+                    std::time::Duration::from_secs(15),
+                    std::time::Duration::from_secs(30),
+                );
             }
         }
     }
@@ -992,6 +1064,7 @@ fn handle_main_panel_key(
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     key: crossterm::event::KeyEvent,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::KeyCode;
 
@@ -1037,7 +1110,13 @@ fn handle_main_panel_key(
         KeyCode::Char('i') => {
             // 新しい Claude Code タブを追加
             if let Some(wt_id) = app.selected_worktree {
-                launch_claude(app, claude_terms, event_tx, wt_id);
+                // 同じ worktree にアクティブセッションがあるかチェック
+                if has_active_sessions(session_registry, app, wt_id) {
+                    app.show_session_choice = true;
+                    app.session_choice_wt_id = Some(wt_id);
+                } else {
+                    launch_claude(app, claude_terms, event_tx, wt_id);
+                }
             }
         }
         KeyCode::Char('s') => {
@@ -1419,6 +1498,32 @@ fn resize_terminals(
 /// Claude Code を中央パネルで起動する
 ///
 /// プロジェクトのパスで `claude` をインタラクティブに起動する。
+/// 同じ worktree 内にアクティブセッションがあるか判定する
+///
+/// レジストリに加え、既に Claude タブが開いているかもチェック（hook 未到着対策）
+fn has_active_sessions(
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
+    app: &app::App,
+    wt_id: app::WorktreeId,
+) -> bool {
+    // 既に Claude タブが開いていれば、hook 到着に関係なくアクティブ
+    if let Some(wt) = app.worktree_by_id(wt_id) {
+        if wt.claude_tabs > 0 {
+            return true;
+        }
+    }
+    let Some(reg) = session_registry.as_ref().and_then(|r| r.lock().ok()) else {
+        return false;
+    };
+    let Some(wt) = app.worktree_by_id(wt_id) else {
+        return false;
+    };
+    let project = &app.projects[wt_id.0].name;
+    reg.by_worktree(project, &wt.name)
+        .iter()
+        .any(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
+}
+
 fn launch_claude(
     app: &mut app::App,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
@@ -1491,6 +1596,7 @@ fn handle_claude_terminal_key(
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     key: crossterm::event::KeyEvent,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -1526,9 +1632,14 @@ fn handle_claude_terminal_key(
         return;
     }
 
-    // Ctrl+t で新しい Claude タブを追加
+    // Ctrl+t で新しい Claude タブを追加（アクティブセッションチェック付き）
     if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        launch_claude(app, claude_terms, event_tx, wt_id);
+        if has_active_sessions(session_registry, app, wt_id) {
+            app.show_session_choice = true;
+            app.session_choice_wt_id = Some(wt_id);
+        } else {
+            launch_claude(app, claude_terms, event_tx, wt_id);
+        }
         return;
     }
 
@@ -1766,6 +1877,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(!app.running);
@@ -1798,6 +1910,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('?'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_help);
@@ -1830,6 +1943,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_help);
@@ -1863,6 +1977,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -1896,6 +2011,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Main);
@@ -1928,6 +2044,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
             None,
+            &None,
         )
         .await;
         // Main パネルでは Tab はタブ切替なのでフォーカスは変わらない
@@ -1961,6 +2078,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::BackTab)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Terminal);
@@ -1993,6 +2111,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(shift_key(KeyCode::Tab)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Terminal);
@@ -2028,6 +2147,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_message_popup);
@@ -2062,6 +2182,7 @@ mod tests {
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
+                &None,
             )
             .await;
         }
@@ -2096,6 +2217,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.popup_input, "a");
@@ -2129,6 +2251,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -2165,6 +2288,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(ctrl_key('\\')),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Right);
@@ -2198,6 +2322,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Right);
@@ -2236,6 +2361,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Tick,
             None,
+            &None,
         )
         .await;
         assert!(app.status_message.is_none());
@@ -2269,6 +2395,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Tick,
             None,
+            &None,
         )
         .await;
         assert!(app.status_message.is_some());
@@ -2307,6 +2434,7 @@ mod tests {
                 },
             },
             None,
+            &None,
         )
         .await;
 
@@ -2345,6 +2473,7 @@ mod tests {
                 worktree_id: (0, 0),
             },
             None,
+            &None,
         )
         .await;
 
@@ -2385,6 +2514,7 @@ mod tests {
                 error: "test error".to_string(),
             },
             None,
+            &None,
         )
         .await;
 
@@ -2426,6 +2556,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('j'))),
             None,
+            &None,
         )
         .await;
         assert_eq!(left_panel.cursor_index, 1);
@@ -2460,6 +2591,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('i'))),
             None,
+            &None,
         )
         .await;
         // claude がインストールされていない環境ではエラーが表示される
@@ -2506,6 +2638,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('t'))),
             None,
+            &None,
         )
         .await;
         assert_eq!(
@@ -2554,6 +2687,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
             Some(&layout),
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Main);
@@ -2596,6 +2730,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
             Some(&layout),
+            &None,
         )
         .await;
         // ポップアップ表示中はフォーカス変わらない
@@ -2634,6 +2769,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_worktree_popup);
@@ -2671,6 +2807,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_worktree_popup);
@@ -2705,6 +2842,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_siki_json_confirm);
@@ -2739,6 +2877,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_worktree_popup);
@@ -2773,6 +2912,7 @@ mod tests {
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
+                &None,
             )
             .await;
         }
@@ -2807,6 +2947,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.add_worktree_input, "a");
@@ -2841,6 +2982,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         // ポップアップは閉じず、worktree も追加されない
@@ -2876,6 +3018,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -2938,6 +3081,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
 
@@ -2982,6 +3126,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('A'))),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_project_popup);
@@ -3017,6 +3162,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3051,6 +3197,7 @@ mod tests {
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
+                &None,
             )
             .await;
         }
@@ -3086,6 +3233,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         assert!(app.show_add_project_popup);
@@ -3121,6 +3269,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3162,6 +3311,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
+            &None,
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3198,6 +3348,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
+            &None,
         )
         .await;
         assert!(app.running);
@@ -3239,6 +3390,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
             None,
+            &None,
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Left);

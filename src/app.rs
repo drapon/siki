@@ -220,6 +220,10 @@ pub struct App {
     pub siki_json_init_scroll: usize,
     /// オーバーレイターミナルのスピナーカウンタ
     pub siki_json_init_spinner: usize,
+    /// セッション選択ポップアップ（新規 Claude タブ起動時）
+    pub show_session_choice: bool,
+    /// セッション選択対象の worktree ID
+    pub session_choice_wt_id: Option<WorktreeId>,
     pub running: bool,
 }
 
@@ -261,6 +265,8 @@ impl App {
             show_siki_json_init_terminal: false,
             siki_json_init_scroll: 0,
             siki_json_init_spinner: 0,
+            show_session_choice: false,
+            session_choice_wt_id: None,
             running: true,
         }
     }
