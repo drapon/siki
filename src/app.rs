@@ -206,10 +206,16 @@ pub struct App {
     pub grep_cursor: usize,
     pub show_archive_confirm: bool,
     pub archive_target: Option<WorktreeId>,
+    pub show_remove_project_confirm: bool,
+    pub remove_project_target: Option<usize>,
     pub show_siki_json_confirm: bool,
     pub siki_json_confirm_project_path: Option<std::path::PathBuf>,
-    /// TUI一時停止用: claude実行後にmainループで処理
-    pub suspend_claude_init: Option<std::path::PathBuf>,
+    /// オーバーレイターミナル（siki.json 作成用）表示中フラグ
+    pub show_siki_json_init_terminal: bool,
+    /// オーバーレイターミナルのスクロールバックオフセット
+    pub siki_json_init_scroll: usize,
+    /// オーバーレイターミナルのスピナーカウンタ
+    pub siki_json_init_spinner: usize,
     pub running: bool,
 }
 
@@ -244,9 +250,13 @@ impl App {
             grep_cursor: 0,
             show_archive_confirm: false,
             archive_target: None,
+            show_remove_project_confirm: false,
+            remove_project_target: None,
             show_siki_json_confirm: false,
             siki_json_confirm_project_path: None,
-            suspend_claude_init: None,
+            show_siki_json_init_terminal: false,
+            siki_json_init_scroll: 0,
+            siki_json_init_spinner: 0,
             running: true,
         }
     }

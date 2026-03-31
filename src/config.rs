@@ -229,6 +229,16 @@ pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// プロジェクトディレクトリ（project.json 含む）を削除する
+pub fn remove_project_meta(project_name: &str) -> Result<()> {
+    let dir = workspaces_dir().join(project_name);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("プロジェクトディレクトリの削除に失敗: {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// project.json を読み込む
 pub fn load_project_meta(project_name: &str) -> Option<ProjectMeta> {
     let path = project_meta_path(project_name);

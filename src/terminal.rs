@@ -30,6 +30,31 @@ impl TerminalEmulator {
         worktree_id: WorktreeId,
         tab_index: usize,
     ) -> Result<Self> {
+        Self::spawn_internal(shell, &[], working_dir, size, event_tx, worktree_id, tab_index)
+    }
+
+    /// 引数付きでコマンドを起動するターミナルエミュレータを作成する
+    pub fn with_args(
+        program: &str,
+        args: &[&str],
+        working_dir: &Path,
+        size: (u16, u16),
+        event_tx: mpsc::UnboundedSender<AppEvent>,
+        worktree_id: WorktreeId,
+        tab_index: usize,
+    ) -> Result<Self> {
+        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index)
+    }
+
+    fn spawn_internal(
+        program: &str,
+        args: &[&str],
+        working_dir: &Path,
+        size: (u16, u16),
+        event_tx: mpsc::UnboundedSender<AppEvent>,
+        worktree_id: WorktreeId,
+        tab_index: usize,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
             rows: size.1,
@@ -42,7 +67,10 @@ impl TerminalEmulator {
             .openpty(pty_size)
             .map_err(|e| anyhow::anyhow!("PTY のオープンに失敗: {}", e))?;
 
-        let mut cmd = CommandBuilder::new(shell);
+        let mut cmd = CommandBuilder::new(program);
+        for arg in args {
+            cmd.arg(*arg);
+        }
         cmd.cwd(working_dir);
 
         pair.slave
@@ -84,7 +112,8 @@ impl TerminalEmulator {
             }
         });
 
-        let parser = vt100::Parser::new(size.1, size.0, 0);
+        let scrollback = if args.is_empty() { 0 } else { 5000 };
+        let parser = vt100::Parser::new(size.1, size.0, scrollback);
 
         Ok(Self {
             master: pair.master,
@@ -126,6 +155,21 @@ impl TerminalEmulator {
     /// VT100 パーサーの画面状態を取得する
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// VT100 パーサーの画面状態を可変で取得する
+    pub fn screen_mut(&mut self) -> &mut vt100::Screen {
+        self.parser.screen_mut()
+    }
+
+    /// スクロールバックの位置を設定する（0 = 最新、大きいほど過去）
+    pub fn set_scrollback(&mut self, offset: usize) {
+        self.parser.screen_mut().set_scrollback(offset);
+    }
+
+    /// 現在のスクロールバック位置を取得する
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
     }
 }
 

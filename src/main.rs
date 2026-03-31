@@ -21,6 +21,10 @@ type TerminalKey = (app::WorktreeId, usize);
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 
+/// siki.json 作成用オーバーレイターミナルのセンチネル値
+const SIKI_INIT_WORKTREE_ID: app::WorktreeId = (usize::MAX, usize::MAX);
+const SIKI_INIT_TAB_INDEX: usize = usize::MAX;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tui::install_panic_hook();
@@ -44,6 +48,7 @@ async fn main() -> Result<()> {
     let mut terminals: HashMap<TerminalKey, terminal::TerminalEmulator> = HashMap::new();
     let mut claude_terms: HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator> =
         HashMap::new();
+    let mut siki_init_terminal: Option<terminal::TerminalEmulator> = None;
 
     let mut tui_terminal = tui::init()?;
     let mut events = event::EventHandler::new();
@@ -90,6 +95,12 @@ async fn main() -> Result<()> {
             }
         });
 
+        // siki.json 作成用オーバーレイターミナルの画面（スクロールバック適用）
+        if let Some(emu) = siki_init_terminal.as_mut() {
+            emu.set_scrollback(app.siki_json_init_scroll);
+        }
+        let siki_init_screen = siki_init_terminal.as_ref().map(|emu| emu.screen());
+
         // UI 描画
         tui_terminal.draw(|frame| {
             last_layout = Some(ui::render(
@@ -101,6 +112,7 @@ async fn main() -> Result<()> {
                 terminal_screen,
                 terminal_tab_info.as_ref(),
                 claude_screen,
+                siki_init_screen,
             ));
         })?;
 
@@ -110,6 +122,7 @@ async fn main() -> Result<()> {
                 &app,
                 &mut terminals,
                 &mut claude_terms,
+                &mut siki_init_terminal,
                 layout,
             );
         }
@@ -124,24 +137,13 @@ async fn main() -> Result<()> {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &event_tx,
             &shell,
             ev,
             last_layout.as_ref(),
         )
         .await;
-
-        // siki.json 作成のための TUI 一時停止処理
-        if let Some(project_path) = app.suspend_claude_init.take() {
-            tui::restore()?;
-            let prompt = config::siki_json_init_prompt();
-            let _ = std::process::Command::new("claude")
-                .arg(&prompt)
-                .current_dir(&project_path)
-                .status();
-            tui_terminal = tui::init()?;
-            tui_terminal.clear()?;
-        }
     }
 
     // クリーンアップ: 全セッションを終了
@@ -161,6 +163,7 @@ async fn handle_event(
     sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     shell: &str,
     event: event::AppEvent,
@@ -171,6 +174,12 @@ async fn handle_event(
 
     match event {
         AppEvent::Key(key) => {
+            // siki.json 作成オーバーレイターミナル表示中
+            if app.show_siki_json_init_terminal {
+                handle_siki_init_terminal_key(app, siki_init_terminal, key);
+                return;
+            }
+
             // ポップアップ表示中はポップアップ専用の処理
             if app.show_help {
                 match key.code {
@@ -203,8 +212,12 @@ async fn handle_event(
                 handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, key);
                 return;
             }
+            if app.show_remove_project_confirm {
+                handle_remove_project_confirm_key(app, sessions, terminals, claude_terms, key);
+                return;
+            }
             if app.show_siki_json_confirm {
-                handle_siki_json_confirm_key(app, key);
+                handle_siki_json_confirm_key(app, siki_init_terminal, event_tx, key);
                 return;
             }
 
@@ -280,7 +293,11 @@ async fn handle_event(
             tab_index,
             data,
         } => {
-            if tab_index >= CLAUDE_TAB_BASE {
+            if worktree_id == SIKI_INIT_WORKTREE_ID && tab_index == SIKI_INIT_TAB_INDEX {
+                if let Some(emu) = siki_init_terminal.as_mut() {
+                    emu.process(&data);
+                }
+            } else if tab_index >= CLAUDE_TAB_BASE {
                 let claude_idx = tab_index - CLAUDE_TAB_BASE;
                 if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
                     emu.process(&data);
@@ -302,8 +319,21 @@ async fn handle_event(
                 }
                 return;
             }
+            // siki.json 作成オーバーレイ表示中はスクロールのみ処理
+            if app.show_siki_json_init_terminal {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.siki_json_init_scroll = app.siki_json_init_scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.siki_json_init_scroll = app.siki_json_init_scroll.saturating_sub(3);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_archive_confirm || app.show_siki_json_confirm {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm {
                 return;
             }
             match mouse.kind {
@@ -360,6 +390,9 @@ async fn handle_event(
         }
         AppEvent::Tick => {
             app.clear_expired_status();
+            if app.show_siki_json_init_terminal {
+                app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
+            }
         }
     }
 }
@@ -822,12 +855,16 @@ fn handle_left_panel_key(
             }
         }
         KeyCode::Char('d') => {
-            // worktree 行にカーソルがある場合のみアーカイブ確認を表示
-            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) =
-                left_panel.current_entry(&entries)
-            {
-                app.archive_target = Some((*project_index, *worktree_index));
-                app.show_archive_confirm = true;
+            match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) => {
+                    app.archive_target = Some((*project_index, *worktree_index));
+                    app.show_archive_confirm = true;
+                }
+                Some(ui::left_panel::ListEntry::Project { index }) => {
+                    app.remove_project_target = Some(*index);
+                    app.show_remove_project_confirm = true;
+                }
+                None => {}
             }
         }
         KeyCode::Char('A') => {
@@ -937,12 +974,36 @@ fn handle_main_panel_key(
 }
 
 /// siki.json 作成確認ダイアログのキー処理
-fn handle_siki_json_confirm_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+fn handle_siki_json_confirm_key(
+    app: &mut app::App,
+    siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    key: crossterm::event::KeyEvent,
+) {
     use crossterm::event::KeyCode;
 
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.suspend_claude_init = app.siki_json_confirm_project_path.take();
+            if let Some(path) = app.siki_json_confirm_project_path.take() {
+                let prompt = config::siki_json_init_prompt();
+                match terminal::TerminalEmulator::with_args(
+                    "claude",
+                    &[&prompt],
+                    &path,
+                    (80, 24),
+                    event_tx.clone(),
+                    SIKI_INIT_WORKTREE_ID,
+                    SIKI_INIT_TAB_INDEX,
+                ) {
+                    Ok(emu) => {
+                        *siki_init_terminal = Some(emu);
+                        app.show_siki_json_init_terminal = true;
+                        app.siki_json_init_scroll = 0;
+                        app.show_info("Claude を起動中...".to_string());
+                    }
+                    Err(e) => app.show_error(format!("Claude 起動失敗: {}", e)),
+                }
+            }
             app.show_siki_json_confirm = false;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -950,6 +1011,51 @@ fn handle_siki_json_confirm_key(app: &mut app::App, key: crossterm::event::KeyEv
             app.show_siki_json_confirm = false;
         }
         _ => {}
+    }
+}
+
+/// siki.json 作成オーバーレイターミナルのキー処理
+fn handle_siki_init_terminal_key(
+    app: &mut app::App,
+    siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Esc または Ctrl+\ でオーバーレイを閉じる
+    if key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('\\') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        *siki_init_terminal = None;
+        app.show_siki_json_init_terminal = false;
+        app.siki_json_init_scroll = 0;
+        return;
+    }
+
+    // Shift+PageUp/PageDown でスクロールバック操作
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::PageUp => {
+                app.siki_json_init_scroll = app.siki_json_init_scroll.saturating_add(10);
+                return;
+            }
+            KeyCode::PageDown => {
+                app.siki_json_init_scroll = app.siki_json_init_scroll.saturating_sub(10);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // 入力操作時はスクロールを最新に戻す
+    app.siki_json_init_scroll = 0;
+
+    // その他のキーは PTY に転送
+    let bytes = terminal::key_to_bytes(&key);
+    if !bytes.is_empty() {
+        if let Some(emu) = siki_init_terminal.as_mut() {
+            let _ = emu.write(&bytes);
+        }
     }
 }
 
@@ -1002,6 +1108,76 @@ fn handle_grep_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
             // 入力変更時は結果をリセット
             app.grep_results.clear();
             app.grep_cursor = 0;
+        }
+        _ => {}
+    }
+}
+
+/// アーカイブ確認ダイアログのキー処理
+/// プロジェクト除外確認ダイアログのキー処理
+fn handle_remove_project_confirm_key(
+    app: &mut app::App,
+    sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+            if let Some(pi) = app.remove_project_target {
+                let project_name = app.projects[pi].name.clone();
+
+                // 関連する Claude セッション・ターミナルをクリーンアップ
+                let wt_count = app.projects[pi].worktrees.len();
+                for wi in 0..wt_count {
+                    let wt_id = (pi, wi);
+                    sessions.remove(&wt_id);
+                    let term_keys: Vec<_> = terminals
+                        .keys()
+                        .filter(|k| k.0 == wt_id)
+                        .cloned()
+                        .collect();
+                    for key in term_keys {
+                        terminals.remove(&key);
+                    }
+                    let claude_keys: Vec<_> = claude_terms
+                        .keys()
+                        .filter(|k| k.0 == wt_id)
+                        .cloned()
+                        .collect();
+                    for key in claude_keys {
+                        claude_terms.remove(&key);
+                    }
+                }
+
+                // project.json を削除
+                if let Err(e) = config::remove_project_meta(&project_name) {
+                    app.show_error(format!("プロジェクトメタの削除に失敗: {}", e));
+                }
+
+                // メモリから削除
+                app.projects.remove(pi);
+
+                // selected_worktree をリセット
+                if let Some((sel_pi, sel_wi)) = app.selected_worktree {
+                    if sel_pi == pi {
+                        app.selected_worktree = None;
+                    } else if sel_pi > pi {
+                        app.selected_worktree = Some((sel_pi - 1, sel_wi));
+                    }
+                }
+
+                app.show_info(format!("プロジェクトを除外しました: {}", project_name));
+            }
+
+            app.show_remove_project_confirm = false;
+            app.remove_project_target = None;
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            app.show_remove_project_confirm = false;
+            app.remove_project_target = None;
         }
         _ => {}
     }
@@ -1099,6 +1275,7 @@ fn resize_terminals(
     app: &app::App,
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
     layout: &ui::layout::AppLayout,
 ) {
     // Claude ターミナル: main パネルからタブバー(2行) + ボーダー(2行2列) を引いた内部サイズ
@@ -1129,6 +1306,23 @@ fn resize_terminals(
                         let _ = emu.resize(term_cols, term_rows);
                     }
                 }
+            }
+        }
+    }
+
+    // siki.json 作成オーバーレイターミナル: 全画面の90%x80%からボーダー分を引く
+    if let Some(emu) = siki_init_terminal.as_mut() {
+        // フレーム全体サイズをレイアウトから復元
+        let full_width = layout.left.width + layout.main.width + layout.right_top.width;
+        let full_height = layout.left.height + layout.status_bar.height;
+        // centered_rect(90, 80) と同じ割合
+        let overlay_cols = full_width.saturating_mul(90).saturating_div(100).saturating_sub(2);
+        let overlay_rows = full_height.saturating_mul(80).saturating_div(100).saturating_sub(2);
+        if overlay_cols > 0 && overlay_rows > 0 {
+            let screen = emu.screen();
+            let (cur_rows, cur_cols) = screen.size();
+            if cur_cols != overlay_cols || cur_rows != overlay_rows {
+                let _ = emu.resize(overlay_cols, overlay_rows);
             }
         }
     }
@@ -1363,6 +1557,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(app.running);
@@ -1374,6 +1569,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -1393,6 +1589,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(!app.show_help);
@@ -1404,6 +1601,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('?'))),
@@ -1423,6 +1621,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_help = true;
@@ -1434,6 +1633,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -1453,6 +1653,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_help = true;
@@ -1465,6 +1666,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -1485,6 +1687,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -1496,6 +1699,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
@@ -1515,6 +1719,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.focused_panel = app::Panel::Main;
@@ -1526,6 +1731,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
@@ -1546,6 +1752,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -1557,6 +1764,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::BackTab)),
@@ -1576,6 +1784,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -1587,6 +1796,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(shift_key(KeyCode::Tab)),
@@ -1608,6 +1818,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -1620,6 +1831,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -1640,6 +1852,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -1652,6 +1865,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
@@ -1672,6 +1886,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -1684,6 +1899,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
@@ -1703,6 +1919,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -1715,6 +1932,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -1737,6 +1955,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.selected_worktree = Some((0, 0));
@@ -1749,6 +1968,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(ctrl_key('\\')),
@@ -1768,6 +1988,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // worktree 未選択で Terminal パネルにキーを送る
@@ -1780,6 +2001,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -1801,6 +2023,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_info("test".to_string());
@@ -1816,6 +2039,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Tick,
@@ -1835,6 +2059,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_info("fresh".to_string());
@@ -1847,6 +2072,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Tick,
@@ -1868,6 +2094,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_event(
@@ -1878,6 +2105,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::ClaudeOutput {
@@ -1905,6 +2133,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
@@ -1917,6 +2146,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::ClaudeComplete {
@@ -1942,6 +2172,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
@@ -1954,6 +2185,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::ClaudeError {
@@ -1985,6 +2217,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(left_panel.cursor_index, 0);
@@ -1996,6 +2229,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('j'))),
@@ -2015,6 +2249,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.focused_panel = app::Panel::Main;
@@ -2028,6 +2263,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('i'))),
@@ -2055,6 +2291,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.focused_panel = app::Panel::Right;
@@ -2072,6 +2309,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('t'))),
@@ -2096,6 +2334,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // レイアウトを作成（200x50 ターミナル想定）
@@ -2118,6 +2357,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
@@ -2137,6 +2377,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let layout = ui::layout::compute_layout(ratatui::prelude::Rect::new(0, 0, 200, 50));
@@ -2158,6 +2399,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
@@ -2182,6 +2424,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // カーソルはプロジェクト行 (index 0)
@@ -2194,6 +2437,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -2217,6 +2461,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // カーソルを worktree 行に移動
@@ -2229,6 +2474,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -2251,6 +2497,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_event(
@@ -2261,6 +2508,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -2281,6 +2529,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -2293,6 +2542,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -2313,6 +2563,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -2325,6 +2576,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
@@ -2345,6 +2597,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -2357,6 +2610,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
@@ -2376,6 +2630,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -2389,6 +2644,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -2410,6 +2666,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -2422,6 +2679,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -2466,6 +2724,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -2482,6 +2741,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -2513,6 +2773,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(!app.show_add_project_popup);
@@ -2524,6 +2785,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('A'))),
@@ -2545,6 +2807,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -2557,6 +2820,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -2577,6 +2841,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -2589,6 +2854,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
@@ -2609,6 +2875,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -2622,6 +2889,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -2642,6 +2910,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -2655,6 +2924,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -2680,6 +2950,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // /tmp は実在するディレクトリ
@@ -2694,6 +2965,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -2717,6 +2989,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -2728,6 +3001,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -2748,6 +3022,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -2767,6 +3042,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut siki_init_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Mouse(mouse),

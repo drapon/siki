@@ -30,6 +30,7 @@ pub fn render(
     terminal_screen: Option<&vt100::Screen>,
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
+    siki_init_screen: Option<&vt100::Screen>,
 ) -> layout::AppLayout {
     let areas = layout::compute_layout(frame.area());
 
@@ -106,9 +107,24 @@ pub fn render(
         render_archive_confirm_popup(frame, app);
     }
 
+    // プロジェクト除外確認ダイアログ
+    if app.show_remove_project_confirm {
+        render_remove_project_confirm_popup(frame, app);
+    }
+
     // siki.json 作成確認ダイアログ
     if app.show_siki_json_confirm {
         render_siki_json_confirm_popup(frame);
+    }
+
+    // siki.json 作成オーバーレイターミナル
+    if app.show_siki_json_init_terminal {
+        render_siki_json_init_terminal(
+            frame,
+            siki_init_screen,
+            app.siki_json_init_scroll,
+            app.siki_json_init_spinner,
+        );
     }
 
     areas
@@ -144,7 +160,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  a          : worktree 追加",
         "  A          : プロジェクト追加",
         "  r          : run スクリプト実行",
-        "  d          : worktree アーカイブ",
+        "  d          : worktree アーカイブ / プロジェクト除外",
         "",
         "[中央パネル]",
         "  Tab        : 次のタブ",
@@ -377,6 +393,30 @@ fn render_archive_confirm_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_remove_project_confirm_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(40, 20, frame.area());
+
+    let project_name = app
+        .remove_project_target
+        .and_then(|pi| app.projects.get(pi))
+        .map(|p| p.name.as_str())
+        .unwrap_or("???");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("プロジェクト除外")
+        .border_style(Style::default().fg(Color::Red));
+
+    let text = format!(
+        "\n  \"{}\" をリストから除外しますか？\n  (プロジェクトファイルは削除されません)\n\n  y: 除外  n: キャンセル",
+        project_name,
+    );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
 fn render_siki_json_confirm_popup(frame: &mut Frame) {
     let area = centered_rect(40, 20, frame.area());
 
@@ -390,6 +430,60 @@ fn render_siki_json_confirm_popup(frame: &mut Frame) {
 
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+fn render_siki_json_init_terminal(
+    frame: &mut Frame,
+    screen: Option<&vt100::Screen>,
+    scroll_offset: usize,
+    spinner: usize,
+) {
+    let area = centered_rect(90, 80, frame.area());
+
+    let spinner_chars = ['|', '/', '-', '\\'];
+    let spinner_char = spinner_chars[spinner % spinner_chars.len()];
+
+    let title = if scroll_offset > 0 {
+        format!(
+            "siki.json 作成 [↑{}行] (Scroll: ホイール/Shift+PgUp,PgDn  Esc で閉じる)",
+            scroll_offset
+        )
+    } else {
+        "siki.json 作成 (Scroll: ホイール/Shift+PgUp,PgDn  Esc で閉じる)".to_string()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let is_loading = match screen {
+        Some(screen) => screen.contents().trim().is_empty(),
+        None => true,
+    };
+
+    if is_loading {
+        let loading_text = format!("\n\n  {} Claude を起動中...", spinner_char);
+        frame.render_widget(
+            Paragraph::new(loading_text)
+                .block(block)
+                .style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+    } else if let Some(screen) = screen {
+        let pseudo_term = tui_term::widget::PseudoTerminal::new(screen).block(block);
+        frame.render_widget(pseudo_term, area);
+    } else {
+        // unreachable だが念のため
+        frame.render_widget(
+            Paragraph::new("\n\n  Claude を起動中...")
+                .block(block)
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+    }
 }
 
 fn render_terminal(
