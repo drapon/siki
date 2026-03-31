@@ -1531,52 +1531,19 @@ fn resize_terminals(
 /// Claude Code を中央パネルで起動する
 ///
 /// プロジェクトのパスで `claude` をインタラクティブに起動する。
-/// セッションのコンテキスト情報を組み立てる（git log, status, summary）
+/// 選択されたセッションを参照するためのプロンプトを組み立てる
 fn build_session_context(
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
     session_id: &str,
 ) -> Option<String> {
     let reg = session_registry.as_ref()?.lock().ok()?;
     let session = reg.get(session_id)?;
-    let cwd = &session.cwd;
-
-    let git_log = std::process::Command::new("git")
-        .args(["log", "--oneline", "-10"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
-    let git_status = std::process::Command::new("git")
-        .args(["status", "--short"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
-    let branch = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    let mut ctx = format!("Continuing from previous session (role: {}).\n", session.role);
-    ctx.push_str(&format!("Branch: {}\n", branch));
-    if !git_log.is_empty() {
-        ctx.push_str(&format!("Recent commits:\n{}\n", git_log));
-    }
-    if !git_status.is_empty() {
-        ctx.push_str(&format!("Changed files:\n{}\n", git_status));
-    }
-    ctx.push_str("Please review the above context and continue the work.");
-    Some(ctx)
+    Some(format!(
+        "Use get_context to review what session '{}' (role: {}, worktree: {}) was working on, then continue.",
+        &session_id[..8.min(session_id.len())],
+        session.role,
+        session.worktree_name,
+    ))
 }
 
 fn launch_claude(
