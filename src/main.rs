@@ -2,9 +2,11 @@ mod app;
 mod broker;
 mod claude;
 mod config;
+mod db;
 mod event;
 mod git;
 mod hooks;
+mod mcp;
 mod session;
 mod terminal;
 mod tui;
@@ -31,6 +33,13 @@ const SIKI_INIT_TAB_INDEX: usize = usize::MAX;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // サブコマンド: siki mcp → MCP stdio サーバーを起動
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "mcp" {
+        let db_path = config::db_path();
+        return mcp::run_stdio_server(&db_path);
+    }
+
     tui::install_panic_hook();
 
     config::ensure_dirs()?;
