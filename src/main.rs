@@ -363,7 +363,7 @@ async fn handle_event(
                     .map(|wt| wt.active_tab < wt.claude_tabs)
                     .unwrap_or(false);
                 if on_claude_tab {
-                    handle_claude_terminal_key(app, claude_terms, event_tx, key);
+                    handle_claude_terminal_key(app, claude_terms, event_tx, key, session_registry);
                     return;
                 }
             }
@@ -1651,6 +1651,7 @@ fn handle_claude_terminal_key(
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     key: crossterm::event::KeyEvent,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -1686,9 +1687,28 @@ fn handle_claude_terminal_key(
         return;
     }
 
-    // Ctrl+t で新しい Claude タブを追加
+    // Ctrl+t で新しい Claude タブを追加（アクティブセッションチェック付き）
     if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        launch_claude(app, claude_terms, event_tx, wt_id);
+        let has_active = session_registry.as_ref().and_then(|reg| {
+            let reg = reg.lock().ok()?;
+            let wt = app.worktree_by_id(wt_id)?;
+            let project = &app.projects[wt_id.0].name;
+            let sessions: Vec<_> = reg.by_worktree(project, &wt.name)
+                .into_iter()
+                .filter(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
+                .map(|s| (s.session_id.clone(), s.role.clone()))
+                .collect();
+            if sessions.is_empty() { None } else { Some(sessions) }
+        });
+
+        if let Some(sessions) = has_active {
+            app.show_session_choice = true;
+            app.session_choice_wt_id = Some(wt_id);
+            app.session_list_items = sessions;
+            app.session_list_cursor = 0;
+        } else {
+            launch_claude(app, claude_terms, event_tx, wt_id);
+        }
         return;
     }
 
