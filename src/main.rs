@@ -55,6 +55,22 @@ async fn main() -> Result<()> {
     let event_tx = events.sender();
     let mut last_layout: Option<ui::layout::AppLayout> = None;
 
+    // 起動時に全 worktree の PR 情報を非同期取得
+    for (pi, project) in app.projects.iter().enumerate() {
+        for (wi, wt) in project.worktrees.iter().enumerate() {
+            let tx = event_tx.clone();
+            let wt_id = (pi, wi);
+            let wt_path = wt.path.clone();
+            tokio::spawn(async move {
+                let title = fetch_pr_title(&wt_path).await;
+                let _ = tx.send(event::AppEvent::PrInfo {
+                    worktree_id: wt_id,
+                    title,
+                });
+            });
+        }
+    }
+
     // メインイベントループ
     while app.running {
         // 現在のターミナル画面とタブ情報を取得
@@ -246,7 +262,7 @@ async fn handle_event(
                     .map(|wt| wt.active_tab < wt.claude_tabs)
                     .unwrap_or(false);
                 if on_claude_tab {
-                    handle_claude_terminal_key(app, claude_terms, key);
+                    handle_claude_terminal_key(app, claude_terms, event_tx, key);
                     return;
                 }
             }
@@ -411,6 +427,11 @@ async fn handle_event(
                     }
                 }
                 _ => {}
+            }
+        }
+        AppEvent::PrInfo { worktree_id, title } => {
+            if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
+                wt.pr_title = title;
             }
         }
         AppEvent::Resize(_w, _h) => {
@@ -595,6 +616,19 @@ fn handle_add_worktree_popup_key(
                 active_terminal: 0,
                 chat_scroll_offset: 0,
                 claude_scroll_offset: 0,
+                pr_title: None,
+            });
+
+            // PR 情報を非同期取得
+            let wi = app.projects[pi].worktrees.len() - 1;
+            let tx = event_tx.clone();
+            let pr_path = wt_path.clone();
+            tokio::spawn(async move {
+                let title = fetch_pr_title(&pr_path).await;
+                let _ = tx.send(event::AppEvent::PrInfo {
+                    worktree_id: (pi, wi),
+                    title,
+                });
             });
 
             app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
@@ -1366,6 +1400,16 @@ fn launch_claude(
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     wt_id: app::WorktreeId,
 ) {
+    launch_claude_with_args(app, claude_terms, event_tx, wt_id, &[]);
+}
+
+fn launch_claude_with_args(
+    app: &mut app::App,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    wt_id: app::WorktreeId,
+    args: &[&str],
+) {
     let project_path = app.worktree_by_id(wt_id).unwrap().path.clone();
     let claude_idx = app
         .worktree_by_id(wt_id)
@@ -1373,14 +1417,28 @@ fn launch_claude(
         .unwrap_or(0);
     let size = (80, 24);
 
-    match terminal::TerminalEmulator::new(
-        "claude",
-        &project_path,
-        size,
-        event_tx.clone(),
-        wt_id,
-        CLAUDE_TAB_BASE + claude_idx,
-    ) {
+    let result = if args.is_empty() {
+        terminal::TerminalEmulator::new(
+            "claude",
+            &project_path,
+            size,
+            event_tx.clone(),
+            wt_id,
+            CLAUDE_TAB_BASE + claude_idx,
+        )
+    } else {
+        terminal::TerminalEmulator::with_args(
+            "claude",
+            args,
+            &project_path,
+            size,
+            event_tx.clone(),
+            wt_id,
+            CLAUDE_TAB_BASE + claude_idx,
+        )
+    };
+
+    match result {
         Ok(emu) => {
             claude_terms.insert((wt_id, claude_idx), emu);
             if let Some(wt) = app.worktree_by_id_mut(wt_id) {
@@ -1400,6 +1458,7 @@ fn launch_claude(
 fn handle_claude_terminal_key(
     app: &mut app::App,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     key: crossterm::event::KeyEvent,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -1413,8 +1472,8 @@ fn handle_claude_terminal_key(
         .map(|wt| wt.active_tab)
         .unwrap_or(0);
 
-    // Ctrl+\ で Claude ターミナルを閉じる
-    if key.code == KeyCode::Char('\\') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Ctrl+w で Claude ターミナルを閉じる
+    if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
         claude_terms.remove(&(wt_id, active_tab));
         // claude_tabs を減らしてタブを詰める
         if let Some(wt) = app.worktree_by_id_mut(wt_id) {
@@ -1433,6 +1492,24 @@ fn handle_claude_terminal_key(
                 }
             }
         }
+        return;
+    }
+
+    // Ctrl+t で新しい Claude タブを追加
+    if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        launch_claude(app, claude_terms, event_tx, wt_id);
+        return;
+    }
+
+    // Ctrl+r で claude -r（セッション再開）タブを追加
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        launch_claude_with_args(app, claude_terms, event_tx, wt_id, &["-r"]);
+        return;
+    }
+
+    // Tab でタブ切り替え
+    if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        ui::main_panel::next_tab(app);
         return;
     }
 
@@ -1555,6 +1632,25 @@ fn handle_right_panel_key(
             }
             _ => {}
         },
+    }
+}
+
+/// worktree のパスで `gh pr view` を実行し、PR タイトルを取得する
+async fn fetch_pr_title(wt_path: &std::path::Path) -> Option<String> {
+    let output = tokio::process::Command::new("gh")
+        .args(["pr", "view", "--json", "title", "--jq", ".title"])
+        .current_dir(wt_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
     }
 }
 

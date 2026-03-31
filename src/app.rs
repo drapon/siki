@@ -173,6 +173,8 @@ pub struct Worktree {
     pub chat_scroll_offset: usize,
     /// Claude ターミナルのスクロールバックオフセット
     pub claude_scroll_offset: usize,
+    /// GitHub PR タイトル（ブランチに紐づく PR がある場合）
+    pub pr_title: Option<String>,
 }
 
 /// プロジェクトの状態
@@ -484,6 +486,7 @@ impl Project {
                 active_terminal: 0,
                 chat_scroll_offset: 0,
                 claude_scroll_offset: 0,
+                pr_title: None,
             })
             .collect();
 

@@ -137,10 +137,17 @@ impl LeftPanel {
 
                         let name_part = format!("  {} {} {} ", branch_char, icon, wt.name);
                         let branch_part = format!(" {}", wt.branch);
-                        let line = Line::from(vec![
+                        let mut spans = vec![
                             Span::styled(name_part, Style::default().fg(name_fg)),
                             Span::styled(branch_part, Style::default().fg(branch_fg).dim()),
-                        ]);
+                        ];
+                        if let Some(ref pr_title) = wt.pr_title {
+                            spans.push(Span::styled(
+                                format!(" ({})", pr_title),
+                                Style::default().fg(Color::Yellow).dim(),
+                            ));
+                        }
+                        let line = Line::from(spans);
 
                         let mut item_style = Style::default();
                         if is_cursor {
@@ -197,6 +204,7 @@ mod tests {
                         active_terminal: 0,
                         chat_scroll_offset: 0,
                         claude_scroll_offset: 0,
+                        pr_title: None,
                     },
                     Worktree {
                         name: "fix-bug".to_string(),
@@ -211,6 +219,7 @@ mod tests {
                         active_terminal: 0,
                         chat_scroll_offset: 0,
                         claude_scroll_offset: 0,
+                        pr_title: None,
                     },
                 ],
             },
@@ -231,6 +240,7 @@ mod tests {
                     active_terminal: 0,
                     chat_scroll_offset: 0,
                     claude_scroll_offset: 0,
+                    pr_title: None,
                 }],
             },
         ]

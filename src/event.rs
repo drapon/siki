@@ -30,6 +30,11 @@ pub enum AppEvent {
         tab_index: usize,
         data: Vec<u8>,
     },
+    /// GitHub PR 情報取得完了
+    PrInfo {
+        worktree_id: WorktreeId,
+        title: Option<String>,
+    },
     /// 定期 tick（UI リフレッシュ）
     Tick,
     /// ウィンドウリサイズ
