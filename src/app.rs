@@ -158,6 +158,35 @@ pub struct StatusMessage {
     pub level: StatusLevel,
 }
 
+/// Worktree 追加時のブランチ作成モード
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddWorktreeMode {
+    /// 現在の HEAD から新規ブランチを作成
+    NewBranch,
+    /// ベースブランチ（origin/main 等）から新規ブランチを作成
+    FromBase,
+    /// 既存リモートブランチをチェックアウト
+    FromRemote,
+}
+
+impl AddWorktreeMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::NewBranch => Self::FromBase,
+            Self::FromBase => Self::FromRemote,
+            Self::FromRemote => Self::NewBranch,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NewBranch => "新規",
+            Self::FromBase => "ベース",
+            Self::FromRemote => "リモート",
+        }
+    }
+}
+
 /// Worktree の状態
 #[derive(Debug)]
 pub struct Worktree {
@@ -204,6 +233,12 @@ pub struct App {
     pub add_worktree_input: String,
     pub add_worktree_project_index: usize,
     pub add_worktree_name: String,
+    pub add_worktree_mode: AddWorktreeMode,
+    pub add_worktree_remote_branches: Vec<String>,
+    pub add_worktree_branch_filter: String,
+    pub add_worktree_branch_cursor: usize,
+    pub add_worktree_loading: bool,
+    pub add_worktree_base_branch: String,
     pub show_add_project_popup: bool,
     pub add_project_input: String,
     pub show_grep_popup: bool,
@@ -256,6 +291,12 @@ impl App {
             add_worktree_input: String::new(),
             add_worktree_project_index: 0,
             add_worktree_name: String::new(),
+            add_worktree_mode: AddWorktreeMode::NewBranch,
+            add_worktree_remote_branches: Vec::new(),
+            add_worktree_branch_filter: String::new(),
+            add_worktree_branch_cursor: 0,
+            add_worktree_loading: false,
+            add_worktree_base_branch: "origin/main".to_string(),
             show_add_project_popup: false,
             add_project_input: String::new(),
             show_grep_popup: false,
@@ -534,6 +575,7 @@ mod tests {
             siki: SikiConfig {
                 shell: Some("/bin/zsh".to_string()),
                 shared_dirs: vec!["node_modules".to_string()],
+                base_branch: None,
             },
             projects: vec![
                 ProjectConfig {
@@ -721,6 +763,7 @@ mod tests {
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![],
         };

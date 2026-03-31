@@ -474,6 +474,7 @@ mod tests {
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![ProjectConfig {
                 name: "test".to_string(),
@@ -864,6 +865,7 @@ mod tests {
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![],
         };
@@ -877,6 +879,7 @@ mod tests {
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![],
         };

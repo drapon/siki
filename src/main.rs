@@ -573,6 +573,13 @@ async fn handle_event(
         AppEvent::Resize(_w, _h) => {
             // ratatui が自動的にリサイズを処理する
         }
+        AppEvent::RemoteBranches { project_index, branches } => {
+            if project_index == app.add_worktree_project_index {
+                app.add_worktree_remote_branches = branches;
+                app.add_worktree_loading = false;
+                app.add_worktree_branch_cursor = 0;
+            }
+        }
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
@@ -701,12 +708,6 @@ fn handle_add_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEv
 
             app.show_add_project_popup = false;
             app.add_project_input.clear();
-
-            // siki.json が無ければ作成確認ポップアップを表示
-            if !config::siki_json_exists(&path) {
-                app.siki_json_confirm_project_path = Some(path);
-                app.show_siki_json_confirm = true;
-            }
         }
         KeyCode::Char(c) => {
             app.add_project_input.push(c);
@@ -731,90 +732,203 @@ fn handle_add_worktree_popup_key(
         KeyCode::Esc => {
             app.show_add_worktree_popup = false;
             app.add_worktree_input.clear();
+            app.add_worktree_branch_filter.clear();
+            app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.add_worktree_mode = app.add_worktree_mode.next();
+            // FromRemote に切り替えたとき、ブランチ一覧が未取得なら非同期取得
+            if app.add_worktree_mode == app::AddWorktreeMode::FromRemote
+                && app.add_worktree_remote_branches.is_empty()
+                && !app.add_worktree_loading
+            {
+                app.add_worktree_loading = true;
+                let pi = app.add_worktree_project_index;
+                let project_path = app.projects[pi].path.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let branches = tokio::task::spawn_blocking(move || {
+                        git::WorktreeManager::list_remote_branches(&project_path)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let _ = tx.send(event::AppEvent::RemoteBranches {
+                        project_index: pi,
+                        branches,
+                    });
+                });
+            }
         }
         KeyCode::Enter => {
-            let branch = app.add_worktree_input.trim().to_string();
-            if branch.is_empty() {
-                return;
-            }
-            let pi = app.add_worktree_project_index;
-            let wt_name = app.add_worktree_name.clone();
-
-            // git worktree を作成
-            let project_name = app.projects[pi].name.clone();
-            let project_path = app.projects[pi].path.clone();
-            let wt_path = config::worktree_path(&project_name, &wt_name);
-
-            let shared_dirs = config::load_config(&config::default_config_path())
-                .map(|c| c.siki.shared_dirs)
-                .unwrap_or_default();
-
-            if let Err(e) = git::WorktreeManager::create_worktree(
-                &project_path,
-                &wt_path,
-                &branch,
-                &shared_dirs,
-            ) {
-                app.show_error(format!("worktree の作成に失敗: {}", e));
-                app.show_add_worktree_popup = false;
-                app.add_worktree_input.clear();
-                return;
-            }
-
-            // メモリ上に worktree を追加
-            app.projects[pi].worktrees.push(app::Worktree {
-                name: wt_name.clone(),
-                branch: branch.clone(),
-                path: wt_path.clone(),
-                status: app::WorktreeStatus::Idle,
-                chat_history: Vec::new(),
-                open_files: Vec::new(),
-                active_tab: 0,
-                claude_tabs: 0,
-                right_panel_mode: app::RightPanelMode::Tree,
-                active_terminal: 0,
-                chat_scroll_offset: 0,
-                claude_scroll_offset: 0,
-                pr_title: None,
-            });
-
-            // PR 情報を非同期取得
-            let wi = app.projects[pi].worktrees.len() - 1;
-            let tx = event_tx.clone();
-            let pr_path = wt_path.clone();
-            tokio::spawn(async move {
-                let title = fetch_pr_title(&pr_path).await;
-                let _ = tx.send(event::AppEvent::PrInfo {
-                    worktree_id: (pi, wi),
-                    title,
-                });
-            });
-
-            app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
-
-            // siki.json の setup スクリプトがあれば実行
-            let wi = app.projects[pi].worktrees.len() - 1;
-            let wt_id = (pi, wi);
-            if let Some(siki_json) = config::load_siki_json(&project_path) {
-                if let Some(ref setup_script) = siki_json.scripts.setup {
-                    run_siki_script(
+            match app.add_worktree_mode {
+                app::AddWorktreeMode::NewBranch | app::AddWorktreeMode::FromBase => {
+                    let branch = app.add_worktree_input.trim().to_string();
+                    if branch.is_empty() {
+                        return;
+                    }
+                    let start_point = if app.add_worktree_mode == app::AddWorktreeMode::FromBase {
+                        Some(app.add_worktree_base_branch.clone())
+                    } else {
+                        None
+                    };
+                    finalize_add_worktree(
                         app, terminals, event_tx, shell,
-                        wt_id, setup_script, &wt_name, &wt_path,
+                        &branch,
+                        start_point.as_deref(),
                     );
                 }
+                app::AddWorktreeMode::FromRemote => {
+                    let filtered: Vec<String> = app
+                        .add_worktree_remote_branches
+                        .iter()
+                        .filter(|b| {
+                            app.add_worktree_branch_filter.is_empty()
+                                || b.contains(&app.add_worktree_branch_filter)
+                        })
+                        .cloned()
+                        .collect();
+                    if let Some(remote_branch) = filtered.get(app.add_worktree_branch_cursor) {
+                        // origin/feature-x → feature-x
+                        let local_branch = remote_branch
+                            .find('/')
+                            .map(|i| &remote_branch[i + 1..])
+                            .unwrap_or(remote_branch)
+                            .to_string();
+                        let start_point = remote_branch.clone();
+                        finalize_add_worktree(
+                            app, terminals, event_tx, shell,
+                            &local_branch,
+                            Some(&start_point),
+                        );
+                    }
+                }
             }
-
-            app.show_add_worktree_popup = false;
-            app.add_worktree_input.clear();
+        }
+        KeyCode::Up => {
+            if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
+                app.add_worktree_branch_cursor =
+                    app.add_worktree_branch_cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
+                let filtered_count = app
+                    .add_worktree_remote_branches
+                    .iter()
+                    .filter(|b| {
+                        app.add_worktree_branch_filter.is_empty()
+                            || b.contains(&app.add_worktree_branch_filter)
+                    })
+                    .count();
+                if filtered_count > 0 {
+                    app.add_worktree_branch_cursor =
+                        (app.add_worktree_branch_cursor + 1).min(filtered_count - 1);
+                }
+            }
         }
         KeyCode::Char(c) => {
-            app.add_worktree_input.push(c);
+            if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
+                app.add_worktree_branch_filter.push(c);
+                app.add_worktree_branch_cursor = 0;
+            } else {
+                app.add_worktree_input.push(c);
+            }
         }
         KeyCode::Backspace => {
-            app.add_worktree_input.pop();
+            if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
+                app.add_worktree_branch_filter.pop();
+                app.add_worktree_branch_cursor = 0;
+            } else {
+                app.add_worktree_input.pop();
+            }
         }
         _ => {}
     }
+}
+
+/// worktree 作成の共通処理（モード問わず）
+fn finalize_add_worktree(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    branch: &str,
+    start_point: Option<&str>,
+) {
+    let pi = app.add_worktree_project_index;
+    let wt_name = app.add_worktree_name.clone();
+
+    let project_name = app.projects[pi].name.clone();
+    let project_path = app.projects[pi].path.clone();
+    let wt_path = config::worktree_path(&project_name, &wt_name);
+
+    let shared_dirs = config::load_config(&config::default_config_path())
+        .map(|c| c.siki.shared_dirs)
+        .unwrap_or_default();
+
+    if let Err(e) = git::WorktreeManager::create_worktree_from_ref(
+        &project_path,
+        &wt_path,
+        branch,
+        start_point,
+        &shared_dirs,
+    ) {
+        app.show_error(format!("worktree の作成に失敗: {}", e));
+        app.show_add_worktree_popup = false;
+        app.add_worktree_input.clear();
+        app.add_worktree_branch_filter.clear();
+        app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
+        return;
+    }
+
+    // メモリ上に worktree を追加
+    app.projects[pi].worktrees.push(app::Worktree {
+        name: wt_name.clone(),
+        branch: branch.to_string(),
+        path: wt_path.clone(),
+        status: app::WorktreeStatus::Idle,
+        chat_history: Vec::new(),
+        open_files: Vec::new(),
+        active_tab: 0,
+        claude_tabs: 0,
+        right_panel_mode: app::RightPanelMode::Tree,
+        active_terminal: 0,
+        chat_scroll_offset: 0,
+        claude_scroll_offset: 0,
+        pr_title: None,
+    });
+
+    // PR 情報を非同期取得
+    let wi = app.projects[pi].worktrees.len() - 1;
+    let tx = event_tx.clone();
+    let pr_path = wt_path.clone();
+    tokio::spawn(async move {
+        let title = fetch_pr_title(&pr_path).await;
+        let _ = tx.send(event::AppEvent::PrInfo {
+            worktree_id: (pi, wi),
+            title,
+        });
+    });
+
+    app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
+
+    // siki.json の setup スクリプトがあれば実行
+    let wi = app.projects[pi].worktrees.len() - 1;
+    let wt_id = (pi, wi);
+    if let Some(siki_json) = config::load_siki_json(&project_path) {
+        if let Some(ref setup_script) = siki_json.scripts.setup {
+            run_siki_script(
+                app, terminals, event_tx, shell,
+                wt_id, setup_script, &wt_name, &wt_path,
+            );
+        }
+    }
+
+    app.show_add_worktree_popup = false;
+    app.add_worktree_input.clear();
+    app.add_worktree_branch_filter.clear();
+    app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
 }
 
 /// Claude Code セッションにメッセージを送信する
@@ -1029,13 +1143,6 @@ fn handle_left_panel_key(
             if let Some(pi) = project_index {
                 let project_path = &app.projects[pi].path;
 
-                // siki.json が無ければ作成確認ポップアップを表示
-                if !config::siki_json_exists(project_path) {
-                    app.siki_json_confirm_project_path = Some(project_path.clone());
-                    app.show_siki_json_confirm = true;
-                    return;
-                }
-
                 // 既存 worktree 名を収集して重複しない都市名を生成
                 let existing_names: Vec<String> = app.projects[pi]
                     .worktrees
@@ -1046,6 +1153,23 @@ fn handle_left_panel_key(
                 app.add_worktree_project_index = pi;
                 app.add_worktree_name = city_name;
                 app.add_worktree_input.clear();
+                app.add_worktree_branch_filter.clear();
+                app.add_worktree_branch_cursor = 0;
+                app.add_worktree_remote_branches.clear();
+                app.add_worktree_loading = false;
+                app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
+
+                // base_branch を解決: siki.json > config.toml > "origin/main"
+                let base = config::load_siki_json(project_path)
+                    .and_then(|sj| sj.base_branch)
+                    .or_else(|| {
+                        config::load_config(&config::default_config_path())
+                            .ok()
+                            .and_then(|c| c.siki.base_branch)
+                    })
+                    .unwrap_or_else(|| "origin/main".to_string());
+                app.add_worktree_base_branch = base;
+
                 app.show_add_worktree_popup = true;
             }
         }
@@ -1087,6 +1211,25 @@ fn handle_left_panel_key(
                     app.show_remove_project_confirm = true;
                 }
                 None => {}
+            }
+        }
+        KeyCode::Char('S') => {
+            // siki.json 作成（プロジェクト行 or worktree 行で有効）
+            let project_index = match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
+                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => {
+                    Some(*project_index)
+                }
+                None => None,
+            };
+            if let Some(pi) = project_index {
+                let project_path = &app.projects[pi].path;
+                if config::siki_json_exists(project_path) {
+                    app.show_info("siki.json は既に存在します".to_string());
+                } else {
+                    app.siki_json_confirm_project_path = Some(project_path.clone());
+                    app.show_siki_json_confirm = true;
+                }
             }
         }
         KeyCode::Char('A') => {
@@ -1880,6 +2023,7 @@ mod tests {
             siki: SikiConfig {
                 shell: Some("/bin/sh".to_string()),
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
@@ -1897,6 +2041,7 @@ mod tests {
             siki: SikiConfig {
                 shell: Some("/bin/sh".to_string()),
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
@@ -2888,9 +3033,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_key_shows_siki_json_confirm_when_missing() {
+    async fn test_a_key_shows_worktree_popup_without_siki_json() {
         let dir = tempfile::TempDir::new().unwrap();
-        // siki.json を作成しない
+        // siki.json を作成しない → worktree 追加ポップアップが表示される
         let config = sample_config_with_path(dir.path().to_string_lossy().to_string());
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
@@ -2918,8 +3063,42 @@ mod tests {
             &None,
         )
         .await;
+        assert!(!app.show_siki_json_confirm);
+        assert!(app.show_add_worktree_popup);
+    }
+
+    #[tokio::test]
+    async fn test_shift_s_key_shows_siki_json_confirm() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // siki.json を作成しない → S で作成確認ポップアップが表示される
+        let config = sample_config_with_path(dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('S'))),
+            None,
+            &None,
+        )
+        .await;
         assert!(app.show_siki_json_confirm);
-        assert!(!app.show_add_worktree_popup);
     }
 
     #[tokio::test]
@@ -3115,6 +3294,7 @@ mod tests {
             siki: SikiConfig {
                 shell: Some("/bin/sh".to_string()),
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),

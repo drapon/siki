@@ -49,6 +49,11 @@ pub enum AppEvent {
         worktree_id: WorktreeId,
         summary: String,
     },
+    /// リモートブランチ一覧取得完了
+    RemoteBranches {
+        project_index: usize,
+        branches: Vec<String>,
+    },
 }
 
 /// Claude Code ストリームイベント型

@@ -187,6 +187,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  Enter      : worktree 選択",
         "  a          : worktree 追加",
         "  A          : プロジェクト追加",
+        "  S          : siki.json 作成",
         "  r          : run スクリプト実行",
         "  d          : worktree アーカイブ / プロジェクト除外",
         "",
@@ -276,7 +277,9 @@ fn render_add_project_popup(frame: &mut Frame, app: &App) {
 }
 
 fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect(50, 30, frame.area());
+    use crate::app::AddWorktreeMode;
+
+    let area = centered_rect(60, 50, frame.area());
     let project_name = app
         .projects
         .get(app.add_worktree_project_index)
@@ -290,10 +293,84 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
         .title(title)
         .border_style(Style::default().fg(Color::Yellow));
 
-    let text = format!(
-        "\n  名前: {}\n  ブランチ: {}_\n\n  Enter: 追加  Esc: キャンセル",
-        app.add_worktree_name, app.add_worktree_input,
-    );
+    // モードタブを構築
+    let modes = [
+        (AddWorktreeMode::NewBranch, "新規"),
+        (AddWorktreeMode::FromBase, "ベース"),
+        (AddWorktreeMode::FromRemote, "リモート"),
+    ];
+    let mode_tabs: String = modes
+        .iter()
+        .map(|(mode, label)| {
+            if *mode == app.add_worktree_mode {
+                format!("[{}]", label)
+            } else {
+                format!(" {} ", label)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut lines = vec![
+        format!(""),
+        format!("  名前: {}", app.add_worktree_name),
+        format!(""),
+        format!("  モード: {}", mode_tabs),
+        format!(""),
+    ];
+
+    match app.add_worktree_mode {
+        AddWorktreeMode::NewBranch => {
+            lines.push(format!("  ブランチ: {}_", app.add_worktree_input));
+        }
+        AddWorktreeMode::FromBase => {
+            lines.push(format!("  ベース: {}", app.add_worktree_base_branch));
+            lines.push(format!("  ブランチ: {}_", app.add_worktree_input));
+        }
+        AddWorktreeMode::FromRemote => {
+            if app.add_worktree_loading {
+                lines.push(format!("  取得中..."));
+            } else {
+                lines.push(format!("  フィルター: {}_", app.add_worktree_branch_filter));
+                lines.push(format!(""));
+
+                let filtered: Vec<&String> = app
+                    .add_worktree_remote_branches
+                    .iter()
+                    .filter(|b| {
+                        app.add_worktree_branch_filter.is_empty()
+                            || b.contains(&app.add_worktree_branch_filter)
+                    })
+                    .collect();
+
+                // 表示可能な行数を計算（ポップアップ内の残りスペース）
+                let max_display = (area.height as usize).saturating_sub(lines.len() + 4);
+                let start = if app.add_worktree_branch_cursor >= max_display {
+                    app.add_worktree_branch_cursor - max_display + 1
+                } else {
+                    0
+                };
+
+                for (i, branch) in filtered.iter().enumerate().skip(start).take(max_display) {
+                    let marker = if i == app.add_worktree_branch_cursor {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!("  {} {}", marker, branch));
+                }
+
+                if filtered.is_empty() {
+                    lines.push(format!("  (リモートブランチなし)"));
+                }
+            }
+        }
+    }
+
+    lines.push(format!(""));
+    lines.push(format!("  Enter: 追加  Tab: モード  Esc: 閉じる"));
+
+    let text = lines.join("\n");
     let paragraph = Paragraph::new(text).block(block);
 
     frame.render_widget(ratatui::widgets::Clear, area);

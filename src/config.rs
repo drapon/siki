@@ -42,11 +42,14 @@ pub struct Config {
     pub projects: Vec<ProjectConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct SikiConfig {
     pub shell: Option<String>,
     #[serde(default)]
     pub shared_dirs: Vec<String>,
+    /// グローバルデフォルトのベースブランチ（例: "origin/main"）
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -75,6 +78,7 @@ pub fn load_config(path: &Path) -> Result<Config> {
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![],
         }),
@@ -363,6 +367,9 @@ pub fn discover_projects() -> Vec<ProjectConfig> {
 pub struct SikiJson {
     #[serde(default)]
     pub scripts: SikiScripts,
+    /// プロジェクト固有のベースブランチ（例: "origin/main", "origin/develop"）
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 /// siki.json の scripts セクション
@@ -574,6 +581,7 @@ worktrees = [
             siki: SikiConfig {
                 shell: Some("/usr/local/bin/fish".to_string()),
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![],
         };
@@ -586,6 +594,7 @@ worktrees = [
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![],
         };
@@ -667,6 +676,7 @@ worktrees = [
             siki: SikiConfig {
                 shell: Some("/bin/zsh".to_string()),
                 shared_dirs: vec!["node_modules".to_string()],
+                base_branch: None,
             },
             projects: vec![ProjectConfig {
                 name: "myproject".to_string(),
@@ -728,6 +738,7 @@ worktrees = [
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![],
         };

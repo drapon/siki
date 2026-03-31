@@ -16,16 +16,36 @@ impl WorktreeManager {
         branch: &str,
         shared_dirs: &[String],
     ) -> Result<PathBuf> {
+        Self::create_worktree_from_ref(project_path, worktree_path, branch, None, shared_dirs)
+    }
+
+    /// start_point を指定して worktree を作成する
+    ///
+    /// `start_point` が Some の場合、そのリビジョンからブランチを作成する。
+    /// None の場合は現在の HEAD からブランチを作成する（従来の動作）。
+    pub fn create_worktree_from_ref(
+        project_path: &Path,
+        worktree_path: &Path,
+        branch: &str,
+        start_point: Option<&str>,
+        shared_dirs: &[String],
+    ) -> Result<PathBuf> {
         // 親ディレクトリを作成
         if let Some(parent) = worktree_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("ディレクトリの作成に失敗: {}", parent.display()))?;
         }
 
-        // git worktree add -b <branch> <path>
+        // git worktree add -b <branch> <path> [<start_point>]
+        let mut args = vec!["worktree", "add", "-b", branch];
+        let wt_path_str = worktree_path.to_string_lossy().to_string();
+        args.push(&wt_path_str);
+        if let Some(sp) = start_point {
+            args.push(sp);
+        }
+
         let output = Command::new("git")
-            .args(["worktree", "add", "-b", branch])
-            .arg(worktree_path)
+            .args(&args)
             .current_dir(project_path)
             .output()
             .context("git worktree add の実行に失敗")?;
@@ -57,6 +77,35 @@ impl WorktreeManager {
         }
 
         Ok(worktree_path.to_path_buf())
+    }
+
+    /// リモートブランチ一覧を取得する
+    pub fn list_remote_branches(project_path: &Path) -> Result<Vec<String>> {
+        // まず fetch して最新状態に同期
+        let _ = Command::new("git")
+            .args(["fetch", "--prune"])
+            .current_dir(project_path)
+            .output();
+
+        let output = Command::new("git")
+            .args(["branch", "-r", "--no-color"])
+            .current_dir(project_path)
+            .output()
+            .context("git branch -r の実行に失敗")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git branch -r に失敗: {}", stderr.trim());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let branches: Vec<String> = stdout
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty() && !line.contains("HEAD ->"))
+            .collect();
+
+        Ok(branches)
     }
 
     /// Worktree を削除する

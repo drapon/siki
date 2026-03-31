@@ -472,6 +472,7 @@ mod tests {
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![
                 ProjectConfig {
@@ -507,6 +508,7 @@ mod tests {
             siki: SikiConfig {
                 shell: None,
                 shared_dirs: vec![],
+                base_branch: None,
             },
             projects: vec![ProjectConfig {
                 name: "webapp".to_string(),
