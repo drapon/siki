@@ -196,6 +196,7 @@ mod tests {
                         right_panel_mode: RightPanelMode::Tree,
                         active_terminal: 0,
                         chat_scroll_offset: 0,
+                        claude_scroll_offset: 0,
                     },
                     Worktree {
                         name: "fix-bug".to_string(),
@@ -209,6 +210,7 @@ mod tests {
                         right_panel_mode: RightPanelMode::Tree,
                         active_terminal: 0,
                         chat_scroll_offset: 0,
+                        claude_scroll_offset: 0,
                     },
                 ],
             },
@@ -228,6 +230,7 @@ mod tests {
                     right_panel_mode: RightPanelMode::Tree,
                     active_terminal: 0,
                     chat_scroll_offset: 0,
+                    claude_scroll_offset: 0,
                 }],
             },
         ]
