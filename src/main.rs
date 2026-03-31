@@ -227,6 +227,18 @@ async fn handle_event(
                 return;
             }
 
+            // Main パネルで Claude タブがアクティブな場合はキーを PTY に転送
+            if app.focused_panel == app::Panel::Main {
+                let on_claude_tab = app
+                    .selected_worktree()
+                    .map(|wt| wt.active_tab < wt.claude_tabs)
+                    .unwrap_or(false);
+                if on_claude_tab {
+                    handle_claude_terminal_key(app, claude_terms, key);
+                    return;
+                }
+            }
+
             // グローバルキー
             match key.code {
                 KeyCode::Char('q') => app.running = false,
@@ -254,16 +266,8 @@ async fn handle_event(
                             handle_left_panel_key(app, left_panel, source_tree, diff_view, terminals, claude_terms, event_tx, shell, key);
                         }
                         app::Panel::Main => {
-                            // 現在のタブが Claude タブならキーを転送
-                            let on_claude_tab = app
-                                .selected_worktree()
-                                .map(|wt| wt.active_tab < wt.claude_tabs)
-                                .unwrap_or(false);
-                            if on_claude_tab {
-                                handle_claude_terminal_key(app, claude_terms, key);
-                            } else {
-                                handle_main_panel_key(app, claude_terms, event_tx, key);
-                            }
+                            // Claude タブは上で早期 return 済みなのでここは非 Claude タブのみ
+                            handle_main_panel_key(app, claude_terms, event_tx, key);
                         }
                         app::Panel::Right => {
                             handle_right_panel_key(app, source_tree, diff_view, key);
