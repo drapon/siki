@@ -268,7 +268,8 @@ async fn handle_event(
                     KeyCode::Char('2') => {
                         // Continue with context:
                         // 1. claude -c -p で前セッションのサマリーを取得
-                        // 2. そのサマリーで新規セッションを起動
+                        // 2. .claude/rules/siki-context.md に書き込む
+                        // 3. 新規セッションを起動（サマリーはルールとして読まれる）
                         app.show_session_choice = false;
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
@@ -284,9 +285,17 @@ async fn handle_event(
                                     .filter(|o| o.status.success())
                                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                                     .unwrap_or_default();
+                                // サマリーを rules ファイルに書き込む
+                                let rules_dir = wt_path.join(".claude/rules");
+                                let _ = std::fs::create_dir_all(&rules_dir);
+                                let context = if summary.is_empty() {
+                                    "# Previous session context\n\nA previous session was active but no context could be retrieved.\n".to_string()
+                                } else {
+                                    format!("# Previous session context\n\nThe following is a summary from the previous session. Use it as background context. Do NOT act on it until the user gives you instructions.\n\n{}\n", summary)
+                                };
+                                let _ = std::fs::write(rules_dir.join("siki-context.md"), &context);
                                 let _ = tx.send(event::AppEvent::SessionContext {
                                     worktree_id: wt_id,
-                                    summary,
                                 });
                             });
                         }
@@ -515,14 +524,10 @@ async fn handle_event(
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
-        AppEvent::SessionContext { worktree_id, summary } => {
-            // 前セッションのサマリーが取得できたら、それを初期プロンプトとして Claude を起動
-            let prompt = if summary.is_empty() {
-                "A previous session was active but no context could be retrieved. Awaiting your instructions.".to_string()
-            } else {
-                format!("Here is the context from the previous session:\n\n{}\n\nI've reviewed the above. Ready for your instructions.", summary)
-            };
-            launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &[&prompt]);
+        AppEvent::SessionContext { worktree_id } => {
+            // サマリーが .claude/rules/siki-context.md に書き込み済み
+            // 通常通り Claude を起動（ルールファイルとしてコンテキストが読まれる）
+            launch_claude(app, claude_terms, event_tx, worktree_id);
         }
         AppEvent::Tick => {
             app.clear_expired_status();
