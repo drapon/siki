@@ -44,12 +44,49 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
         "echo '{{\"event\":\"dead\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
     ), true);
 
+    // siki MCP サーバーを自動登録
+    inject_mcp_server(&mut settings);
+
     let content = serde_json::to_string_pretty(&settings)
         .context("settings.json のシリアライズに失敗")?;
     std::fs::write(&settings_path, content)
         .with_context(|| format!("settings.json の書き込みに失敗: {}", settings_path.display()))?;
 
     Ok(())
+}
+
+/// siki MCP サーバーの設定を注入する
+///
+/// 実行中の siki バイナリのパスを自動検出し、mcpServers に登録する。
+fn inject_mcp_server(settings: &mut Value) {
+    let siki_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "siki".to_string());
+
+    let mcp_servers = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}));
+
+    let servers = match mcp_servers.as_object_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // 既に siki が登録済みなら上書きしない
+    if servers.contains_key("siki") {
+        return;
+    }
+
+    servers.insert(
+        "siki".to_string(),
+        json!({
+            "type": "stdio",
+            "command": siki_path,
+            "args": ["mcp"]
+        }),
+    );
 }
 
 /// settings.json を読み込む。なければ空オブジェクトを返す。
