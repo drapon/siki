@@ -525,28 +525,11 @@ async fn handle_event(
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
         AppEvent::SessionContext { worktree_id } => {
-            // Claude を起動し、起動完了後に @file で添付する
-            launch_claude(app, claude_terms, event_tx, worktree_id);
-
-            // Claude PTY に @file を遅延書き込み（起動待ち）
-            let claude_idx = app.worktree_by_id(worktree_id)
-                .map(|wt| wt.claude_tabs.saturating_sub(1))
-                .unwrap_or(0);
-            let wt_id = worktree_id;
-            let tx = event_tx.clone();
-            tokio::spawn(async move {
-                // Claude 起動待ち
-                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-                let _ = tx.send(AppEvent::SessionContextReady {
-                    worktree_id: wt_id,
-                    claude_idx,
-                });
-            });
-        }
-        AppEvent::SessionContextReady { worktree_id, claude_idx } => {
-            if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
-                let _ = emu.write(b"@.claude/siki-handoff.md\n");
-            }
+            // --append-system-prompt-file でサマリーをシステムプロンプトに追加して起動
+            launch_claude_with_args(
+                app, claude_terms, event_tx, worktree_id,
+                &["--append-system-prompt-file", ".claude/siki-handoff.md"],
+            );
         }
         AppEvent::Tick => {
             app.clear_expired_status();
