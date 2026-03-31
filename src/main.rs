@@ -266,49 +266,10 @@ async fn handle_event(
                         }
                     }
                     KeyCode::Char('2') => {
-                        // Reference existing → セッション一覧へ
+                        // Resume existing → claude -c で会話ピッカーを開く
                         app.show_session_choice = false;
-                        app.show_session_list = true;
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            if app.show_session_list {
-                match key.code {
-                    KeyCode::Esc => {
-                        app.show_session_list = false;
-                        app.session_choice_wt_id = None;
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !app.session_list_items.is_empty() {
-                            app.session_list_cursor = (app.session_list_cursor + 1) % app.session_list_items.len();
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if !app.session_list_items.is_empty() {
-                            if app.session_list_cursor == 0 {
-                                app.session_list_cursor = app.session_list_items.len() - 1;
-                            } else {
-                                app.session_list_cursor -= 1;
-                            }
-                        }
-                    }
-                    KeyCode::Enter => {
-                        // 選択したセッションのコンテキストを取得して Claude を起動
-                        app.show_session_list = false;
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
-                            let context_prompt = if let Some((session_id, _)) = app.session_list_items.get(app.session_list_cursor) {
-                                build_session_context(session_registry, session_id)
-                            } else {
-                                None
-                            };
-                            if let Some(prompt) = context_prompt {
-                                // 初期プロンプト付きで Claude を起動
-                                launch_claude_with_args(app, claude_terms, event_tx, wt_id, &[&prompt]);
-                            } else {
-                                launch_claude(app, claude_terms, event_tx, wt_id);
-                            }
+                            launch_claude_with_args(app, claude_terms, event_tx, wt_id, &["-c"]);
                         }
                     }
                     _ => {}
@@ -1121,12 +1082,9 @@ fn handle_main_panel_key(
             // 新しい Claude Code タブを追加
             if let Some(wt_id) = app.selected_worktree {
                 // 同じ worktree にアクティブセッションがあるかチェック
-                let has_active = find_active_sessions(session_registry, app, wt_id);
-                if let Some(sessions) = has_active {
+                if has_active_sessions(session_registry, app, wt_id) {
                     app.show_session_choice = true;
                     app.session_choice_wt_id = Some(wt_id);
-                    app.session_list_items = sessions;
-                    app.session_list_cursor = 0;
                 } else {
                     launch_claude(app, claude_terms, event_tx, wt_id);
                 }
@@ -1511,66 +1469,22 @@ fn resize_terminals(
 /// Claude Code を中央パネルで起動する
 ///
 /// プロジェクトのパスで `claude` をインタラクティブに起動する。
-/// 同じ worktree 内のアクティブセッションを検索する
-/// 表示用に (session_id, 表示ラベル) のペアを返す
-fn find_active_sessions(
+/// 同じ worktree 内にアクティブセッションがあるか判定する
+fn has_active_sessions(
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
     app: &app::App,
     wt_id: app::WorktreeId,
-) -> Option<Vec<(String, String)>> {
-    let reg = session_registry.as_ref()?.lock().ok()?;
-    let wt = app.worktree_by_id(wt_id)?;
+) -> bool {
+    let Some(reg) = session_registry.as_ref().and_then(|r| r.lock().ok()) else {
+        return false;
+    };
+    let Some(wt) = app.worktree_by_id(wt_id) else {
+        return false;
+    };
     let project = &app.projects[wt_id.0].name;
-
-    // DB から summary を取得
-    let db_path = config::db_path();
-    let db_sessions = db::init(&db_path)
-        .ok()
-        .and_then(|conn| db::list_sessions(&conn).ok())
-        .unwrap_or_default();
-
-    // ブランチ名を取得
-    let branch = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&wt.path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    let sessions: Vec<_> = reg
-        .by_worktree(project, &wt.name)
-        .into_iter()
-        .filter(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
-        .map(|s| {
-            // DB から summary を探す、なければブランチ名
-            let label = db_sessions
-                .iter()
-                .find(|ds| ds.session_id == s.session_id)
-                .and_then(|ds| ds.summary.clone())
-                .unwrap_or_else(|| {
-                    if branch.is_empty() { s.role.clone() } else { branch.clone() }
-                });
-            (s.session_id.clone(), label)
-        })
-        .collect();
-
-    if sessions.is_empty() { None } else { Some(sessions) }
-}
-
-/// 選択されたセッションを参照するためのプロンプトを組み立てる
-fn build_session_context(
-    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
-    session_id: &str,
-) -> Option<String> {
-    let reg = session_registry.as_ref()?.lock().ok()?;
-    let session = reg.get(session_id)?;
-    let wt = &session.worktree_name;
-    Some(format!(
-        "Use get_context with target {{type: \"worktree\", id: \"{}\"}} to review previous work, then continue.",
-        wt,
-    ))
+    reg.by_worktree(project, &wt.name)
+        .iter()
+        .any(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
 }
 
 fn launch_claude(
@@ -1683,12 +1597,9 @@ fn handle_claude_terminal_key(
 
     // Ctrl+t で新しい Claude タブを追加（アクティブセッションチェック付き）
     if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        let has_active = find_active_sessions(session_registry, app, wt_id);
-        if let Some(sessions) = has_active {
+        if has_active_sessions(session_registry, app, wt_id) {
             app.show_session_choice = true;
             app.session_choice_wt_id = Some(wt_id);
-            app.session_list_items = sessions;
-            app.session_list_cursor = 0;
         } else {
             launch_claude(app, claude_terms, event_tx, wt_id);
         }
