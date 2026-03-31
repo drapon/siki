@@ -14,7 +14,7 @@ pub fn execute_tool(
     session_id: &str,
 ) -> Result<Value> {
     match tool_name {
-        "list_sessions" => list_sessions(conn),
+        "list_sessions" => list_sessions(conn, session_id),
         "send_message" => send_message(conn, params, session_id),
         "broadcast" => broadcast(conn, params, session_id),
         "set_summary" => set_summary(conn, params, session_id),
@@ -23,7 +23,7 @@ pub fn execute_tool(
     }
 }
 
-fn list_sessions(conn: &Connection) -> Result<Value> {
+fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
     let sessions = db::list_sessions(conn)?;
     let items: Vec<Value> = sessions
         .iter()
@@ -39,7 +39,32 @@ fn list_sessions(conn: &Connection) -> Result<Value> {
             })
         })
         .collect();
-    Ok(json!({ "sessions": items }))
+
+    // 自セッション宛の未読メッセージも取得
+    let my_worktree = sessions.iter().find(|s| s.session_id == session_id);
+    let (wt, proj) = my_worktree
+        .map(|s| (s.worktree_name.as_str(), s.project_name.as_str()))
+        .unwrap_or(("", ""));
+
+    let pending = db::get_pending_messages(conn, session_id, wt, proj)?;
+    let msg_ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
+    let messages: Vec<Value> = pending
+        .iter()
+        .map(|m| {
+            json!({
+                "from": m.from_session,
+                "content": m.content,
+                "type": m.message_type,
+            })
+        })
+        .collect();
+
+    // 取得したメッセージを既読にする
+    if !msg_ids.is_empty() {
+        let _ = db::mark_messages_read(conn, &msg_ids);
+    }
+
+    Ok(json!({ "sessions": items, "pending_messages": messages }))
 }
 
 fn send_message(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
@@ -204,18 +229,36 @@ mod tests {
     #[test]
     fn test_list_sessions_empty() {
         let conn = test_db();
-        let result = list_sessions(&conn).unwrap();
+        let result = list_sessions(&conn, "me").unwrap();
         assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(result["pending_messages"].as_array().unwrap().len(), 0);
     }
 
     #[test]
     fn test_list_sessions_with_data() {
         let conn = test_db();
         db::upsert_session(&conn, "s1", "frontend", "osaka", "myapp", "/tmp", "idle").unwrap();
-        let result = list_sessions(&conn).unwrap();
+        let result = list_sessions(&conn, "s2").unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["id"], "s1");
+    }
+
+    #[test]
+    fn test_list_sessions_includes_pending_messages() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp", "idle").unwrap();
+        db::upsert_session(&conn, "s2", "default", "osaka", "myapp", "/tmp", "idle").unwrap();
+        db::insert_message(&conn, "s1", Some("s2"), None, None, "hello s2", "message", None).unwrap();
+
+        let result = list_sessions(&conn, "s2").unwrap();
+        let msgs = result["pending_messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["content"], "hello s2");
+
+        // 2回目は既読なので空
+        let result2 = list_sessions(&conn, "s2").unwrap();
+        assert_eq!(result2["pending_messages"].as_array().unwrap().len(), 0);
     }
 
     #[test]

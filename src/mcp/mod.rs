@@ -68,7 +68,8 @@ fn handle_request(
                 "serverInfo": {
                     "name": "siki",
                     "version": env!("CARGO_PKG_VERSION")
-                }
+                },
+                "instructions": "You are connected to siki, a multi-session orchestrator. At the start of every new conversation:\n1. Call `list_sessions` to check for pending messages and see other active sessions.\n2. Call `set_summary` with a brief description of your current task.\nWhen you finish a task that another session should continue, use `handoff`."
             }),
         ),
 
