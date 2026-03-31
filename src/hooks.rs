@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// worktree の `.claude/settings.json` に siki 用 hook を注入する
 ///
@@ -97,6 +97,40 @@ fn inject_mcp_json(worktree_path: &Path) {
 
     if let Ok(content) = serde_json::to_string_pretty(&config) {
         let _ = std::fs::write(&mcp_path, content);
+    }
+
+    // .mcp.json を git 追跡から除外（.git/info/exclude を使い .gitignore を汚さない）
+    exclude_from_git(worktree_path, ".mcp.json");
+}
+
+/// .git/info/exclude にパターンを追加して git 追跡から除外する
+fn exclude_from_git(worktree_path: &Path, pattern: &str) {
+    // worktree の .git はファイル（"gitdir: ..." 形式）またはディレクトリ
+    let git_path = worktree_path.join(".git");
+    let info_dir = if git_path.is_dir() {
+        git_path.join("info")
+    } else if let Ok(content) = std::fs::read_to_string(&git_path) {
+        // "gitdir: /path/to/.git/worktrees/<name>"
+        if let Some(gitdir) = content.strip_prefix("gitdir: ") {
+            PathBuf::from(gitdir.trim()).join("info")
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+
+    let _ = std::fs::create_dir_all(&info_dir);
+    let exclude_path = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if !existing.lines().any(|line| line.trim() == pattern) {
+        let mut content = existing;
+        if !content.ends_with('\n') && !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(pattern);
+        content.push('\n');
+        let _ = std::fs::write(&exclude_path, content);
     }
 }
 
