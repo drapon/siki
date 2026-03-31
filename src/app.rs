@@ -220,6 +220,16 @@ pub struct App {
     pub siki_json_init_scroll: usize,
     /// オーバーレイターミナルのスピナーカウンタ
     pub siki_json_init_spinner: usize,
+    /// セッション選択ポップアップ（新規 Claude タブ起動時）
+    pub show_session_choice: bool,
+    /// セッション選択: 参照モード（セッション一覧表示中）
+    pub show_session_list: bool,
+    /// セッション選択対象の worktree ID
+    pub session_choice_wt_id: Option<WorktreeId>,
+    /// セッション一覧（表示用）
+    pub session_list_items: Vec<(String, String)>, // (session_id, summary)
+    /// セッション一覧のカーソル
+    pub session_list_cursor: usize,
     pub running: bool,
 }
 
@@ -261,6 +271,11 @@ impl App {
             show_siki_json_init_terminal: false,
             siki_json_init_scroll: 0,
             siki_json_init_spinner: 0,
+            show_session_choice: false,
+            show_session_list: false,
+            session_choice_wt_id: None,
+            session_list_items: Vec::new(),
+            session_list_cursor: 0,
             running: true,
         }
     }

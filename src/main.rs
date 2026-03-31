@@ -256,6 +256,71 @@ async fn handle_event(
                 }
                 return;
             }
+            if app.show_session_choice {
+                match key.code {
+                    KeyCode::Char('1') | KeyCode::Enter | KeyCode::Esc => {
+                        // Start new（デフォルト）
+                        app.show_session_choice = false;
+                        if let Some(wt_id) = app.session_choice_wt_id.take() {
+                            launch_claude(app, claude_terms, event_tx, wt_id);
+                        }
+                    }
+                    KeyCode::Char('2') => {
+                        // Reference existing → セッション一覧へ
+                        app.show_session_choice = false;
+                        app.show_session_list = true;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            if app.show_session_list {
+                match key.code {
+                    KeyCode::Esc => {
+                        app.show_session_list = false;
+                        app.session_choice_wt_id = None;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !app.session_list_items.is_empty() {
+                            app.session_list_cursor = (app.session_list_cursor + 1) % app.session_list_items.len();
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if !app.session_list_items.is_empty() {
+                            if app.session_list_cursor == 0 {
+                                app.session_list_cursor = app.session_list_items.len() - 1;
+                            } else {
+                                app.session_list_cursor -= 1;
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        // 選択したセッションのコンテキストを取得して Claude を起動
+                        app.show_session_list = false;
+                        if let Some(wt_id) = app.session_choice_wt_id.take() {
+                            let context_prompt = if let Some((session_id, _)) = app.session_list_items.get(app.session_list_cursor) {
+                                build_session_context(session_registry, session_id)
+                            } else {
+                                None
+                            };
+                            launch_claude(app, claude_terms, event_tx, wt_id);
+                            // コンテキストを Claude PTY に書き込む
+                            if let Some(prompt) = context_prompt {
+                                let claude_idx = app.worktree_by_id(wt_id)
+                                    .map(|wt| wt.claude_tabs.saturating_sub(1))
+                                    .unwrap_or(0);
+                                if let Some(emu) = claude_terms.get_mut(&(wt_id, claude_idx)) {
+                                    // 少し待ってから書き込む（Claude 起動待ち）
+                                    let msg = format!("{}\n", prompt);
+                                    let _ = emu.write(msg.as_bytes());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if app.show_message_popup {
                 handle_popup_key(app, sessions, event_tx, key).await;
                 return;
@@ -331,7 +396,7 @@ async fn handle_event(
                         }
                         app::Panel::Main => {
                             // Claude タブは上で早期 return 済みなのでここは非 Claude タブのみ
-                            handle_main_panel_key(app, claude_terms, event_tx, key);
+                            handle_main_panel_key(app, claude_terms, event_tx, key, session_registry);
                         }
                         app::Panel::Right => {
                             handle_right_panel_key(app, source_tree, diff_view, key);
@@ -1015,6 +1080,7 @@ fn handle_main_panel_key(
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     key: crossterm::event::KeyEvent,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::KeyCode;
 
@@ -1060,7 +1126,30 @@ fn handle_main_panel_key(
         KeyCode::Char('i') => {
             // 新しい Claude Code タブを追加
             if let Some(wt_id) = app.selected_worktree {
-                launch_claude(app, claude_terms, event_tx, wt_id);
+                // 同じ worktree にアクティブセッションがあるかチェック
+                let has_active = session_registry.as_ref().and_then(|reg| {
+                    let reg = reg.lock().ok()?;
+                    let wt = app.worktree_by_id(wt_id)?;
+                    let project = &app.projects[wt_id.0].name;
+                    let sessions: Vec<_> = reg.by_worktree(project, &wt.name)
+                        .into_iter()
+                        .filter(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
+                        .map(|s| {
+                            let summary = s.role.clone();
+                            (s.session_id.clone(), summary)
+                        })
+                        .collect();
+                    if sessions.is_empty() { None } else { Some(sessions) }
+                });
+
+                if let Some(sessions) = has_active {
+                    app.show_session_choice = true;
+                    app.session_choice_wt_id = Some(wt_id);
+                    app.session_list_items = sessions;
+                    app.session_list_cursor = 0;
+                } else {
+                    launch_claude(app, claude_terms, event_tx, wt_id);
+                }
             }
         }
         KeyCode::Char('s') => {
@@ -1442,6 +1531,54 @@ fn resize_terminals(
 /// Claude Code を中央パネルで起動する
 ///
 /// プロジェクトのパスで `claude` をインタラクティブに起動する。
+/// セッションのコンテキスト情報を組み立てる（git log, status, summary）
+fn build_session_context(
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
+    session_id: &str,
+) -> Option<String> {
+    let reg = session_registry.as_ref()?.lock().ok()?;
+    let session = reg.get(session_id)?;
+    let cwd = &session.cwd;
+
+    let git_log = std::process::Command::new("git")
+        .args(["log", "--oneline", "-10"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    let git_status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let mut ctx = format!("Continuing from previous session (role: {}).\n", session.role);
+    ctx.push_str(&format!("Branch: {}\n", branch));
+    if !git_log.is_empty() {
+        ctx.push_str(&format!("Recent commits:\n{}\n", git_log));
+    }
+    if !git_status.is_empty() {
+        ctx.push_str(&format!("Changed files:\n{}\n", git_status));
+    }
+    ctx.push_str("Please review the above context and continue the work.");
+    Some(ctx)
+}
+
 fn launch_claude(
     app: &mut app::App,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,

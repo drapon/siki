@@ -119,6 +119,14 @@ pub fn render(
         render_siki_json_confirm_popup(frame);
     }
 
+    if app.show_session_choice {
+        render_session_choice_popup(frame);
+    }
+
+    if app.show_session_list {
+        render_session_list_popup(frame, app);
+    }
+
     // siki.json 作成オーバーレイターミナル
     if app.show_siki_json_init_terminal {
         render_siki_json_init_terminal(
@@ -130,6 +138,62 @@ pub fn render(
     }
 
     areas
+}
+
+fn render_session_choice_popup(frame: &mut Frame) {
+    use ratatui::widgets::{Clear, Paragraph};
+
+    let area = frame.area();
+    let w = 42.min(area.width);
+    let h = 5.min(area.height);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup_area = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Active Session Found")
+        .border_style(Style::default().fg(Color::Yellow));
+    let text = " [1] Start new (default)\n [2] Reference existing";
+    frame.render_widget(
+        Paragraph::new(text).block(block).style(Style::default().fg(Color::White)),
+        popup_area,
+    );
+}
+
+fn render_session_list_popup(frame: &mut Frame, app: &App) {
+    use ratatui::widgets::{Clear, List, ListItem, ListState};
+
+    let area = frame.area();
+    let h = (app.session_list_items.len() as u16 + 2).min(area.height).max(4);
+    let w = 50.min(area.width);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup_area = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Select Session (Enter/Esc)")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let items: Vec<ListItem> = app
+        .session_list_items
+        .iter()
+        .map(|(id, role)| {
+            let text = format!(" {} ({})", &id[..8.min(id.len())], role);
+            ListItem::new(text)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+
+    let mut state = ListState::default();
+    state.select(Some(app.session_list_cursor));
+    frame.render_stateful_widget(list, popup_area, &mut state);
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
