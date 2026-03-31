@@ -1476,11 +1476,19 @@ fn resize_terminals(
 ///
 /// プロジェクトのパスで `claude` をインタラクティブに起動する。
 /// 同じ worktree 内にアクティブセッションがあるか判定する
+///
+/// レジストリに加え、既に Claude タブが開いているかもチェック（hook 未到着対策）
 fn has_active_sessions(
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
     app: &app::App,
     wt_id: app::WorktreeId,
 ) -> bool {
+    // 既に Claude タブが開いていれば、hook 到着に関係なくアクティブ
+    if let Some(wt) = app.worktree_by_id(wt_id) {
+        if wt.claude_tabs > 0 {
+            return true;
+        }
+    }
     let Some(reg) = session_registry.as_ref().and_then(|r| r.lock().ok()) else {
         return false;
     };
