@@ -113,7 +113,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "set_summary".to_string(),
-            description: "Set a work summary for the current session".to_string(),
+            description: "Set a work summary for the current session. IMPORTANT: Call this tool at the start of every new task with a brief description of what you are working on (e.g. 'Implementing auth flow', 'Writing tests for API'). This helps other sessions understand what this session is doing.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
