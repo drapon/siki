@@ -266,30 +266,14 @@ async fn handle_event(
                         }
                     }
                     KeyCode::Char('2') => {
-                        // Continue with context:
-                        // 1. claude -c -p で前セッションのサマリーを取得
-                        // 2. .claude/rules/siki-context.md に書き込む
-                        // 3. 新規セッションを起動（サマリーはルールとして読まれる）
+                        // claude -c で前セッションを再開し、引き継ぎプロンプトを送信
                         app.show_session_choice = false;
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
-                            let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
-                            let tx = event_tx.clone();
-                            app.show_info("Generating summary & launching Claude...".to_string());
-                            tokio::spawn(async move {
-                                let summary = tokio::process::Command::new("claude")
-                                    .args(["-c", "-p", "Summarize what you were working on in detail. Include: the goal, what was done, key files changed, decisions made, current status, and any remaining work. Be specific about file paths and code changes."])
-                                    .current_dir(&wt_path)
-                                    .output()
-                                    .await
-                                    .ok()
-                                    .filter(|o| o.status.success())
-                                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                                    .unwrap_or_default();
-                                let _ = tx.send(event::AppEvent::SessionContext {
-                                    worktree_id: wt_id,
-                                    summary,
-                                });
-                            });
+                            app.show_info("Resuming previous session...".to_string());
+                            let handoff_prompt = "[Session Handoff] This session is being handed off to a new operator. \
+                                Summarize what you were working on: the goal, current status, key changes, and remaining work. \
+                                Then STOP and wait for the new operator's instructions. Do NOT continue working.";
+                            launch_claude_with_args(app, claude_terms, event_tx, wt_id, &["-c", handoff_prompt]);
                         }
                     }
                     _ => {}
@@ -516,16 +500,8 @@ async fn handle_event(
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
-        AppEvent::SessionContext { worktree_id, summary } => {
-            let prompt = if summary.is_empty() {
-                "Previous session had no context available.".to_string()
-            } else {
-                format!("Previous session context:\n{}", summary)
-            };
-            launch_claude_with_args(
-                app, claude_terms, event_tx, worktree_id,
-                &["--append-system-prompt", &prompt],
-            );
+        AppEvent::SessionContext { .. } => {
+            // 未使用（claude -c 方式に変更済み）
         }
         AppEvent::Tick => {
             app.clear_expired_status();
