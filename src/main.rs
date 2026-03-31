@@ -85,6 +85,18 @@ async fn main() -> Result<()> {
         };
 
         // Claude ターミナル画面を取得（active_tab が Claude タブの場合）
+        // スクロールバックオフセットを適用してから screen() を取得
+        if let Some(wt_id) = app.selected_worktree {
+            if let Some(wt) = app.worktree_by_id(wt_id) {
+                let tab = wt.active_tab;
+                if tab < wt.claude_tabs {
+                    let offset = wt.claude_scroll_offset;
+                    if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
+                        emu.set_scrollback(offset);
+                    }
+                }
+            }
+        }
         let claude_screen = app.selected_worktree.and_then(|wt_id| {
             let tab = app.worktree_by_id(wt_id)?.active_tab;
             let claude_tabs = app.worktree_by_id(wt_id)?.claude_tabs;
@@ -354,7 +366,19 @@ async fn handle_event(
                         let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                         match panel {
                             Some(app::Panel::Main) => {
-                                if is_up {
+                                let on_claude_tab = app
+                                    .selected_worktree()
+                                    .map(|wt| wt.active_tab < wt.claude_tabs)
+                                    .unwrap_or(false);
+                                if on_claude_tab {
+                                    if let Some(wt) = app.selected_worktree_mut() {
+                                        if is_up {
+                                            wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(3);
+                                        } else {
+                                            wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(3);
+                                        }
+                                    }
+                                } else if is_up {
                                     ui::main_panel::scroll_up(app);
                                 } else {
                                     ui::main_panel::scroll_down(app);
@@ -570,6 +594,7 @@ fn handle_add_worktree_popup_key(
                 right_panel_mode: app::RightPanelMode::Tree,
                 active_terminal: 0,
                 chat_scroll_offset: 0,
+                claude_scroll_offset: 0,
             });
 
             app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
@@ -1409,6 +1434,47 @@ fn handle_claude_terminal_key(
             }
         }
         return;
+    }
+
+    // Shift+PageUp/PageDown でスクロールバック操作
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::PageUp => {
+                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(10);
+                }
+                return;
+            }
+            KeyCode::PageDown => {
+                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(10);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Up/Down キーでスクロールバック操作
+    match key.code {
+        KeyCode::Up => {
+            if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(1);
+            }
+            return;
+        }
+        KeyCode::Down => {
+            if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(1);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // 入力操作時はスクロールを最新に戻す
+    if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+        wt.claude_scroll_offset = 0;
     }
 
     // キー入力を PTY に転送

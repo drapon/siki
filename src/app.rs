@@ -171,6 +171,8 @@ pub struct Worktree {
     pub right_panel_mode: RightPanelMode,
     pub active_terminal: usize,
     pub chat_scroll_offset: usize,
+    /// Claude ターミナルのスクロールバックオフセット
+    pub claude_scroll_offset: usize,
 }
 
 /// プロジェクトの状態
@@ -481,6 +483,7 @@ impl Project {
                 right_panel_mode: RightPanelMode::Tree,
                 active_terminal: 0,
                 chat_scroll_offset: 0,
+                claude_scroll_offset: 0,
             })
             .collect();
 
