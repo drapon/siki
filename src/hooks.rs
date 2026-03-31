@@ -47,6 +47,9 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
     // worktree ルートに .mcp.json を作成して siki MCP サーバーを登録
     inject_mcp_json(worktree_path);
 
+    // .claude/rules/siki.md にセッション開始時のルールを書き込む
+    inject_rules(&claude_dir);
+
     let content = serde_json::to_string_pretty(&settings)
         .context("settings.json のシリアライズに失敗")?;
     std::fs::write(&settings_path, content)
@@ -99,8 +102,36 @@ fn inject_mcp_json(worktree_path: &Path) {
         let _ = std::fs::write(&mcp_path, content);
     }
 
-    // .mcp.json を git 追跡から除外（.git/info/exclude を使い .gitignore を汚さない）
+    // siki が生成したファイルを git 追跡から除外
     exclude_from_git(worktree_path, ".mcp.json");
+    exclude_from_git(worktree_path, ".claude/rules/siki.md");
+}
+
+/// .claude/rules/siki.md にセッション開始ルールを書き込む
+fn inject_rules(claude_dir: &Path) {
+    let rules_dir = claude_dir.join("rules");
+    let _ = std::fs::create_dir_all(&rules_dir);
+    let rules_path = rules_dir.join("siki.md");
+
+    // 既に存在すれば上書きしない
+    if rules_path.exists() {
+        return;
+    }
+
+    let content = r#"# siki session rules
+
+BEFORE responding to the user's first message, you MUST:
+
+1. Call the `list_sessions` MCP tool (siki server).
+2. If the result shows active sessions in the same worktree AND pending_messages is not empty, deliver the messages first.
+3. If active sessions exist in the same worktree (even without messages), show:
+   `Active session(s) found. [1] Start new  [2] Reference existing`
+   Wait for user choice. Default is 1.
+   If user picks 2, list active sessions with summaries, let user pick one, then call `get_context` for it.
+4. Once work begins, call `set_summary` with a short task description.
+"#;
+
+    let _ = std::fs::write(&rules_path, content);
 }
 
 /// .git/info/exclude にパターンを追加して git 追跡から除外する
