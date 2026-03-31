@@ -7,6 +7,7 @@ mod event;
 mod git;
 mod hooks;
 mod mcp;
+mod selection;
 mod session;
 mod terminal;
 mod tui;
@@ -448,9 +449,70 @@ async fn handle_event(
                         if let Some(panel) = layout.hit_test(mouse.column, mouse.row) {
                             app.focused_panel = panel;
                         }
+                        // Claude ペインのコンテンツ領域でクリック → 選択開始
+                        if let Some(ref content_area) = app.claude_content_area {
+                            let on_claude_tab = app
+                                .selected_worktree()
+                                .map(|wt| wt.active_tab < wt.claude_tabs)
+                                .unwrap_or(false);
+                            if on_claude_tab
+                                && layout.hit_test(mouse.column, mouse.row) == Some(app::Panel::Main)
+                            {
+                                let pos = selection::screen_to_term(mouse.column, mouse.row, content_area);
+                                app.text_selection = Some(selection::TextSelection {
+                                    anchor: pos,
+                                    current: pos,
+                                    active: true,
+                                });
+                            } else {
+                                app.text_selection = None;
+                            }
+                        } else {
+                            app.text_selection = None;
+                        }
+                    }
+                }
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                    if let Some(ref mut sel) = app.text_selection {
+                        if sel.active {
+                            if let Some(ref content_area) = app.claude_content_area {
+                                sel.current = selection::screen_to_term(mouse.column, mouse.row, content_area);
+                            }
+                        }
+                    }
+                }
+                MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                    let should_copy = app.text_selection.as_ref().map_or(false, |s| s.active && !s.is_empty());
+                    let sel_range = app.text_selection.as_ref().map(|s| s.normalize());
+                    if let Some(ref mut sel) = app.text_selection {
+                        if sel.active {
+                            sel.active = false;
+                            if sel.is_empty() {
+                                app.text_selection = None;
+                            }
+                        }
+                    }
+                    if should_copy {
+                        if let (Some((start, end)), Some(wt_id)) = (sel_range, app.selected_worktree) {
+                            if let Some(wt) = app.worktree_by_id(wt_id) {
+                                let tab = wt.active_tab;
+                                if tab < wt.claude_tabs {
+                                    if let Some(emu) = claude_terms.get(&(wt_id, tab)) {
+                                        let text = selection::extract_text(emu.screen(), &start, &end);
+                                        if !text.is_empty() {
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                let _ = clipboard.set_text(text);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    // スクロール時は選択をクリア
+                    app.text_selection = None;
                     if let Some(layout) = last_layout {
                         let panel = layout.hit_test(mouse.column, mouse.row);
                         let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
@@ -1608,6 +1670,17 @@ fn handle_claude_terminal_key(
         .worktree_by_id(wt_id)
         .map(|wt| wt.active_tab)
         .unwrap_or(0);
+
+    // Escape で選択クリア（選択中なら PTY には送らない）
+    if key.code == KeyCode::Esc && app.text_selection.is_some() {
+        app.text_selection = None;
+        return;
+    }
+
+    // キー入力時は選択をクリア（表示だけ消す）
+    if app.text_selection.is_some() && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        app.text_selection = None;
+    }
 
     // Ctrl+w で Claude ターミナルを閉じる
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {

@@ -87,16 +87,18 @@ impl EventHandler {
                             }
                         }
                         Ok(Event::Mouse(mouse)) => {
-                            use crossterm::event::MouseEventKind;
+                            use crossterm::event::{MouseButton, MouseEventKind};
                             match mouse.kind {
                                 MouseEventKind::Down(_)
+                                | MouseEventKind::Drag(MouseButton::Left)
+                                | MouseEventKind::Up(MouseButton::Left)
                                 | MouseEventKind::ScrollUp
                                 | MouseEventKind::ScrollDown => {
                                     if key_tx.send(AppEvent::Mouse(mouse)).is_err() {
                                         break;
                                     }
                                 }
-                                _ => {} // Move/Drag は無視
+                                _ => {}
                             }
                         }
                         Ok(Event::Resize(w, h)) => {

@@ -10,19 +10,22 @@ pub fn render(
     focused: bool,
     claude_screen: Option<&vt100::Screen>,
 ) {
-    let wt = match app.selected_worktree_mut() {
-        Some(wt) => wt,
-        None => {
-            // worktree 未選択時
-            let block = panel_block("Main", focused);
-            frame.render_widget(
-                Paragraph::new("← プロジェクトから worktree を選択してください")
-                    .block(block)
-                    .style(Style::default().fg(Color::DarkGray)),
-                area,
-            );
-            return;
-        }
+    // worktree の情報を先に取得（借用の衝突回避）
+    let wt_info = app.selected_worktree().map(|wt| {
+        (wt.active_tab, wt.claude_tabs, wt.open_files.len())
+    });
+
+    let Some((active_tab, claude_tabs, _open_file_count)) = wt_info else {
+        app.claude_content_area = None;
+        // worktree 未選択時
+        let block = panel_block("Main", focused);
+        frame.render_widget(
+            Paragraph::new("← プロジェクトから worktree を選択してください")
+                .block(block)
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
     };
 
     // タブバー + コンテンツの分割
@@ -32,15 +35,18 @@ pub fn render(
     ])
     .split(area);
 
-    // タブバー描画
-    render_tab_bar(frame, chunks[0], wt.active_tab, wt.claude_tabs, &wt.open_files, focused);
+    // タブバー描画（immutable borrow で取得）
+    if let Some(wt) = app.selected_worktree() {
+        render_tab_bar(frame, chunks[0], wt.active_tab, wt.claude_tabs, &wt.open_files, focused);
+    }
 
     // コンテンツ描画
-    if wt.active_tab < wt.claude_tabs {
+    if active_tab < claude_tabs {
         // Claude タブ
         if let Some(screen) = claude_screen {
-            render_claude_terminal(frame, chunks[1], screen, focused);
+            render_claude_terminal(frame, chunks[1], screen, focused, app);
         } else {
+            app.claude_content_area = None;
             let block = panel_block("Claude Code", focused);
             frame.render_widget(
                 Paragraph::new("起動中...")
@@ -50,9 +56,12 @@ pub fn render(
             );
         }
     } else {
-        let file_index = wt.active_tab - wt.claude_tabs;
-        if let Some(file) = wt.open_files.get_mut(file_index) {
-            render_file(frame, chunks[1], file, focused);
+        app.claude_content_area = None;
+        let file_index = active_tab - claude_tabs;
+        if let Some(wt) = app.selected_worktree_mut() {
+            if let Some(file) = wt.open_files.get_mut(file_index) {
+                render_file(frame, chunks[1], file, focused);
+            }
         }
     }
 }
@@ -107,6 +116,7 @@ fn render_claude_terminal(
     area: Rect,
     screen: &vt100::Screen,
     focused: bool,
+    app: &mut App,
 ) {
     let title = if focused {
         "Claude Code (Ctrl+\\ exit)"
@@ -121,8 +131,43 @@ fn render_claude_terminal(
         } else {
             Style::default().fg(Color::DarkGray)
         });
+
+    // コンテンツ領域を計算して保存（ボーダー内側）
+    let content_area = block.inner(area);
+    app.claude_content_area = Some(content_area);
+
     let pseudo_term = tui_term::widget::PseudoTerminal::new(screen).block(block);
     frame.render_widget(pseudo_term, area);
+
+    // 選択範囲のハイライト描画
+    if let Some(ref sel) = app.text_selection {
+        let (start, end) = sel.normalize();
+        let buf = frame.buffer_mut();
+        for row in start.row..=end.row {
+            let screen_y = content_area.y + row;
+            if screen_y >= content_area.y + content_area.height {
+                break;
+            }
+            let col_start = if row == start.row { start.col } else { 0 };
+            let col_end = if row == end.row {
+                end.col
+            } else {
+                content_area.width.saturating_sub(1)
+            };
+            for col in col_start..=col_end {
+                let screen_x = content_area.x + col;
+                if screen_x >= content_area.x + content_area.width {
+                    break;
+                }
+                let cell = &mut buf[(screen_x, screen_y)];
+                // fg/bg 反転で選択をハイライト
+                let fg = cell.fg;
+                let bg = cell.bg;
+                cell.set_fg(if bg == Color::Reset { Color::Black } else { bg });
+                cell.set_bg(if fg == Color::Reset { Color::White } else { fg });
+            }
+        }
+    }
 }
 
 /// ファイル内容をシンタックスハイライト付きで描画（キャッシュ済みデータを使用）

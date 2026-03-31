@@ -1,6 +1,8 @@
 use crate::config::{self, Config, ProjectConfig};
 use crate::event::ClaudeStreamEvent;
+use crate::selection::TextSelection;
 use chrono::{DateTime, Utc};
+use ratatui::prelude::Rect;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -224,6 +226,10 @@ pub struct App {
     pub show_session_choice: bool,
     /// セッション選択対象の worktree ID
     pub session_choice_wt_id: Option<WorktreeId>,
+    /// テキスト選択状態（Claude ペインのマウスドラッグ選択）
+    pub text_selection: Option<TextSelection>,
+    /// Claude ペインのコンテンツ領域（レンダリング時に計算）
+    pub claude_content_area: Option<Rect>,
     pub running: bool,
 }
 
@@ -267,6 +273,8 @@ impl App {
             siki_json_init_spinner: 0,
             show_session_choice: false,
             session_choice_wt_id: None,
+            text_selection: None,
+            claude_content_area: None,
             running: true,
         }
     }

@@ -8,6 +8,7 @@ repository = "https://github.com/drapon/siki"
 
 [dependencies]
 anyhow = "1.0.102"
+arboard = "3"
 chrono = "0.4.43"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 dirs = "6.0.0"
