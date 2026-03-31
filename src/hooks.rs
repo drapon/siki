@@ -30,9 +30,8 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
         "echo '{{\"event\":\"working\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
     ), true);
 
-    inject_hook(hooks, "PostToolUse", &format!(
-        "echo '{{\"event\":\"idle\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
-    ), true);
+    // PostToolUse では idle にしない — Stop まで working を維持する
+    // これにより連続ツール実行中はずっと ● 黄が点灯する
 
     inject_hook(hooks, "Stop", &format!(
         "echo '{{\"event\":\"idle\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
@@ -179,10 +178,9 @@ mod tests {
         let content = std::fs::read_to_string(&settings_path).unwrap();
         let settings: Value = serde_json::from_str(&content).unwrap();
 
-        // 各イベントに hook が存在する
+        // 各イベントに hook が存在する（PostToolUse は使わない）
         assert!(settings["hooks"]["SessionStart"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().len() > 0);
-        assert!(settings["hooks"]["PostToolUse"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["Stop"].as_array().unwrap().len() > 0);
     }
 
