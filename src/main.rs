@@ -303,17 +303,11 @@ async fn handle_event(
                             } else {
                                 None
                             };
-                            launch_claude(app, claude_terms, event_tx, wt_id);
-                            // コンテキストを Claude PTY に書き込む
                             if let Some(prompt) = context_prompt {
-                                let claude_idx = app.worktree_by_id(wt_id)
-                                    .map(|wt| wt.claude_tabs.saturating_sub(1))
-                                    .unwrap_or(0);
-                                if let Some(emu) = claude_terms.get_mut(&(wt_id, claude_idx)) {
-                                    // 少し待ってから書き込む（Claude 起動待ち）
-                                    let msg = format!("{}\n", prompt);
-                                    let _ = emu.write(msg.as_bytes());
-                                }
+                                // 初期プロンプト付きで Claude を起動
+                                launch_claude_with_args(app, claude_terms, event_tx, wt_id, &[&prompt]);
+                            } else {
+                                launch_claude(app, claude_terms, event_tx, wt_id);
                             }
                         }
                     }
