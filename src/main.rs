@@ -526,9 +526,12 @@ async fn handle_event(
         }
         AppEvent::SessionContext { worktree_id } => {
             // --append-system-prompt-file でサマリーをシステムプロンプトに追加して起動
+            let handoff_path = app.worktree_by_id(worktree_id)
+                .map(|wt| wt.path.join(".claude/siki-handoff.md").to_string_lossy().to_string())
+                .unwrap_or_default();
             launch_claude_with_args(
                 app, claude_terms, event_tx, worktree_id,
-                &["--append-system-prompt-file", ".claude/siki-handoff.md"],
+                &["--append-system-prompt-file", &handoff_path],
             );
         }
         AppEvent::Tick => {
