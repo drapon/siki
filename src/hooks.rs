@@ -22,26 +22,29 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
 
     let sock = sock_path.to_string_lossy();
 
+    // SIKI_SID: CLAUDE_SESSION_ID があればそれを使い、なければ PID ベースの ID を生成
+    let sid_expr = "${CLAUDE_SESSION_ID:-siki-$$}";
+
     inject_hook(hooks, "SessionStart", &format!(
-        "echo '{{\"event\":\"register\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\",\"cwd\":\"'\"$PWD\"'\",\"role\":\"'\"${{SIKI_ROLE:-default}}\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"register\",\"session_id\":\"'\"{sid_expr}\"'\",\"cwd\":\"'\"$PWD\"'\",\"role\":\"'\"${{SIKI_ROLE:-default}}\"'\"}}' | nc -U {sock}"
     ), false);
 
     inject_hook(hooks, "PreToolUse", &format!(
-        "echo '{{\"event\":\"working\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"working\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
 
     inject_hook(hooks, "PermissionRequest", &format!(
-        "echo '{{\"event\":\"waiting\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"waiting\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
 
     // PostToolUse では idle にしない — Stop まで working を維持する
 
     inject_hook(hooks, "Stop", &format!(
-        "echo '{{\"event\":\"idle\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"idle\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
 
     inject_hook(hooks, "SessionEnd", &format!(
-        "echo '{{\"event\":\"dead\",\"session_id\":\"'\"$CLAUDE_SESSION_ID\"'\"}}' | nc -U {sock}"
+        "echo '{{\"event\":\"dead\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
 
     // worktree ルートに .mcp.json を作成して siki MCP サーバーを登録

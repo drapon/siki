@@ -1535,17 +1535,29 @@ fn find_active_sessions(
         .and_then(|conn| db::list_sessions(&conn).ok())
         .unwrap_or_default();
 
+    // ブランチ名を取得
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&wt.path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
     let sessions: Vec<_> = reg
         .by_worktree(project, &wt.name)
         .into_iter()
         .filter(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
         .map(|s| {
-            // DB から summary を探す
+            // DB から summary を探す、なければブランチ名
             let label = db_sessions
                 .iter()
                 .find(|ds| ds.session_id == s.session_id)
                 .and_then(|ds| ds.summary.clone())
-                .unwrap_or_else(|| s.role.clone());
+                .unwrap_or_else(|| {
+                    if branch.is_empty() { s.role.clone() } else { branch.clone() }
+                });
             (s.session_id.clone(), label)
         })
         .collect();
@@ -1560,11 +1572,10 @@ fn build_session_context(
 ) -> Option<String> {
     let reg = session_registry.as_ref()?.lock().ok()?;
     let session = reg.get(session_id)?;
+    let wt = &session.worktree_name;
     Some(format!(
-        "Use get_context to review what session '{}' (role: {}, worktree: {}) was working on, then continue.",
-        &session_id[..8.min(session_id.len())],
-        session.role,
-        session.worktree_name,
+        "Use get_context with target {{type: \"worktree\", id: \"{}\"}} to review previous work, then continue.",
+        wt,
     ))
 }
 
