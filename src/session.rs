@@ -283,7 +283,7 @@ impl SessionRegistry {
 /// cwd パスからプロジェクト名とworktree名を推定する
 ///
 /// 期待パス形式: `~/.siki/workspaces/<project>/<worktree>/...`
-fn guess_names_from_cwd(cwd: &str) -> (String, String) {
+pub fn guess_names_from_cwd(cwd: &str) -> (String, String) {
     let workspaces = crate::config::workspaces_dir();
     let workspaces_str = workspaces.to_string_lossy();
 

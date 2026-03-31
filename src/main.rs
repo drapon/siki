@@ -63,9 +63,11 @@ async fn main() -> Result<()> {
         HashMap::new();
     let mut siki_init_terminal: Option<terminal::TerminalEmulator> = None;
 
-    // セッションレジストリと broker の起動
+    // セッションレジストリ・DB・broker の起動
     let session_registry = Arc::new(Mutex::new(session::SessionRegistry::new()));
     let sock_path = config::sock_path();
+    let db_path = config::db_path();
+    let broker_db = Arc::new(Mutex::new(db::init(&db_path)?));
 
     let mut tui_terminal = tui::init()?;
     let mut events = event::EventHandler::new();
@@ -73,7 +75,7 @@ async fn main() -> Result<()> {
     let mut last_layout: Option<ui::layout::AppLayout> = None;
 
     // broker タスクを起動（hook イベントを受信）
-    match broker::Broker::new(&sock_path, Arc::clone(&session_registry), event_tx.clone()) {
+    match broker::Broker::new(&sock_path, Arc::clone(&session_registry), Arc::clone(&broker_db), event_tx.clone()) {
         Ok(b) => {
             tokio::spawn(b.run());
         }
