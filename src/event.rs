@@ -39,6 +39,11 @@ pub enum AppEvent {
     Tick,
     /// ウィンドウリサイズ
     Resize(u16, u16),
+    /// セッション状態の変化（broker から）
+    SessionUpdate {
+        session_id: String,
+        state: crate::session::SessionState,
+    },
 }
 
 /// Claude Code ストリームイベント型

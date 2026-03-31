@@ -30,7 +30,7 @@ impl TerminalEmulator {
         worktree_id: WorktreeId,
         tab_index: usize,
     ) -> Result<Self> {
-        Self::spawn_internal(shell, &[], working_dir, size, event_tx, worktree_id, tab_index)
+        Self::spawn_internal(shell, &[], working_dir, size, event_tx, worktree_id, tab_index, &[])
     }
 
     /// 引数付きでコマンドを起動するターミナルエミュレータを作成する
@@ -43,7 +43,21 @@ impl TerminalEmulator {
         worktree_id: WorktreeId,
         tab_index: usize,
     ) -> Result<Self> {
-        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index)
+        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index, &[])
+    }
+
+    /// 引数と環境変数付きでコマンドを起動する
+    pub fn with_args_and_envs(
+        program: &str,
+        args: &[&str],
+        working_dir: &Path,
+        size: (u16, u16),
+        event_tx: mpsc::UnboundedSender<AppEvent>,
+        worktree_id: WorktreeId,
+        tab_index: usize,
+        envs: &[(&str, &str)],
+    ) -> Result<Self> {
+        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index, envs)
     }
 
     fn spawn_internal(
@@ -54,6 +68,7 @@ impl TerminalEmulator {
         event_tx: mpsc::UnboundedSender<AppEvent>,
         worktree_id: WorktreeId,
         tab_index: usize,
+        envs: &[(&str, &str)],
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
@@ -72,6 +87,9 @@ impl TerminalEmulator {
             cmd.arg(*arg);
         }
         cmd.cwd(working_dir);
+        for (key, value) in envs {
+            cmd.env(*key, *value);
+        }
 
         pair.slave
             .spawn_command(cmd)

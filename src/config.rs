@@ -414,6 +414,11 @@ pub fn load_siki_json(project_path: &Path) -> Option<SikiJson> {
     serde_json::from_str(&content).ok()
 }
 
+/// Unix ソケットのパスを返す: ~/.siki/sock
+pub fn sock_path() -> std::path::PathBuf {
+    siki_home().join("sock")
+}
+
 /// ユーザーのデフォルトシェルを検出する
 pub fn detect_default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
