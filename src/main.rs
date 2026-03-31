@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
             if let Some(wt) = app.worktree_by_id(wt_id) {
                 let tab = wt.active_tab;
                 if tab < wt.claude_tabs {
-                    let offset = wt.claude_scroll_offset;
+                    let offset = wt.claude_scroll_offsets.get(&tab).copied().unwrap_or(0);
                     if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
                         emu.set_scrollback(offset);
                     }
@@ -524,10 +524,12 @@ async fn handle_event(
                                     .unwrap_or(false);
                                 if on_claude_tab {
                                     if let Some(wt) = app.selected_worktree_mut() {
+                                        let tab = wt.active_tab;
+                                        let offset = wt.claude_scroll_offsets.entry(tab).or_insert(0);
                                         if is_up {
-                                            wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(3);
+                                            *offset = offset.saturating_add(3);
                                         } else {
-                                            wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(3);
+                                            *offset = offset.saturating_sub(3);
                                         }
                                     }
                                 } else if is_up {
@@ -895,7 +897,7 @@ fn finalize_add_worktree(
         right_panel_mode: app::RightPanelMode::Tree,
         active_terminal: 0,
         chat_scroll_offset: 0,
-        claude_scroll_offset: 0,
+        claude_scroll_offsets: HashMap::new(),
         pr_title: None,
     });
 
@@ -1876,35 +1878,34 @@ fn handle_claude_terminal_key(
         match key.code {
             KeyCode::Up => {
                 if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(1);
+                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
+                    *offset = offset.saturating_add(1);
                 }
                 return;
             }
             KeyCode::Down => {
                 if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(1);
+                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
+                    *offset = offset.saturating_sub(1);
                 }
                 return;
             }
             KeyCode::PageUp => {
                 if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_add(10);
+                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
+                    *offset = offset.saturating_add(10);
                 }
                 return;
             }
             KeyCode::PageDown => {
                 if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    wt.claude_scroll_offset = wt.claude_scroll_offset.saturating_sub(10);
+                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
+                    *offset = offset.saturating_sub(10);
                 }
                 return;
             }
             _ => {}
         }
-    }
-
-    // 入力操作時はスクロールを最新に戻す
-    if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-        wt.claude_scroll_offset = 0;
     }
 
     // キー入力を PTY に転送

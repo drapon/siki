@@ -3,6 +3,7 @@ use crate::event::ClaudeStreamEvent;
 use crate::selection::TextSelection;
 use chrono::{DateTime, Utc};
 use ratatui::prelude::Rect;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -202,8 +203,8 @@ pub struct Worktree {
     pub right_panel_mode: RightPanelMode,
     pub active_terminal: usize,
     pub chat_scroll_offset: usize,
-    /// Claude ターミナルのスクロールバックオフセット
-    pub claude_scroll_offset: usize,
+    /// Claude ターミナルのスクロールバックオフセット（タブごと）
+    pub claude_scroll_offsets: HashMap<usize, usize>,
     /// GitHub PR タイトル（ブランチに紐づく PR がある場合）
     pub pr_title: Option<String>,
 }
@@ -540,7 +541,7 @@ impl Project {
                 right_panel_mode: RightPanelMode::Tree,
                 active_terminal: 0,
                 chat_scroll_offset: 0,
-                claude_scroll_offset: 0,
+                claude_scroll_offsets: HashMap::new(),
                 pr_title: None,
             })
             .collect();
