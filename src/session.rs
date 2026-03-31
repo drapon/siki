@@ -63,6 +63,8 @@ pub struct Session {
     pub role: String,
     pub state: SessionState,
     pub last_seen: Instant,
+    /// idle 遷移の遅延（working/waiting を最低限の時間表示するため）
+    pub idle_pending_since: Option<Instant>,
 }
 
 /// Hook から送信されるイベント
@@ -127,15 +129,39 @@ impl SessionRegistry {
                 role,
                 state: SessionState::Idle,
                 last_seen: Instant::now(),
+                idle_pending_since: None,
             },
         );
     }
 
     /// セッション状態を更新する
+    ///
+    /// working/waiting → idle の遷移は即座に行わず、idle_pending_since を記録して
+    /// Tick で一定時間後に遷移させる（バッジが一瞬で消えるのを防ぐ）。
+    /// working/waiting への遷移時は pending をキャンセルする。
     pub fn update_state(&mut self, session_id: &str, state: SessionState) {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.state = state;
             session.last_seen = Instant::now();
+
+            match state {
+                SessionState::Idle => {
+                    // working/waiting 中なら即座に idle にせず遅延
+                    if matches!(session.state, SessionState::Working | SessionState::Waiting) {
+                        session.idle_pending_since = Some(Instant::now());
+                    } else {
+                        session.state = state;
+                    }
+                }
+                SessionState::Working | SessionState::Waiting => {
+                    // アクティブ状態への遷移: pending をキャンセル
+                    session.idle_pending_since = None;
+                    session.state = state;
+                }
+                _ => {
+                    session.idle_pending_since = None;
+                    session.state = state;
+                }
+            }
         }
     }
 
@@ -165,8 +191,12 @@ impl SessionRegistry {
             .max_by_key(|s| s.priority())
     }
 
+    /// idle 遅延の最小表示時間
+    const IDLE_HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
+
     /// タイムアウトしたセッションを段階的に劣化させる
     ///
+    /// - idle_pending_since から 3秒経過 → Idle に遷移
     /// - `stale_timeout`（15秒）を超えたら Stale（◷）
     /// - `dead_timeout`（30秒）を超えたら Dead（✕）
     pub fn expire_stale_sessions(
@@ -176,6 +206,14 @@ impl SessionRegistry {
     ) {
         let now = Instant::now();
         for session in self.sessions.values_mut() {
+            // idle 遅延の解消: 3秒経過したら実際に idle に遷移
+            if let Some(pending_since) = session.idle_pending_since {
+                if now.duration_since(pending_since) >= Self::IDLE_HOLD_DURATION {
+                    session.state = SessionState::Idle;
+                    session.idle_pending_since = None;
+                }
+            }
+
             let elapsed = now.duration_since(session.last_seen);
             match session.state {
                 SessionState::Dead => {}
