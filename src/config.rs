@@ -362,6 +362,32 @@ pub fn discover_projects() -> Vec<ProjectConfig> {
     projects
 }
 
+/// プロジェクト名のプレフィックスでフィルタ（大文字小文字を区別しない starts_with）
+pub fn filter_projects_by_prefix(projects: Vec<ProjectConfig>, prefix: &str) -> Vec<ProjectConfig> {
+    let prefix_lower = prefix.to_lowercase();
+    projects
+        .into_iter()
+        .filter(|p| p.name.to_lowercase().starts_with(&prefix_lower))
+        .collect()
+}
+
+/// cwd がどのプロジェクトに属するか検出する。
+/// ソースリポジトリパスと ~/.siki/workspaces/<project>/ の両方をチェック。
+pub fn detect_project_from_cwd(projects: &[ProjectConfig], cwd: &std::path::Path) -> Option<String> {
+    let ws_dir = workspaces_dir();
+    for project in projects {
+        let source = std::path::Path::new(&project.path);
+        if cwd.starts_with(source) {
+            return Some(project.name.clone());
+        }
+        let workspace = ws_dir.join(&project.name);
+        if cwd.starts_with(&workspace) {
+            return Some(project.name.clone());
+        }
+    }
+    None
+}
+
 /// プロジェクトルートの siki.json を表す構造体
 #[derive(Debug, Deserialize, Default)]
 pub struct SikiJson {

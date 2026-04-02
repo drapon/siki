@@ -41,6 +41,25 @@ async fn main() -> Result<()> {
         return mcp::run_stdio_server(&db_path);
     }
 
+    // -p <prefix> オプションの取得
+    let prefix_filter: Option<String> = {
+        let mut filter = None;
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "-p" {
+                if let Some(val) = args.get(i + 1) {
+                    filter = Some(val.clone());
+                } else {
+                    eprintln!("Error: -p requires a project name prefix");
+                    std::process::exit(1);
+                }
+                break;
+            }
+            i += 1;
+        }
+        filter
+    };
+
     tui::install_panic_hook();
 
     config::ensure_dirs()?;
@@ -51,6 +70,19 @@ async fn main() -> Result<()> {
     let discovered = config::discover_projects();
     if !discovered.is_empty() {
         config.projects = discovered;
+    }
+
+    // プロジェクトフィルタの適用
+    if let Some(ref prefix) = prefix_filter {
+        config.projects = config::filter_projects_by_prefix(config.projects, prefix);
+        if config.projects.is_empty() {
+            eprintln!("No projects matching prefix: {}", prefix);
+            std::process::exit(1);
+        }
+    } else if let Ok(cwd) = std::env::current_dir() {
+        if let Some(project_name) = config::detect_project_from_cwd(&config.projects, &cwd) {
+            config.projects.retain(|p| p.name == project_name);
+        }
     }
 
     let shell = config::resolve_shell(&config);
