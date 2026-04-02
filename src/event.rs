@@ -54,6 +54,8 @@ pub enum AppEvent {
         project_index: usize,
         branches: Vec<String>,
     },
+    /// ペースト入力（ブラケットペーストモード）
+    Paste(String),
 }
 
 /// Claude Code ストリームイベント型
@@ -108,6 +110,11 @@ impl EventHandler {
                         }
                         Ok(Event::Resize(w, h)) => {
                             if key_tx.send(AppEvent::Resize(w, h)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Event::Paste(text)) => {
+                            if key_tx.send(AppEvent::Paste(text)).is_err() {
                                 break;
                             }
                         }

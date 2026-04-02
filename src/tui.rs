@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -12,7 +12,7 @@ pub type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 /// ターミナルを初期化し、raw mode + alternate screen + mouse capture に切り替える
 pub fn init() -> Result<Tui> {
     terminal::enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout());
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -21,7 +21,7 @@ pub fn init() -> Result<Tui> {
 /// ターミナルを元の状態に復元する
 pub fn restore() -> Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     Ok(())
 }
 

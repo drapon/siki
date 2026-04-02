@@ -440,6 +440,14 @@ async fn handle_event(
                 let claude_idx = tab_index - CLAUDE_TAB_BASE;
                 if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
                     emu.process(&data);
+                    // vt100 はスクロールバック中に新行が来ると内部で offset を
+                    // 調整するため、外部保持のオフセットを同期する
+                    let current = emu.scrollback();
+                    if current > 0 {
+                        if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
+                            wt.claude_scroll_offsets.insert(claude_idx, current);
+                        }
+                    }
                 }
             } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
                 emu.process(&data);
@@ -628,6 +636,48 @@ async fn handle_event(
                 )
             };
             launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &[&prompt]);
+        }
+        AppEvent::Paste(text) => {
+            // siki.json 作成オーバーレイ表示中
+            if app.show_siki_json_init_terminal {
+                if let Some(emu) = siki_init_terminal.as_mut() {
+                    let _ = emu.write(text.as_bytes());
+                }
+                return;
+            }
+            // メッセージポップアップ: 入力欄に追加
+            if app.show_message_popup {
+                app.popup_input.push_str(&text);
+                return;
+            }
+            // ワークツリー追加ポップアップ
+            if app.show_add_worktree_popup {
+                app.add_worktree_name.push_str(&text);
+                return;
+            }
+            // grep ポップアップ
+            if app.show_grep_popup {
+                app.grep_input.push_str(&text);
+                return;
+            }
+            // Claude / 通常ターミナルへ転送
+            if let Some(wt_id) = app.selected_worktree {
+                if let Some(wt) = app.worktree_by_id(wt_id) {
+                    let tab = wt.active_tab;
+                    if tab < wt.claude_tabs {
+                        if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
+                            let _ = emu.write(text.as_bytes());
+                        }
+                        return;
+                    }
+                    let active_terminal = wt.active_terminal;
+                    if app.focused_panel == app::Panel::Terminal {
+                        if let Some(emu) = terminals.get_mut(&(wt_id, active_terminal)) {
+                            let _ = emu.write(text.as_bytes());
+                        }
+                    }
+                }
+            }
         }
         AppEvent::Tick => {
             app.clear_expired_status();
