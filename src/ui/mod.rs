@@ -7,6 +7,7 @@ pub mod source_tree;
 pub mod syntax;
 
 use crate::app::{App, Panel};
+use crate::selection::SelectionPanel;
 use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -62,7 +63,7 @@ pub fn render(
     render_terminal(
         frame,
         areas.right_bottom,
-        app,
+        &mut *app,
         terminal_screen,
         terminal_tab_info,
     );
@@ -594,7 +595,7 @@ fn render_siki_json_init_terminal(
 fn render_terminal(
     frame: &mut Frame,
     area: Rect,
-    app: &App,
+    app: &mut App,
     terminal_screen: Option<&vt100::Screen>,
     tab_info: Option<&TerminalTabInfo>,
 ) {
@@ -632,10 +633,45 @@ fn render_terminal(
 
     let block = panel_block(&title, focused);
 
+    // コンテンツ領域を計算して保存（選択座標変換に使用）
+    let content_area = block.inner(area);
+    app.terminal_content_area = Some(content_area);
+
     match terminal_screen {
         Some(screen) => {
             let pseudo_term = tui_term::widget::PseudoTerminal::new(screen).block(block);
             frame.render_widget(pseudo_term, area);
+
+            // 選択範囲のハイライト描画
+            if let Some(ref sel) = app.text_selection {
+                if sel.panel == SelectionPanel::Terminal {
+                    let (start, end) = sel.normalize();
+                    let buf = frame.buffer_mut();
+                    for row in start.row..=end.row {
+                        let screen_y = content_area.y + row;
+                        if screen_y >= content_area.y + content_area.height {
+                            break;
+                        }
+                        let col_start = if row == start.row { start.col } else { 0 };
+                        let col_end = if row == end.row {
+                            end.col
+                        } else {
+                            content_area.width.saturating_sub(1)
+                        };
+                        for col in col_start..=col_end {
+                            let screen_x = content_area.x + col;
+                            if screen_x >= content_area.x + content_area.width {
+                                break;
+                            }
+                            let cell = &mut buf[(screen_x, screen_y)];
+                            let fg = cell.fg;
+                            let bg = cell.bg;
+                            cell.set_fg(if bg == Color::Reset { Color::Black } else { bg });
+                            cell.set_bg(if fg == Color::Reset { Color::White } else { fg });
+                        }
+                    }
+                }
+            }
         }
         None => {
             let hint = if focused {

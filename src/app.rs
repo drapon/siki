@@ -262,10 +262,12 @@ pub struct App {
     pub show_session_choice: bool,
     /// セッション選択対象の worktree ID
     pub session_choice_wt_id: Option<WorktreeId>,
-    /// テキスト選択状態（Claude ペインのマウスドラッグ選択）
+    /// テキスト選択状態（Claude / ターミナルペインのマウスドラッグ選択）
     pub text_selection: Option<TextSelection>,
     /// Claude ペインのコンテンツ領域（レンダリング時に計算）
     pub claude_content_area: Option<Rect>,
+    /// ターミナルペインのコンテンツ領域（レンダリング時に計算）
+    pub terminal_content_area: Option<Rect>,
     pub running: bool,
 }
 
@@ -317,6 +319,7 @@ impl App {
             session_choice_wt_id: None,
             text_selection: None,
             claude_content_area: None,
+            terminal_content_area: None,
             running: true,
         }
     }

@@ -7,6 +7,13 @@ pub struct TermPos {
     pub col: u16,
 }
 
+/// 選択が開始されたパネル
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionPanel {
+    Claude,
+    Terminal,
+}
+
 /// テキスト選択状態
 #[derive(Debug, Clone)]
 pub struct TextSelection {
@@ -16,6 +23,8 @@ pub struct TextSelection {
     pub current: TermPos,
     /// ドラッグ中かどうか
     pub active: bool,
+    /// 選択が開始されたパネル
+    pub panel: SelectionPanel,
 }
 
 impl TextSelection {
@@ -74,6 +83,7 @@ mod tests {
             anchor: TermPos { row: 0, col: 5 },
             current: TermPos { row: 2, col: 3 },
             active: false,
+            panel: SelectionPanel::Claude,
         };
         let (start, end) = sel.normalize();
         assert_eq!(start, TermPos { row: 0, col: 5 });
@@ -86,6 +96,7 @@ mod tests {
             anchor: TermPos { row: 2, col: 3 },
             current: TermPos { row: 0, col: 5 },
             active: false,
+            panel: SelectionPanel::Claude,
         };
         let (start, end) = sel.normalize();
         assert_eq!(start, TermPos { row: 0, col: 5 });
@@ -109,6 +120,7 @@ mod tests {
             anchor: TermPos { row: 1, col: 5 },
             current: TermPos { row: 1, col: 5 },
             active: false,
+            panel: SelectionPanel::Claude,
         };
         assert!(sel.is_empty());
     }

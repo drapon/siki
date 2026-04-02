@@ -139,8 +139,11 @@ fn render_claude_terminal(
     let pseudo_term = tui_term::widget::PseudoTerminal::new(screen).block(block);
     frame.render_widget(pseudo_term, area);
 
-    // 選択範囲のハイライト描画
+    // 選択範囲のハイライト描画（Claude パネルの選択のみ）
     if let Some(ref sel) = app.text_selection {
+        if sel.panel != crate::selection::SelectionPanel::Claude {
+            return;
+        }
         let (start, end) = sel.normalize();
         let buf = frame.buffer_mut();
         for row in start.row..=end.row {

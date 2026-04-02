@@ -489,24 +489,35 @@ async fn handle_event(
                         if let Some(panel) = layout.hit_test(mouse.column, mouse.row) {
                             app.focused_panel = panel;
                         }
+                        let hit_panel = layout.hit_test(mouse.column, mouse.row);
                         // Claude ペインのコンテンツ領域でクリック → 選択開始
-                        if let Some(ref content_area) = app.claude_content_area {
-                            let on_claude_tab = app
-                                .selected_worktree()
-                                .map(|wt| wt.active_tab < wt.claude_tabs)
-                                .unwrap_or(false);
-                            if on_claude_tab
-                                && layout.hit_test(mouse.column, mouse.row) == Some(app::Panel::Main)
-                            {
-                                let pos = selection::screen_to_term(mouse.column, mouse.row, content_area);
-                                app.text_selection = Some(selection::TextSelection {
-                                    anchor: pos,
-                                    current: pos,
-                                    active: true,
-                                });
-                            } else {
-                                app.text_selection = None;
-                            }
+                        let on_claude_tab = app
+                            .selected_worktree()
+                            .map(|wt| wt.active_tab < wt.claude_tabs)
+                            .unwrap_or(false);
+                        if on_claude_tab
+                            && hit_panel == Some(app::Panel::Main)
+                            && app.claude_content_area.is_some()
+                        {
+                            let content_area = app.claude_content_area.unwrap();
+                            let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
+                            app.text_selection = Some(selection::TextSelection {
+                                anchor: pos,
+                                current: pos,
+                                active: true,
+                                panel: selection::SelectionPanel::Claude,
+                            });
+                        } else if hit_panel == Some(app::Panel::Terminal)
+                            && app.terminal_content_area.is_some()
+                        {
+                            let content_area = app.terminal_content_area.unwrap();
+                            let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
+                            app.text_selection = Some(selection::TextSelection {
+                                anchor: pos,
+                                current: pos,
+                                active: true,
+                                panel: selection::SelectionPanel::Terminal,
+                            });
                         } else {
                             app.text_selection = None;
                         }
@@ -515,15 +526,18 @@ async fn handle_event(
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                     if let Some(ref mut sel) = app.text_selection {
                         if sel.active {
-                            if let Some(ref content_area) = app.claude_content_area {
-                                sel.current = selection::screen_to_term(mouse.column, mouse.row, content_area);
+                            let content_area = match sel.panel {
+                                selection::SelectionPanel::Claude => app.claude_content_area,
+                                selection::SelectionPanel::Terminal => app.terminal_content_area,
+                            };
+                            if let Some(ref area) = content_area {
+                                sel.current = selection::screen_to_term(mouse.column, mouse.row, area);
                             }
                         }
                     }
                 }
                 MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                    let should_copy = app.text_selection.as_ref().map_or(false, |s| s.active && !s.is_empty());
-                    let sel_range = app.text_selection.as_ref().map(|s| s.normalize());
+                    let sel_info = app.text_selection.as_ref().map(|s| (s.active && !s.is_empty(), s.normalize(), s.panel));
                     if let Some(ref mut sel) = app.text_selection {
                         if sel.active {
                             sel.active = false;
@@ -532,18 +546,23 @@ async fn handle_event(
                             }
                         }
                     }
-                    if should_copy {
-                        if let (Some((start, end)), Some(wt_id)) = (sel_range, app.selected_worktree) {
-                            if let Some(wt) = app.worktree_by_id(wt_id) {
-                                let tab = wt.active_tab;
-                                if tab < wt.claude_tabs {
-                                    if let Some(emu) = claude_terms.get(&(wt_id, tab)) {
-                                        let text = selection::extract_text(emu.screen(), &start, &end);
-                                        if !text.is_empty() {
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                let _ = clipboard.set_text(text);
-                                            }
-                                        }
+                    if let Some((true, (start, end), panel)) = sel_info {
+                        if let Some(wt_id) = app.selected_worktree {
+                            let screen = match panel {
+                                selection::SelectionPanel::Claude => {
+                                    let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_tab).unwrap_or(0);
+                                    claude_terms.get(&(wt_id, tab)).map(|emu| emu.screen())
+                                }
+                                selection::SelectionPanel::Terminal => {
+                                    let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_terminal).unwrap_or(0);
+                                    terminals.get(&(wt_id, tab)).map(|emu| emu.screen())
+                                }
+                            };
+                            if let Some(screen) = screen {
+                                let text = selection::extract_text(screen, &start, &end);
+                                if !text.is_empty() {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(text);
                                     }
                                 }
                             }
@@ -1069,6 +1088,16 @@ fn handle_terminal_key(
         app.focused_panel = app::Panel::Right;
         return;
     };
+
+    // Escape で選択クリア（選択中なら PTY には送らない）
+    if key.code == KeyCode::Esc && app.text_selection.is_some() {
+        app.text_selection = None;
+        return;
+    }
+    // キー入力時は選択をクリア（表示だけ消す）
+    if app.text_selection.is_some() && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        app.text_selection = None;
+    }
 
     let active_tab = app
         .worktree_by_id(wt_id)
