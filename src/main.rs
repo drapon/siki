@@ -34,8 +34,48 @@ const SIKI_INIT_TAB_INDEX: usize = usize::MAX;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // サブコマンド: siki mcp → MCP stdio サーバーを起動
     let args: Vec<String> = std::env::args().collect();
+
+    // --version / -V
+    if args.len() > 1 && (args[1] == "--version" || args[1] == "-V") {
+        println!("siki {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // --help / -h
+    if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
+        println!("siki {} - TUI orchestrator for multiple Claude Code sessions", env!("CARGO_PKG_VERSION"));
+        println!();
+        println!("Usage: siki [OPTIONS] [COMMAND]");
+        println!();
+        println!("Commands:");
+        println!("  list       List projects and worktrees");
+        println!("  mcp        Start MCP stdio server");
+        println!();
+        println!("Options:");
+        println!("  -p <name>  Filter projects by name prefix");
+        println!("  -h, --help     Print help");
+        println!("  -V, --version  Print version");
+        return Ok(());
+    }
+
+    // サブコマンド: siki list → プロジェクト一覧を表示
+    if args.len() > 1 && args[1] == "list" {
+        let projects = config::discover_projects();
+        if projects.is_empty() {
+            println!("No projects found.");
+        } else {
+            for p in &projects {
+                println!("{} ({})", p.name, p.path);
+                for w in &p.worktrees {
+                    println!("  └ {} [{}]", w.name, w.branch);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // サブコマンド: siki mcp → MCP stdio サーバーを起動
     if args.len() > 1 && args[1] == "mcp" {
         let db_path = config::db_path();
         return mcp::run_stdio_server(&db_path);
