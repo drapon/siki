@@ -1,3 +1,4 @@
+pub mod diff_file_list;
 pub mod diff_view;
 pub mod layout;
 pub mod left_panel;
@@ -12,7 +13,7 @@ use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use diff_view::DiffView;
+use diff_file_list::DiffFileList;
 use source_tree::SourceTree;
 
 /// ターミナルタブ情報（描画用）
@@ -28,7 +29,7 @@ pub fn render(
     app: &mut App,
     left_panel: &left_panel::LeftPanel,
     source_tree: &SourceTree,
-    diff_view: &DiffView,
+    diff_file_list: &DiffFileList,
     terminal_screen: Option<&vt100::Screen>,
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
@@ -49,13 +50,13 @@ pub fn render(
         claude_screen,
     );
 
-    // 右パネル上部（SourceTree / DiffView）
+    // 右パネル上部（SourceTree / DiffFileList）
     right_panel::render_top(
         frame,
         areas.right_top,
         app,
         source_tree,
-        diff_view,
+        diff_file_list,
         app.focused_panel == Panel::Right,
     );
 

@@ -1,8 +1,8 @@
 use crate::app::{App, RightPanelMode};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
-use super::diff_view::DiffView;
+use super::diff_file_list::DiffFileList;
 use super::source_tree::SourceTree;
 
 /// 右パネル上部を描画する
@@ -11,18 +11,62 @@ pub fn render_top(
     area: Rect,
     app: &App,
     source_tree: &SourceTree,
-    diff_view: &DiffView,
+    diff_file_list: &DiffFileList,
     focused: bool,
 ) {
     match app.selected_worktree() {
-        Some(wt) => match wt.right_panel_mode {
-            RightPanelMode::Tree => {
-                source_tree.render(frame, area, focused);
+        Some(wt) => {
+            let border_style = if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            // 外枠ブロック
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+
+            // タブバー + コンテンツの分割
+            let chunks = Layout::vertical([
+                Constraint::Length(1), // タブバー
+                Constraint::Min(0),    // コンテンツ
+            ])
+            .split(inner);
+
+            // タブバー描画
+            let titles = vec!["一覧", "差分"];
+            let active = match wt.right_panel_mode {
+                RightPanelMode::Tree => 0,
+                RightPanelMode::Diff => 1,
+            };
+            let tabs = Tabs::new(titles)
+                .select(active)
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .style(if focused {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                })
+                .divider("|");
+            frame.render_widget(tabs, chunks[0]);
+
+            // コンテンツ描画
+            match wt.right_panel_mode {
+                RightPanelMode::Tree => {
+                    source_tree.render_content(frame, chunks[1], focused);
+                }
+                RightPanelMode::Diff => {
+                    diff_file_list.render(frame, chunks[1], focused);
+                }
             }
-            RightPanelMode::Diff => {
-                diff_view.render(frame, area, focused);
-            }
-        },
+        }
         None => {
             let block = Block::default()
                 .borders(Borders::ALL)

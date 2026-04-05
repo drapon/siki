@@ -424,6 +424,96 @@ impl SourceTree {
             frame.render_stateful_widget(list, area, &mut list_state);
         }
     }
+
+    /// ボーダーなしで描画（right_panel が外枠を管理）
+    pub fn render_content(&self, frame: &mut Frame, area: Rect, _focused: bool) {
+        if self.search_active {
+            let chunks = Layout::vertical([
+                Constraint::Length(1), // 検索入力行
+                Constraint::Min(0),    // リスト
+            ])
+            .split(area);
+
+            // 検索入力行
+            let search_text = format!("/{}_", self.search_query);
+            let match_info = if self.search_query.is_empty() {
+                String::new()
+            } else {
+                format!(" [{} found]", self.search_matches.len())
+            };
+            let search_line = Line::from(vec![
+                Span::styled(search_text, Style::default().fg(Color::Cyan)),
+                Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+            ]);
+            frame.render_widget(Paragraph::new(search_line), chunks[0]);
+
+            // フィルタ済みリスト
+            let filtered = self.filtered_entries();
+            let items: Vec<ListItem> = filtered
+                .iter()
+                .map(|&i| {
+                    let entry = &self.entries[i];
+                    let indent = "  ".repeat(entry.depth);
+                    let icon = if entry.is_dir {
+                        if entry.expanded { "▾ " } else { "▸ " }
+                    } else {
+                        "  "
+                    };
+                    let style = if i == self.cursor_index {
+                        Style::default().fg(Color::White).bg(Color::DarkGray)
+                    } else if entry.is_dir {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(format!("{}{}{}", indent, icon, entry.name)).style(style)
+                })
+                .collect();
+
+            let selected_pos = filtered.iter().position(|&i| i == self.cursor_index);
+            let list = List::new(items);
+            let mut list_state = ListState::default();
+            list_state.select(selected_pos);
+            frame.render_stateful_widget(list, chunks[1], &mut list_state);
+        } else {
+            let items: Vec<ListItem> = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let indent = "  ".repeat(entry.depth);
+                    let icon = if entry.is_dir {
+                        if entry.expanded { "▾ " } else { "▸ " }
+                    } else {
+                        "  "
+                    };
+
+                    let is_match = !self.search_matches.is_empty()
+                        && self.search_matches.contains(&i);
+                    let style = if i == self.cursor_index {
+                        if entry.is_dir {
+                            Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::White).bg(Color::DarkGray)
+                        }
+                    } else if is_match {
+                        Style::default().bg(Color::Yellow).fg(Color::Black)
+                    } else if entry.is_dir {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+
+                    ListItem::new(format!("{}{}{}", indent, icon, entry.name)).style(style)
+                })
+                .collect();
+
+            let list = List::new(items);
+            let mut list_state = ListState::default();
+            list_state.select(Some(self.cursor_index));
+            frame.render_stateful_widget(list, area, &mut list_state);
+        }
+    }
 }
 
 #[cfg(test)]

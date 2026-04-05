@@ -17,7 +17,7 @@ use anyhow::Result;
 use config::load_config;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use ui::diff_view::DiffView;
+use ui::diff_file_list::DiffFileList;
 use ui::left_panel::LeftPanel;
 use ui::source_tree::SourceTree;
 
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     let mut app = app::App::new(&config);
     let mut left_panel = LeftPanel::new();
     let mut source_tree = SourceTree::new();
-    let mut diff_view = DiffView::new();
+    let mut diff_file_list = DiffFileList::new();
     let mut sessions: HashMap<app::WorktreeId, claude::ClaudeSession> = HashMap::new();
     let mut terminals: HashMap<TerminalKey, terminal::TerminalEmulator> = HashMap::new();
     let mut claude_terms: HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator> =
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
                 &mut app,
                 &left_panel,
                 &source_tree,
-                &diff_view,
+                &diff_file_list,
                 terminal_screen,
                 terminal_tab_info.as_ref(),
                 claude_screen,
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -295,7 +295,7 @@ async fn handle_event(
     app: &mut app::App,
     left_panel: &mut LeftPanel,
     source_tree: &mut SourceTree,
-    diff_view: &mut DiffView,
+    diff_file_list: &mut DiffFileList,
     sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
@@ -438,14 +438,14 @@ async fn handle_event(
                     // パネル固有のキー処理
                     match app.focused_panel {
                         app::Panel::Left => {
-                            handle_left_panel_key(app, left_panel, source_tree, diff_view, terminals, claude_terms, event_tx, shell, key);
+                            handle_left_panel_key(app, left_panel, source_tree, diff_file_list, terminals, claude_terms, event_tx, shell, key);
                         }
                         app::Panel::Main => {
                             // Claude タブは上で早期 return 済みなのでここは非 Claude タブのみ
                             handle_main_panel_key(app, claude_terms, event_tx, key, session_registry);
                         }
                         app::Panel::Right => {
-                            handle_right_panel_key(app, source_tree, diff_view, key);
+                            handle_right_panel_key(app, source_tree, diff_file_list, key);
                         }
                         app::Panel::Terminal => unreachable!(),
                     }
@@ -652,9 +652,9 @@ async fn handle_event(
                                     }
                                     app::RightPanelMode::Diff => {
                                         if is_up {
-                                            diff_view.scroll_up();
+                                            diff_file_list.move_up();
                                         } else {
-                                            diff_view.scroll_down();
+                                            diff_file_list.move_down();
                                         }
                                     }
                                 }
@@ -1261,7 +1261,7 @@ fn handle_left_panel_key(
     app: &mut app::App,
     left_panel: &mut LeftPanel,
     source_tree: &mut SourceTree,
-    diff_view: &mut DiffView,
+    diff_file_list: &mut DiffFileList,
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
@@ -1399,7 +1399,7 @@ fn handle_left_panel_key(
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                 source_tree.load(&wt_path);
-                diff_view.load(&wt_path);
+                diff_file_list.load(&wt_path);
                 // Claude Code とターミナルを自動起動
                 let has_claude = app
                     .worktree_by_id(wt_id)
@@ -2071,7 +2071,7 @@ fn handle_claude_terminal_key(
 fn handle_right_panel_key(
     app: &mut app::App,
     source_tree: &mut SourceTree,
-    diff_view: &mut DiffView,
+    diff_file_list: &mut DiffFileList,
     key: crossterm::event::KeyEvent,
 ) {
     use crossterm::event::KeyCode;
@@ -2132,13 +2132,19 @@ fn handle_right_panel_key(
         }
         app::RightPanelMode::Diff => match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                diff_view.scroll_down();
+                diff_file_list.move_down();
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                diff_view.scroll_up();
+                diff_file_list.move_up();
             }
             KeyCode::Char('t') => {
                 ui::right_panel::toggle_mode(app);
+            }
+            KeyCode::Enter => {
+                if let Some(path) = diff_file_list.current_file_path() {
+                    ui::main_panel::open_file_tab(app, path);
+                    app.focused_panel = app::Panel::Main;
+                }
             }
             _ => {}
         },
@@ -2226,7 +2232,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2238,7 +2244,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2259,7 +2265,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2271,7 +2277,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2292,7 +2298,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2304,7 +2310,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2325,7 +2331,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2338,7 +2344,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2360,7 +2366,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2372,7 +2378,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2393,7 +2399,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2405,7 +2411,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2427,7 +2433,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2439,7 +2445,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2460,7 +2466,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2472,7 +2478,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2495,7 +2501,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2508,7 +2514,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2530,7 +2536,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2543,7 +2549,7 @@ mod tests {
                 &mut app,
                 &mut left_panel,
                 &mut source_tree,
-                &mut diff_view,
+                &mut diff_file_list,
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
@@ -2565,7 +2571,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2578,7 +2584,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2599,7 +2605,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2612,7 +2618,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2636,7 +2642,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2649,7 +2655,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2670,7 +2676,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2683,7 +2689,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2706,7 +2712,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2722,7 +2728,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2743,7 +2749,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2756,7 +2762,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2779,7 +2785,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2790,7 +2796,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2819,7 +2825,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2832,7 +2838,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2859,7 +2865,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2872,7 +2878,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2905,7 +2911,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2917,7 +2923,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2938,7 +2944,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2952,7 +2958,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -2981,7 +2987,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -2999,7 +3005,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3025,7 +3031,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3048,7 +3054,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3069,7 +3075,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3091,7 +3097,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3117,7 +3123,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3130,7 +3136,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3155,7 +3161,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3168,7 +3174,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3192,7 +3198,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3203,7 +3209,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3227,7 +3233,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3238,7 +3244,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3259,7 +3265,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3272,7 +3278,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3294,7 +3300,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3307,7 +3313,7 @@ mod tests {
                 &mut app,
                 &mut left_panel,
                 &mut source_tree,
-                &mut diff_view,
+                &mut diff_file_list,
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
@@ -3329,7 +3335,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3342,7 +3348,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3363,7 +3369,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3377,7 +3383,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3400,7 +3406,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3413,7 +3419,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3460,7 +3466,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3477,7 +3483,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3510,7 +3516,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3522,7 +3528,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3545,7 +3551,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3558,7 +3564,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3580,7 +3586,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3593,7 +3599,7 @@ mod tests {
                 &mut app,
                 &mut left_panel,
                 &mut source_tree,
-                &mut diff_view,
+                &mut diff_file_list,
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
@@ -3615,7 +3621,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3629,7 +3635,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3651,7 +3657,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3665,7 +3671,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3692,7 +3698,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3707,7 +3713,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3732,7 +3738,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3744,7 +3750,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -3766,7 +3772,7 @@ mod tests {
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
         let mut source_tree = SourceTree::new();
-        let mut diff_view = DiffView::new();
+        let mut diff_file_list = DiffFileList::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -3786,7 +3792,7 @@ mod tests {
             &mut app,
             &mut left_panel,
             &mut source_tree,
-            &mut diff_view,
+            &mut diff_file_list,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
