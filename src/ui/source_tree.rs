@@ -330,7 +330,6 @@ impl SourceTree {
             // 外枠ブロック
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title("Tree")
                 .border_style(border_style);
             frame.render_widget(block, area);
 
@@ -414,7 +413,6 @@ impl SourceTree {
 
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title("Tree")
                 .border_style(border_style);
 
             let list = List::new(items).block(block);

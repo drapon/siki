@@ -38,7 +38,6 @@ impl DiffView {
     pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Diff")
             .border_style(if focused {
                 Style::default().fg(Color::Cyan)
             } else {

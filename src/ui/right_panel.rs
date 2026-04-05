@@ -1,6 +1,6 @@
 use crate::app::{App, RightPanelMode};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
 use super::diff_view::DiffView;
 use super::source_tree::SourceTree;
@@ -15,14 +15,43 @@ pub fn render_top(
     focused: bool,
 ) {
     match app.selected_worktree() {
-        Some(wt) => match wt.right_panel_mode {
-            RightPanelMode::Tree => {
-                source_tree.render(frame, area, focused);
+        Some(wt) => {
+            let chunks = Layout::vertical([
+                Constraint::Length(1), // タブバー
+                Constraint::Min(0),   // コンテンツ
+            ])
+            .split(area);
+
+            // タブバー描画
+            let active = match wt.right_panel_mode {
+                RightPanelMode::Tree => 0,
+                RightPanelMode::Diff => 1,
+            };
+            let tabs = Tabs::new(vec!["Tree", "Diff"])
+                .select(active)
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .style(if focused {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                })
+                .divider("|");
+            frame.render_widget(tabs, chunks[0]);
+
+            // コンテンツ描画
+            match wt.right_panel_mode {
+                RightPanelMode::Tree => {
+                    source_tree.render(frame, chunks[1], focused);
+                }
+                RightPanelMode::Diff => {
+                    diff_view.render(frame, chunks[1], focused);
+                }
             }
-            RightPanelMode::Diff => {
-                diff_view.render(frame, area, focused);
-            }
-        },
+        }
         None => {
             let block = Block::default()
                 .borders(Borders::ALL)
