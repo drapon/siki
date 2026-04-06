@@ -30,6 +30,11 @@ pub enum AppEvent {
         tab_index: usize,
         data: Vec<u8>,
     },
+    /// ターミナル（PTY）プロセスが終了した
+    TerminalExited {
+        worktree_id: WorktreeId,
+        tab_index: usize,
+    },
     /// GitHub PR 情報取得完了
     PrInfo {
         worktree_id: WorktreeId,
