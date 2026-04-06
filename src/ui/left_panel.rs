@@ -224,6 +224,7 @@ mod tests {
                         chat_scroll_offset: 0,
                         claude_scroll_offsets: std::collections::HashMap::new(),
                         pr_title: None,
+                        claude_session_id: None,
                     },
                     Worktree {
                         name: "fix-bug".to_string(),
@@ -239,6 +240,7 @@ mod tests {
                         chat_scroll_offset: 0,
                         claude_scroll_offsets: std::collections::HashMap::new(),
                         pr_title: None,
+                        claude_session_id: None,
                     },
                 ],
             },
@@ -260,6 +262,7 @@ mod tests {
                     chat_scroll_offset: 0,
                     claude_scroll_offsets: std::collections::HashMap::new(),
                     pr_title: None,
+                    claude_session_id: None,
                 }],
             },
         ]

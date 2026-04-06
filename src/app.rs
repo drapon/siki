@@ -207,6 +207,8 @@ pub struct Worktree {
     pub claude_scroll_offsets: HashMap<usize, usize>,
     /// GitHub PR タイトル（ブランチに紐づく PR がある場合）
     pub pr_title: Option<String>,
+    /// Claude Code のセッション ID（`-r` による再開用）
+    pub claude_session_id: Option<String>,
 }
 
 /// プロジェクトの状態
@@ -458,8 +460,11 @@ impl App {
         };
 
         match event {
-            ClaudeStreamEvent::Init { .. } => {
-                // セッション初期化完了。特に表示しない
+            ClaudeStreamEvent::Init { session_id } => {
+                // セッション初期化完了。session_id を保存（-r による再開用）
+                if !session_id.is_empty() {
+                    wt.claude_session_id = Some(session_id);
+                }
             }
             ClaudeStreamEvent::ContentDelta { text } => {
                 // 最後のメッセージが Assistant なら追記、なければ新規作成
@@ -546,6 +551,7 @@ impl Project {
                 chat_scroll_offset: 0,
                 claude_scroll_offsets: HashMap::new(),
                 pr_title: None,
+                claude_session_id: None,
             })
             .collect();
 

@@ -18,19 +18,26 @@ impl ClaudeSession {
     ///
     /// worktree ディレクトリで `claude -p --output-format stream-json --input-format stream-json`
     /// を起動し、stdout を非同期で読み取る背景タスクをスポーンする。
+    /// `resume_session_id` が指定された場合は `-r <session_id>` で前回のセッションを再開する。
     pub async fn spawn(
         worktree_path: &Path,
         event_tx: mpsc::UnboundedSender<AppEvent>,
         worktree_id: WorktreeId,
+        resume_session_id: Option<&str>,
     ) -> Result<Self> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+        ];
+        if let Some(session_id) = resume_session_id {
+            args.push("-r".to_string());
+            args.push(session_id.to_string());
+        }
         let mut process = Command::new("claude")
-            .args([
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--input-format",
-                "stream-json",
-            ])
+            .args(&args)
             .current_dir(worktree_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
