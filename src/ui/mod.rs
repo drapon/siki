@@ -141,8 +141,8 @@ fn render_session_choice_popup(frame: &mut Frame) {
     use ratatui::widgets::{Clear, Paragraph};
 
     let area = frame.area();
-    let w = 42.min(area.width);
-    let h = 5.min(area.height);
+    let w = 44.min(area.width);
+    let h = 6.min(area.height);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup_area = Rect::new(x, y, w, h);
@@ -152,7 +152,7 @@ fn render_session_choice_popup(frame: &mut Frame) {
         .borders(Borders::ALL)
         .title("Active Session Found")
         .border_style(Style::default().fg(Color::Yellow));
-    let text = " [1] Start new (default)\n [2] Continue with context";
+    let text = " [1] Start new (default)\n [2] Resume session\n [3] Continue with context";
     frame.render_widget(
         Paragraph::new(text).block(block).style(Style::default().fg(Color::White)),
         popup_area,

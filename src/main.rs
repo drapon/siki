@@ -345,8 +345,14 @@ async fn handle_event(
                         }
                     }
                     KeyCode::Char('2') => {
-                        // 1. claude -c -p でサマリー生成
-                        // 2. サマリー + 待機指示を新規セッションのプロンプトとして渡す
+                        // Resume session - インタラクティブ選択で過去セッションから選ぶ
+                        app.show_session_choice = false;
+                        if let Some(wt_id) = app.session_choice_wt_id.take() {
+                            launch_claude_with_args(app, claude_terms, event_tx, wt_id, &["-r"]);
+                        }
+                    }
+                    KeyCode::Char('3') => {
+                        // Continue with context - 現セッションのサマリーを生成して新セッションに引き継ぐ
                         app.show_session_choice = false;
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
