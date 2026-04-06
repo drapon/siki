@@ -492,6 +492,23 @@ async fn handle_event(
                 emu.process(&data);
             }
         }
+        AppEvent::TerminalExited {
+            worktree_id,
+            tab_index,
+        } => {
+            if worktree_id == SIKI_INIT_WORKTREE_ID && tab_index == SIKI_INIT_TAB_INDEX {
+                if let Some(emu) = siki_init_terminal.as_mut() {
+                    emu.mark_exited();
+                }
+            } else if tab_index >= CLAUDE_TAB_BASE {
+                let claude_idx = tab_index - CLAUDE_TAB_BASE;
+                if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
+                    emu.mark_exited();
+                }
+            } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
+                emu.mark_exited();
+            }
+        }
         AppEvent::Mouse(mouse) => {
             use crossterm::event::MouseEventKind;
             // ヘルプポップアップ表示中はスクロールのみ処理
@@ -1957,26 +1974,15 @@ fn launch_claude_with_args(
         .unwrap_or(0);
     let size = (80, 24);
 
-    let result = if args.is_empty() {
-        terminal::TerminalEmulator::new(
-            "claude",
-            &project_path,
-            size,
-            event_tx.clone(),
-            wt_id,
-            CLAUDE_TAB_BASE + claude_idx,
-        )
-    } else {
-        terminal::TerminalEmulator::with_args(
-            "claude",
-            args,
-            &project_path,
-            size,
-            event_tx.clone(),
-            wt_id,
-            CLAUDE_TAB_BASE + claude_idx,
-        )
-    };
+    let result = terminal::TerminalEmulator::with_args(
+        "claude",
+        args,
+        &project_path,
+        size,
+        event_tx.clone(),
+        wt_id,
+        CLAUDE_TAB_BASE + claude_idx,
+    );
 
     match result {
         Ok(emu) => {

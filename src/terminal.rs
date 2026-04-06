@@ -15,6 +15,7 @@ pub struct TerminalEmulator {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: vt100::Parser,
+    alive: bool,
 }
 
 impl TerminalEmulator {
@@ -30,7 +31,7 @@ impl TerminalEmulator {
         worktree_id: WorktreeId,
         tab_index: usize,
     ) -> Result<Self> {
-        Self::spawn_internal(shell, &[], working_dir, size, event_tx, worktree_id, tab_index, &[])
+        Self::spawn_internal(shell, &[], working_dir, size, event_tx, worktree_id, tab_index, &[], 0)
     }
 
     /// 引数付きでコマンドを起動するターミナルエミュレータを作成する
@@ -43,7 +44,7 @@ impl TerminalEmulator {
         worktree_id: WorktreeId,
         tab_index: usize,
     ) -> Result<Self> {
-        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index, &[])
+        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index, &[], 5000)
     }
 
     /// 引数と環境変数付きでコマンドを起動する
@@ -57,7 +58,7 @@ impl TerminalEmulator {
         tab_index: usize,
         envs: &[(&str, &str)],
     ) -> Result<Self> {
-        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index, envs)
+        Self::spawn_internal(program, args, working_dir, size, event_tx, worktree_id, tab_index, envs, 5000)
     }
 
     fn spawn_internal(
@@ -69,6 +70,7 @@ impl TerminalEmulator {
         worktree_id: WorktreeId,
         tab_index: usize,
         envs: &[(&str, &str)],
+        scrollback_lines: usize,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
@@ -112,7 +114,13 @@ impl TerminalEmulator {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        let _ = event_tx.send(AppEvent::TerminalExited {
+                            worktree_id,
+                            tab_index,
+                        });
+                        break;
+                    }
                     Ok(n) => {
                         if event_tx
                             .send(AppEvent::TerminalOutput {
@@ -125,23 +133,32 @@ impl TerminalEmulator {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        let _ = event_tx.send(AppEvent::TerminalExited {
+                            worktree_id,
+                            tab_index,
+                        });
+                        break;
+                    }
                 }
             }
         });
 
-        let scrollback = if args.is_empty() { 0 } else { 5000 };
-        let parser = vt100::Parser::new(size.1, size.0, scrollback);
+        let parser = vt100::Parser::new(size.1, size.0, scrollback_lines);
 
         Ok(Self {
             master: pair.master,
             writer,
             parser,
+            alive: true,
         })
     }
 
     /// PTY にデータを書き込む
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
+        if !self.alive {
+            return Ok(());
+        }
         self.writer
             .write_all(data)
             .map_err(|e| anyhow::anyhow!("PTY への書き込みに失敗: {}", e))?;
@@ -149,6 +166,16 @@ impl TerminalEmulator {
             .flush()
             .map_err(|e| anyhow::anyhow!("PTY のフラッシュに失敗: {}", e))?;
         Ok(())
+    }
+
+    /// PTY プロセスが終了したことをマークする
+    pub fn mark_exited(&mut self) {
+        self.alive = false;
+    }
+
+    /// PTY プロセスが生存しているか
+    pub fn is_alive(&self) -> bool {
+        self.alive
     }
 
     /// PTY とパーサーのサイズを変更する
