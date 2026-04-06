@@ -203,18 +203,8 @@ async fn main() -> Result<()> {
         };
 
         // Claude ターミナル画面を取得（active_tab が Claude タブの場合）
-        // スクロールバックオフセットを適用してから screen() を取得
-        if let Some(wt_id) = app.selected_worktree {
-            if let Some(wt) = app.worktree_by_id(wt_id) {
-                let tab = wt.active_tab;
-                if tab < wt.claude_tabs {
-                    let offset = wt.claude_scroll_offsets.get(&tab).copied().unwrap_or(0);
-                    if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
-                        emu.set_scrollback(offset);
-                    }
-                }
-            }
-        }
+        // NOTE: alternate screen ではスクロールバックが効かないため、
+        // set_scrollback は行わず、マウススクロールは PTY に転送する方式に変更済み
         let claude_screen = app.selected_worktree.and_then(|wt_id| {
             let tab = app.worktree_by_id(wt_id)?.active_tab;
             let claude_tabs = app.worktree_by_id(wt_id)?.claude_tabs;
@@ -622,13 +612,24 @@ async fn handle_event(
                                     .map(|wt| wt.active_tab < wt.claude_tabs)
                                     .unwrap_or(false);
                                 if on_claude_tab {
-                                    if let Some(wt) = app.selected_worktree_mut() {
-                                        let tab = wt.active_tab;
-                                        let offset = wt.claude_scroll_offsets.entry(tab).or_insert(0);
-                                        if is_up {
-                                            *offset = offset.saturating_add(3);
+                                    // alternate screen ではスクロールバックが効かないため、
+                                    // マウススクロールを SGR エスケープシーケンスとして PTY に転送する
+                                    if let Some(wt_id) = app.selected_worktree {
+                                        let tab = app.selected_worktree()
+                                            .map(|wt| wt.active_tab)
+                                            .unwrap_or(0);
+                                        // PTY 内座標に変換（content_area 基準、1-based）
+                                        let (col, row) = if let Some(ca) = app.claude_content_area {
+                                            (
+                                                mouse.column.saturating_sub(ca.x) + 1,
+                                                mouse.row.saturating_sub(ca.y) + 1,
+                                            )
                                         } else {
-                                            *offset = offset.saturating_sub(3);
+                                            (1, 1)
+                                        };
+                                        let bytes = terminal::mouse_scroll_to_bytes(is_up, col, row);
+                                        if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
+                                            let _ = emu.write(&bytes);
                                         }
                                     }
                                 } else if is_up {
@@ -2024,34 +2025,19 @@ fn handle_claude_terminal_key(
         return;
     }
 
-    // Shift+Up/Down/PageUp/PageDown でスクロールバック操作
+    // Shift+Up/Down/PageUp/PageDown: PTY にスクロールイベントを転送
+    // alternate screen ではスクロールバックが効かないため、
+    // マウススクロールと同様に SGR エスケープシーケンスで PTY に送信
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         match key.code {
-            KeyCode::Up => {
-                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
-                    *offset = offset.saturating_add(1);
-                }
-                return;
-            }
-            KeyCode::Down => {
-                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
-                    *offset = offset.saturating_sub(1);
-                }
-                return;
-            }
-            KeyCode::PageUp => {
-                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
-                    *offset = offset.saturating_add(10);
-                }
-                return;
-            }
-            KeyCode::PageDown => {
-                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    let offset = wt.claude_scroll_offsets.entry(active_tab).or_insert(0);
-                    *offset = offset.saturating_sub(10);
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                let is_up = matches!(key.code, KeyCode::Up | KeyCode::PageUp);
+                let count = if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) { 10 } else { 1 };
+                for _ in 0..count {
+                    let bytes = terminal::mouse_scroll_to_bytes(is_up, 1, 1);
+                    if let Some(emu) = claude_terms.get_mut(&(wt_id, active_tab)) {
+                        let _ = emu.write(&bytes);
+                    }
                 }
                 return;
             }

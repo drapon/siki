@@ -232,6 +232,17 @@ pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
     }
 }
 
+/// マウススクロールイベントを SGR エンコーディングのバイト列に変換する
+///
+/// `col` / `row` は PTY 内座標（1-based）。
+/// SGR 形式: `\x1b[<button;col;rowM`
+///   - ScrollUp   button = 64
+///   - ScrollDown  button = 65
+pub fn mouse_scroll_to_bytes(is_up: bool, col: u16, row: u16) -> Vec<u8> {
+    let button: u8 = if is_up { 64 } else { 65 };
+    format!("\x1b[<{};{};{}M", button, col, row).into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
