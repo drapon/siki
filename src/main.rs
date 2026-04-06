@@ -1201,7 +1201,20 @@ async fn send_to_claude(
             None => return,
         };
 
-        match claude::ClaudeSession::spawn(&path, event_tx.clone(), wt_id, resume_id.as_deref()).await {
+        let spawn_result = claude::ClaudeSession::spawn(&path, event_tx.clone(), wt_id, resume_id.as_deref()).await;
+
+        // resume 失敗時は新規セッションでフォールバック
+        let spawn_result = match (&spawn_result, &resume_id) {
+            (Err(_), Some(_)) => {
+                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                    wt.claude_session_id = None;
+                }
+                claude::ClaudeSession::spawn(&path, event_tx.clone(), wt_id, None).await
+            }
+            _ => spawn_result,
+        };
+
+        match spawn_result {
             Ok(mut session) => {
                 if let Err(e) = session.send_message(message).await {
                     app.show_error(format!("メッセージ送信失敗: {}", e));
