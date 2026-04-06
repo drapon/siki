@@ -232,15 +232,31 @@ pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
     }
 }
 
-/// マウススクロールイベントを SGR エンコーディングのバイト列に変換する
+/// マウススクロールイベントを PTY が期待するエンコーディングのバイト列に変換する
 ///
 /// `col` / `row` は PTY 内座標（1-based）。
-/// SGR 形式: `\x1b[<button;col;rowM`
-///   - ScrollUp   button = 64
-///   - ScrollDown  button = 65
-pub fn mouse_scroll_to_bytes(is_up: bool, col: u16, row: u16) -> Vec<u8> {
+/// エンコーディングは vt100::Screen の mouse_protocol_encoding に従う。
+pub fn mouse_scroll_to_bytes(
+    is_up: bool,
+    col: u16,
+    row: u16,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Vec<u8> {
     let button: u8 = if is_up { 64 } else { 65 };
-    format!("\x1b[<{};{};{}M", button, col, row).into_bytes()
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            // SGR 形式: \x1b[<button;col;rowM
+            format!("\x1b[<{};{};{}M", button, col, row).into_bytes()
+        }
+        _ => {
+            // Default / Utf8 形式: \x1b[M<button+32><col+32><row+32>
+            let mut bytes = b"\x1b[M".to_vec();
+            bytes.push(button + 32);
+            bytes.push((col.min(223) as u8) + 32);
+            bytes.push((row.min(223) as u8) + 32);
+            bytes
+        }
+    }
 }
 
 #[cfg(test)]
