@@ -24,6 +24,7 @@ pub fn init(db_path: &Path) -> Result<Connection> {
             cwd TEXT NOT NULL DEFAULT '',
             state TEXT NOT NULL DEFAULT 'idle',
             summary TEXT,
+            claude_session_id TEXT,
             last_heartbeat INTEGER NOT NULL,
             created_at INTEGER NOT NULL
         );
@@ -42,6 +43,11 @@ pub fn init(db_path: &Path) -> Result<Connection> {
         );
         ",
     )?;
+
+    // マイグレーション: claude_session_id カラムが無ければ追加
+    let _ = conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT;",
+    );
 
     Ok(conn)
 }
@@ -89,6 +95,43 @@ pub fn update_session_summary(
         rusqlite::params![summary, session_id],
     )?;
     Ok(())
+}
+
+/// Claude Code のセッション ID を保存する
+pub fn update_claude_session_id(
+    conn: &Connection,
+    session_id: &str,
+    claude_session_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET claude_session_id = ?1 WHERE session_id = ?2",
+        rusqlite::params![claude_session_id, session_id],
+    )?;
+    Ok(())
+}
+
+/// 指定 worktree の最新の claude_session_id を取得する
+///
+/// 同じ worktree/project で最も新しく作成されたセッションの claude_session_id を返す。
+pub fn get_latest_claude_session_id(
+    conn: &Connection,
+    worktree_name: &str,
+    project_name: &str,
+) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT claude_session_id FROM sessions
+         WHERE worktree_name = ?1 AND project_name = ?2
+           AND claude_session_id IS NOT NULL
+         ORDER BY last_heartbeat DESC
+         LIMIT 1",
+        rusqlite::params![worktree_name, project_name],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// セッション一覧を取得する

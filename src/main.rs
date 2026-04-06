@@ -143,6 +143,19 @@ async fn main() -> Result<()> {
     let db_path = config::db_path();
     let broker_db = Arc::new(Mutex::new(db::init(&db_path)?));
 
+    // DB から前回の claude_session_id を各 worktree に復元
+    if let Ok(conn) = broker_db.lock() {
+        for project in &mut app.projects {
+            for wt in &mut project.worktrees {
+                if let Ok(Some(id)) =
+                    db::get_latest_claude_session_id(&conn, &wt.name, &project.name)
+                {
+                    wt.claude_session_id = Some(id);
+                }
+            }
+        }
+    }
+
     let mut tui_terminal = tui::init()?;
     let mut events = event::EventHandler::new();
     let event_tx = events.sender();
@@ -266,6 +279,7 @@ async fn main() -> Result<()> {
             ev,
             last_layout.as_ref(),
             &Some(Arc::clone(&session_registry)),
+            &broker_db,
         )
         .await;
     }
@@ -296,6 +310,7 @@ async fn handle_event(
     event: event::AppEvent,
     last_layout: Option<&ui::layout::AppLayout>,
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
+    broker_db: &Arc<Mutex<rusqlite::Connection>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
     use event::AppEvent;
@@ -445,9 +460,33 @@ async fn handle_event(
         }
         AppEvent::ClaudeOutput {
             worktree_id,
-            event: stream_event,
+            event: ref stream_event,
         } => {
-            app.handle_claude_output(worktree_id, stream_event);
+            // Init イベントの claude_session_id を DB に保存
+            if let event::ClaudeStreamEvent::Init { session_id } = stream_event {
+                if !session_id.is_empty() {
+                    if let Some(wt) = app.worktree_by_id(worktree_id) {
+                        let wt_name = wt.name.clone();
+                        let project_name = app
+                            .projects
+                            .iter()
+                            .find(|p| {
+                                p.worktrees.iter().any(|w| w.name == wt_name)
+                            })
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default();
+                        if let Ok(conn) = broker_db.lock() {
+                            // worktree に紐づくアクティブなセッションの claude_session_id を更新
+                            let _ = conn.execute(
+                                "UPDATE sessions SET claude_session_id = ?1
+                                 WHERE worktree_name = ?2 AND project_name = ?3 AND state != 'dead'",
+                                rusqlite::params![session_id, wt_name, project_name],
+                            );
+                        }
+                    }
+                }
+            }
+            app.handle_claude_output(worktree_id, stream_event.clone());
         }
         AppEvent::ClaudeComplete { worktree_id } => {
             app.handle_claude_complete(worktree_id);
@@ -1103,6 +1142,7 @@ fn finalize_add_worktree(
         chat_scroll_offset: 0,
         claude_scroll_offsets: HashMap::new(),
         pr_title: None,
+        claude_session_id: None,
     });
 
     // PR 情報を非同期取得
@@ -1155,13 +1195,13 @@ async fn send_to_claude(
             wt.status = app::WorktreeStatus::Running;
         }
     } else {
-        // 新規セッションを起動
-        let path = match app.worktree_by_id(wt_id) {
-            Some(wt) => wt.path.clone(),
+        // 新規セッションを起動（前回の session_id があれば再開を試行）
+        let (path, resume_id) = match app.worktree_by_id(wt_id) {
+            Some(wt) => (wt.path.clone(), wt.claude_session_id.clone()),
             None => return,
         };
 
-        match claude::ClaudeSession::spawn(&path, event_tx.clone(), wt_id).await {
+        match claude::ClaudeSession::spawn(&path, event_tx.clone(), wt_id, resume_id.as_deref()).await {
             Ok(mut session) => {
                 if let Err(e) = session.send_message(message).await {
                     app.show_error(format!("メッセージ送信失敗: {}", e));
@@ -2271,6 +2311,10 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    fn test_broker_db() -> Arc<Mutex<rusqlite::Connection>> {
+        Arc::new(Mutex::new(db::init(std::path::Path::new(":memory:")).unwrap()))
+    }
+
     // --- グローバルキーの状態遷移テスト ---
 
     #[tokio::test]
@@ -2301,6 +2345,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.running);
@@ -2334,6 +2379,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('?'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.show_help);
@@ -2367,6 +2413,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.show_help);
@@ -2401,6 +2448,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.running);
@@ -2435,6 +2483,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Tab)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Main);
@@ -2468,6 +2517,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Tab)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         // Main パネルでは Tab はタブ切替なのでフォーカスは変わらない
@@ -2502,6 +2552,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::BackTab)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Terminal);
@@ -2535,6 +2586,7 @@ mod tests {
             event::AppEvent::Key(shift_key(KeyCode::Tab)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Terminal);
@@ -2571,6 +2623,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.show_message_popup);
@@ -2606,6 +2659,7 @@ mod tests {
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
                 &None,
+                &test_broker_db(),
             )
             .await;
         }
@@ -2641,6 +2695,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Backspace)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.popup_input, "a");
@@ -2675,6 +2730,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.running);
@@ -2712,6 +2768,7 @@ mod tests {
             event::AppEvent::Key(ctrl_key('\\')),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Right);
@@ -2746,6 +2803,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Right);
@@ -2785,6 +2843,7 @@ mod tests {
             event::AppEvent::Tick,
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.status_message.is_none());
@@ -2819,6 +2878,7 @@ mod tests {
             event::AppEvent::Tick,
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.status_message.is_some());
@@ -2858,6 +2918,7 @@ mod tests {
             },
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
 
@@ -2897,6 +2958,7 @@ mod tests {
             },
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
 
@@ -2938,6 +3000,7 @@ mod tests {
             },
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
 
@@ -2980,6 +3043,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('j'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(left_panel.cursor_index, 1);
@@ -3015,6 +3079,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('i'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         // claude がインストールされていない環境ではエラーが表示される
@@ -3062,6 +3127,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('t'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(
@@ -3111,6 +3177,7 @@ mod tests {
             event::AppEvent::Mouse(mouse),
             Some(&layout),
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Main);
@@ -3154,6 +3221,7 @@ mod tests {
             event::AppEvent::Mouse(mouse),
             Some(&layout),
             &None,
+            &test_broker_db(),
         )
         .await;
         // ポップアップ表示中はフォーカス変わらない
@@ -3193,6 +3261,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.show_add_worktree_popup);
@@ -3231,6 +3300,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.show_add_worktree_popup);
@@ -3266,6 +3336,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('a'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.show_siki_json_confirm);
@@ -3301,6 +3372,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('S'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.show_siki_json_confirm);
@@ -3335,6 +3407,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.show_add_worktree_popup);
@@ -3370,6 +3443,7 @@ mod tests {
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
                 &None,
+                &test_broker_db(),
             )
             .await;
         }
@@ -3405,6 +3479,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Backspace)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.add_worktree_input, "a");
@@ -3440,6 +3515,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         // ポップアップは閉じず、worktree も追加されない
@@ -3476,6 +3552,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.running);
@@ -3540,6 +3617,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
 
@@ -3585,6 +3663,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('A'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.show_add_project_popup);
@@ -3621,6 +3700,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Esc)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3656,6 +3736,7 @@ mod tests {
                 event::AppEvent::Key(key(KeyCode::Char(c))),
                 None,
                 &None,
+                &test_broker_db(),
             )
             .await;
         }
@@ -3692,6 +3773,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.show_add_project_popup);
@@ -3728,6 +3810,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3770,6 +3853,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Enter)),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(!app.show_add_project_popup);
@@ -3807,6 +3891,7 @@ mod tests {
             event::AppEvent::Key(key(KeyCode::Char('q'))),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert!(app.running);
@@ -3849,6 +3934,7 @@ mod tests {
             event::AppEvent::Mouse(mouse),
             None,
             &None,
+            &test_broker_db(),
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Left);

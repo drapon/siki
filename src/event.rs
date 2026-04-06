@@ -64,7 +64,7 @@ pub enum AppEvent {
 }
 
 /// Claude Code ストリームイベント型
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ClaudeStreamEvent {
     Init { session_id: String },
     ContentDelta { text: String },
