@@ -16,6 +16,7 @@ mod ui;
 use anyhow::Result;
 use config::load_config;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use ui::diff_view::DiffView;
 use ui::left_panel::LeftPanel;
@@ -450,6 +451,14 @@ async fn handle_event(
         }
         AppEvent::ClaudeComplete { worktree_id } => {
             app.handle_claude_complete(worktree_id);
+            // 選択中の worktree が完了した場合、Diff と SourceTree を自動更新
+            if app.selected_worktree == Some(worktree_id) {
+                if let Some(wt) = app.worktree_by_id(worktree_id) {
+                    let wt_path = wt.path.clone();
+                    diff_view.load(&wt_path);
+                    source_tree.load(&wt_path);
+                }
+            }
         }
         AppEvent::ClaudeError {
             worktree_id,
@@ -618,6 +627,23 @@ async fn handle_event(
                                             .unwrap_or(0);
                                         if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
                                             let mouse_mode = emu.screen().mouse_protocol_mode();
+                                            let alt_screen = emu.screen().alternate_screen();
+                                            let scrollback_size = emu.screen().scrollback();
+                                            // DEBUG: スクロールイベントの状態をログ出力
+                                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                .create(true).append(true)
+                                                .open("/tmp/siki_scroll_debug.log")
+                                            {
+                                                let _ = writeln!(f,
+                                                    "[scroll] dir={} mouse_mode={:?} alt_screen={} scrollback={} col={} row={}",
+                                                    if is_up { "UP" } else { "DOWN" },
+                                                    mouse_mode,
+                                                    alt_screen,
+                                                    scrollback_size,
+                                                    mouse.column,
+                                                    mouse.row,
+                                                );
+                                            }
                                             if mouse_mode != vt100::MouseProtocolMode::None {
                                                 // PTY がマウスモードを有効にしている場合は転送
                                                 let encoding = emu.screen().mouse_protocol_encoding();
@@ -630,6 +656,15 @@ async fn handle_event(
                                                     (1, 1)
                                                 };
                                                 let bytes = terminal::mouse_scroll_to_bytes(is_up, col, row, encoding);
+                                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                    .create(true).append(true)
+                                                    .open("/tmp/siki_scroll_debug.log")
+                                                {
+                                                    let _ = writeln!(f,
+                                                        "[scroll] -> PTY transfer: encoding={:?} pty_col={} pty_row={} bytes={:?}",
+                                                        encoding, col, row, bytes,
+                                                    );
+                                                }
                                                 let _ = emu.write(&bytes);
                                             } else {
                                                 // マウスモード未有効: vt100 スクロールバックを操作
