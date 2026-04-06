@@ -154,17 +154,22 @@ impl TerminalEmulator {
         })
     }
 
-    /// PTY にデータを書き込む
+    /// PTY にデータを書き込む（大きなデータはチャンク分割）
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
         if !self.alive {
             return Ok(());
         }
-        self.writer
-            .write_all(data)
-            .map_err(|e| anyhow::anyhow!("PTY への書き込みに失敗: {}", e))?;
-        self.writer
-            .flush()
-            .map_err(|e| anyhow::anyhow!("PTY のフラッシュに失敗: {}", e))?;
+        // 大きなペーストでPTYバッファが詰まりフリーズするのを防ぐため
+        // チャンク分割して書き込む
+        const CHUNK_SIZE: usize = 4096;
+        for chunk in data.chunks(CHUNK_SIZE) {
+            self.writer
+                .write_all(chunk)
+                .map_err(|e| anyhow::anyhow!("PTY への書き込みに失敗: {}", e))?;
+            self.writer
+                .flush()
+                .map_err(|e| anyhow::anyhow!("PTY のフラッシュに失敗: {}", e))?;
+        }
         Ok(())
     }
 
