@@ -8,6 +8,7 @@ use std::process::Command;
 pub struct DiffView {
     pub content: String,
     pub scroll_offset: usize,
+    line_count: usize,
 }
 
 impl DiffView {
@@ -15,6 +16,7 @@ impl DiffView {
         Self {
             content: String::new(),
             scroll_offset: 0,
+            line_count: 0,
         }
     }
 
@@ -22,11 +24,14 @@ impl DiffView {
     pub fn load(&mut self, worktree_path: &Path) {
         self.scroll_offset = 0;
         self.content = get_git_diff(worktree_path);
+        self.line_count = self.content.lines().count();
     }
 
     /// スクロール下
     pub fn scroll_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(1);
+        if self.scroll_offset < self.line_count.saturating_sub(1) {
+            self.scroll_offset = self.scroll_offset.saturating_add(1);
+        }
     }
 
     /// スクロール上
@@ -73,9 +78,10 @@ impl DiffView {
             })
             .collect();
 
+        let scroll_y = u16::try_from(self.scroll_offset).unwrap_or(u16::MAX);
         let paragraph = Paragraph::new(lines)
             .block(block)
-            .scroll((self.scroll_offset as u16, 0));
+            .scroll((scroll_y, 0));
 
         frame.render_widget(paragraph, area);
     }
@@ -84,7 +90,7 @@ impl DiffView {
 /// git diff コマンドを実行して結果を返す
 fn get_git_diff(worktree_path: &Path) -> String {
     let output = Command::new("git")
-        .args(["diff"])
+        .args(["diff", "HEAD"])
         .current_dir(worktree_path)
         .output();
 
@@ -184,6 +190,9 @@ mod tests {
     #[test]
     fn test_diff_view_scroll() {
         let mut view = DiffView::new();
+        // 5行分のコンテンツを設定
+        view.content = "line1\nline2\nline3\nline4\nline5".to_string();
+        view.line_count = 5;
         assert_eq!(view.scroll_offset, 0);
 
         view.scroll_down();
@@ -195,6 +204,28 @@ mod tests {
         view.scroll_up();
         assert_eq!(view.scroll_offset, 0);
         view.scroll_up(); // 0 以下にはならない
+        assert_eq!(view.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_diff_view_scroll_clamp() {
+        let mut view = DiffView::new();
+        view.content = "line1\nline2\nline3".to_string();
+        view.line_count = 3;
+
+        // 最大 line_count - 1 = 2 まで
+        view.scroll_down();
+        view.scroll_down();
+        assert_eq!(view.scroll_offset, 2);
+        view.scroll_down(); // これ以上は進まない
+        assert_eq!(view.scroll_offset, 2);
+    }
+
+    #[test]
+    fn test_diff_view_scroll_empty_content() {
+        let mut view = DiffView::new();
+        // 空コンテンツでは scroll_down しても動かない
+        view.scroll_down();
         assert_eq!(view.scroll_offset, 0);
     }
 

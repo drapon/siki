@@ -450,6 +450,14 @@ async fn handle_event(
         }
         AppEvent::ClaudeComplete { worktree_id } => {
             app.handle_claude_complete(worktree_id);
+            // 選択中の worktree が完了した場合、Diff と SourceTree を自動更新
+            if app.selected_worktree == Some(worktree_id) {
+                if let Some(wt) = app.worktree_by_id(worktree_id) {
+                    let wt_path = wt.path.clone();
+                    diff_view.load(&wt_path);
+                    source_tree.load(&wt_path);
+                }
+            }
         }
         AppEvent::ClaudeError {
             worktree_id,
