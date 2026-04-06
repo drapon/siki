@@ -2126,6 +2126,13 @@ fn handle_right_panel_key(
                 }
                 KeyCode::Char('t') => {
                     ui::right_panel::toggle_mode(app);
+                    // Diff モードに切り替えた時は最新の diff を取得
+                    if let Some(wt) = app.selected_worktree() {
+                        if wt.right_panel_mode == app::RightPanelMode::Diff {
+                            let wt_path = wt.path.clone();
+                            diff_view.load(&wt_path);
+                        }
+                    }
                 }
                 _ => {}
             }
