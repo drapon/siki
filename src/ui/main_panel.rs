@@ -28,23 +28,29 @@ pub fn render(
         return;
     };
 
-    // タブバー + コンテンツの分割
+    // ブランチ情報ヘッダー + タブバー + コンテンツの分割
     let chunks = Layout::vertical([
+        Constraint::Length(1), // ブランチ / PR タイトル
         Constraint::Length(2), // タブバー（1行 + 下線）
         Constraint::Min(0),   // コンテンツ
     ])
     .split(area);
 
+    // ブランチ / PR タイトル描画
+    if let Some(wt) = app.selected_worktree() {
+        render_branch_header(frame, chunks[0], &wt.branch, wt.pr_title.as_deref(), focused);
+    }
+
     // タブバー描画（immutable borrow で取得）
     if let Some(wt) = app.selected_worktree() {
-        render_tab_bar(frame, chunks[0], wt.active_tab, wt.claude_tabs, &wt.open_files, focused);
+        render_tab_bar(frame, chunks[1], wt.active_tab, wt.claude_tabs, &wt.open_files, focused);
     }
 
     // コンテンツ描画
     if active_tab < claude_tabs {
         // Claude タブ
         if let Some(screen) = claude_screen {
-            render_claude_terminal(frame, chunks[1], screen, focused, app);
+            render_claude_terminal(frame, chunks[2], screen, focused, app);
         } else {
             app.claude_content_area = None;
             let block = panel_block("Claude Code", focused);
@@ -52,7 +58,7 @@ pub fn render(
                 Paragraph::new("起動中...")
                     .block(block)
                     .style(Style::default().fg(Color::DarkGray)),
-                chunks[1],
+                chunks[2],
             );
         }
     } else {
@@ -60,10 +66,41 @@ pub fn render(
         let file_index = active_tab - claude_tabs;
         if let Some(wt) = app.selected_worktree_mut() {
             if let Some(file) = wt.open_files.get_mut(file_index) {
-                render_file(frame, chunks[1], file, focused);
+                render_file(frame, chunks[2], file, focused);
             }
         }
     }
+}
+
+/// ブランチ名 / PR タイトルのヘッダーを描画
+fn render_branch_header(
+    frame: &mut Frame,
+    area: Rect,
+    branch: &str,
+    pr_title: Option<&str>,
+    focused: bool,
+) {
+    let branch_style = Style::default()
+        .fg(if focused { Color::Green } else { Color::DarkGray })
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(branch, branch_style),
+    ];
+
+    if let Some(title) = pr_title {
+        spans.push(Span::styled(
+            " | ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            title,
+            Style::default().fg(if focused { Color::Yellow } else { Color::DarkGray }),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// タブバーを描画
