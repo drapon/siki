@@ -142,7 +142,7 @@ fn render_session_choice_popup(frame: &mut Frame) {
 
     let area = frame.area();
     let w = 44.min(area.width);
-    let h = 6.min(area.height);
+    let h = 7.min(area.height);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup_area = Rect::new(x, y, w, h);

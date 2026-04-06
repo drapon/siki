@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // --version / -V
-    if args.len() > 1 && (args[1] == "--version" || args[1] == "-V") {
+    if args.len() > 1 && (args[1] == "--version" || args[1] == "-V" || args[1] == "-v") {
         println!("siki {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
         println!("Options:");
         println!("  -p <name>  Filter projects by name prefix");
         println!("  -h, --help     Print help");
-        println!("  -V, --version  Print version");
+        println!("  -v, -V, --version  Print version");
         return Ok(());
     }
 
@@ -503,6 +503,19 @@ async fn handle_event(
                     diff_view.load(&wt_path);
                     source_tree.load(&wt_path);
                 }
+            }
+            // Claude セッション中に PR が作成された可能性があるため再取得
+            if let Some(wt) = app.worktree_by_id(worktree_id) {
+                let tx = event_tx.clone();
+                let wt_path = wt.path.clone();
+                let wt_id = worktree_id;
+                tokio::spawn(async move {
+                    let title = fetch_pr_title(&wt_path).await;
+                    let _ = tx.send(event::AppEvent::PrInfo {
+                        worktree_id: wt_id,
+                        title,
+                    });
+                });
             }
         }
         AppEvent::ClaudeError {
