@@ -612,24 +612,34 @@ async fn handle_event(
                                     .map(|wt| wt.active_tab < wt.claude_tabs)
                                     .unwrap_or(false);
                                 if on_claude_tab {
-                                    // alternate screen ではスクロールバックが効かないため、
-                                    // マウススクロールを SGR エスケープシーケンスとして PTY に転送する
                                     if let Some(wt_id) = app.selected_worktree {
                                         let tab = app.selected_worktree()
                                             .map(|wt| wt.active_tab)
                                             .unwrap_or(0);
-                                        // PTY 内座標に変換（content_area 基準、1-based）
-                                        let (col, row) = if let Some(ca) = app.claude_content_area {
-                                            (
-                                                mouse.column.saturating_sub(ca.x) + 1,
-                                                mouse.row.saturating_sub(ca.y) + 1,
-                                            )
-                                        } else {
-                                            (1, 1)
-                                        };
-                                        let bytes = terminal::mouse_scroll_to_bytes(is_up, col, row);
                                         if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
-                                            let _ = emu.write(&bytes);
+                                            let mouse_mode = emu.screen().mouse_protocol_mode();
+                                            if mouse_mode != vt100::MouseProtocolMode::None {
+                                                // PTY がマウスモードを有効にしている場合は転送
+                                                let encoding = emu.screen().mouse_protocol_encoding();
+                                                let (col, row) = if let Some(ca) = app.claude_content_area {
+                                                    (
+                                                        mouse.column.saturating_sub(ca.x) + 1,
+                                                        mouse.row.saturating_sub(ca.y) + 1,
+                                                    )
+                                                } else {
+                                                    (1, 1)
+                                                };
+                                                let bytes = terminal::mouse_scroll_to_bytes(is_up, col, row, encoding);
+                                                let _ = emu.write(&bytes);
+                                            } else {
+                                                // マウスモード未有効: vt100 スクロールバックを操作
+                                                let current = emu.scrollback();
+                                                if is_up {
+                                                    emu.set_scrollback(current.saturating_add(3));
+                                                } else {
+                                                    emu.set_scrollback(current.saturating_sub(3));
+                                                }
+                                            }
                                         }
                                     }
                                 } else if is_up {
@@ -2025,18 +2035,27 @@ fn handle_claude_terminal_key(
         return;
     }
 
-    // Shift+Up/Down/PageUp/PageDown: PTY にスクロールイベントを転送
-    // alternate screen ではスクロールバックが効かないため、
-    // マウススクロールと同様に SGR エスケープシーケンスで PTY に送信
+    // Shift+Up/Down/PageUp/PageDown: スクロール
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         match key.code {
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                 let is_up = matches!(key.code, KeyCode::Up | KeyCode::PageUp);
                 let count = if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) { 10 } else { 1 };
-                for _ in 0..count {
-                    let bytes = terminal::mouse_scroll_to_bytes(is_up, 1, 1);
-                    if let Some(emu) = claude_terms.get_mut(&(wt_id, active_tab)) {
-                        let _ = emu.write(&bytes);
+                if let Some(emu) = claude_terms.get_mut(&(wt_id, active_tab)) {
+                    let mouse_mode = emu.screen().mouse_protocol_mode();
+                    if mouse_mode != vt100::MouseProtocolMode::None {
+                        let encoding = emu.screen().mouse_protocol_encoding();
+                        for _ in 0..count {
+                            let bytes = terminal::mouse_scroll_to_bytes(is_up, 1, 1, encoding);
+                            let _ = emu.write(&bytes);
+                        }
+                    } else {
+                        let current = emu.scrollback();
+                        if is_up {
+                            emu.set_scrollback(current.saturating_add(count));
+                        } else {
+                            emu.set_scrollback(current.saturating_sub(count));
+                        }
                     }
                 }
                 return;
