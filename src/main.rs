@@ -500,7 +500,8 @@ async fn handle_event(
             if app.selected_worktree == Some(worktree_id) {
                 if let Some(wt) = app.worktree_by_id(worktree_id) {
                     let wt_path = wt.path.clone();
-                    diff_view.load(&wt_path);
+                    let base = resolve_base_branch(&app.projects[worktree_id.0].path);
+                    diff_view.load(&wt_path, &base);
                     source_tree.load(&wt_path);
                 }
             }
@@ -1293,8 +1294,8 @@ fn handle_terminal_key(
     }
 
     if !has_terminal {
-        // ターミナル未作成時: n で新規作成、それ以外は無視
-        if key.code == KeyCode::Char('n') {
+        // ターミナル未作成時: Ctrl+t で新規作成、それ以外は無視
+        if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
             spawn_terminal(app, terminals, event_tx, shell, wt_id, 0);
         }
         return;
@@ -1311,8 +1312,8 @@ fn handle_terminal_key(
             }
             return;
         }
-        // Ctrl+n で新規タブ（最大5つ）
-        if key.code == KeyCode::Char('n') {
+        // Ctrl+t で新規タブ（最大5つ）
+        if key.code == KeyCode::Char('t') {
             let next_tab = (0..5).find(|i| !terminals.contains_key(&(wt_id, *i)));
             if let Some(tab) = next_tab {
                 spawn_terminal(app, terminals, event_tx, shell, wt_id, tab);
@@ -1453,15 +1454,7 @@ fn handle_left_panel_key(
                 app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
 
                 // base_branch を解決: siki.json > config.toml > "origin/main"
-                let base = config::load_siki_json(project_path)
-                    .and_then(|sj| sj.base_branch)
-                    .or_else(|| {
-                        config::load_config(&config::default_config_path())
-                            .ok()
-                            .and_then(|c| c.siki.base_branch)
-                    })
-                    .unwrap_or_else(|| "origin/main".to_string());
-                app.add_worktree_base_branch = base;
+                app.add_worktree_base_branch = resolve_base_branch(project_path);
 
                 app.show_add_worktree_popup = true;
             }
@@ -1538,8 +1531,9 @@ fn handle_left_panel_key(
                 app.focused_panel = app::Panel::Main;
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+                let base = resolve_base_branch(&app.projects[wt_id.0].path);
                 source_tree.load(&wt_path);
-                diff_view.load(&wt_path);
+                diff_view.load(&wt_path, &base);
                 // Claude Code とターミナルを自動起動
                 let has_claude = app
                     .worktree_by_id(wt_id)
@@ -2250,10 +2244,13 @@ fn handle_right_panel_key(
                 KeyCode::Char('t') => {
                     ui::right_panel::toggle_mode(app);
                     // Diff モードに切り替えた時は最新の diff を取得
-                    if let Some(wt) = app.selected_worktree() {
-                        if wt.right_panel_mode == app::RightPanelMode::Diff {
-                            let wt_path = wt.path.clone();
-                            diff_view.load(&wt_path);
+                    if let Some(wt_id) = app.selected_worktree {
+                        if let Some(wt) = app.worktree_by_id(wt_id) {
+                            if wt.right_panel_mode == app::RightPanelMode::Diff {
+                                let wt_path = wt.path.clone();
+                                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                                diff_view.load(&wt_path, &base);
+                            }
                         }
                     }
                 }
@@ -2279,6 +2276,18 @@ fn handle_right_panel_key(
             _ => {}
         },
     }
+}
+
+/// プロジェクトパスから base_branch を解決する
+fn resolve_base_branch(project_path: &std::path::Path) -> String {
+    config::load_siki_json(project_path)
+        .and_then(|sj| sj.base_branch)
+        .or_else(|| {
+            config::load_config(&config::default_config_path())
+                .ok()
+                .and_then(|c| c.siki.base_branch)
+        })
+        .unwrap_or_else(|| "origin/main".to_string())
 }
 
 /// worktree のパスで `gh pr view` を実行し、PR タイトルを取得する

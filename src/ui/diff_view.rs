@@ -31,10 +31,11 @@ impl DiffView {
     }
 
     /// worktree パスの git diff を取得・パースする
-    pub fn load(&mut self, worktree_path: &Path) {
+    /// base_branch: PR のベースブランチ (e.g. "origin/main")
+    pub fn load(&mut self, worktree_path: &Path, base_branch: &str) {
         self.selected_file = 0;
         self.diff_scroll_offset = 0;
-        let raw = get_git_diff(worktree_path);
+        let raw = get_git_diff(worktree_path, base_branch);
         self.files = parse_diff(&raw);
     }
 
@@ -327,9 +328,12 @@ fn count_changes(content: &str) -> (usize, usize) {
 }
 
 /// git diff コマンドを実行して結果を返す
-fn get_git_diff(worktree_path: &Path) -> String {
+/// base_branch からの差分（PR の変更内容）を取得する
+fn get_git_diff(worktree_path: &Path, base_branch: &str) -> String {
+    // merge-base を使ってベースブランチからの差分を取得
+    let merge_base_arg = format!("{}...HEAD", base_branch);
     let output = Command::new("git")
-        .args(["diff", "HEAD"])
+        .args(["diff", &merge_base_arg])
         .current_dir(worktree_path)
         .output();
 
@@ -563,7 +567,7 @@ new file mode 100644
     #[test]
     fn test_diff_view_load_nonexistent() {
         let mut view = DiffView::new();
-        view.load(Path::new("/nonexistent/path"));
+        view.load(Path::new("/nonexistent/path"), "origin/main");
         // エラー時は files が空のまま（git diff がエラーメッセージを返すが diff --git で始まらないのでパースされない）
         assert_eq!(view.selected_file, 0);
     }
