@@ -832,7 +832,12 @@ async fn handle_event(
             }
             // ワークツリー追加ポップアップ
             if app.show_add_worktree_popup {
-                app.add_worktree_name.push_str(&text);
+                if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
+                    app.add_worktree_branch_filter.push_str(&text);
+                    app.add_worktree_branch_cursor = 0;
+                } else {
+                    app.add_worktree_input.push_str(&text);
+                }
                 return;
             }
             // grep ポップアップ
