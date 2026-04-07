@@ -1,4 +1,5 @@
 use crate::app::{App, OpenFile};
+use super::grep_view;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
@@ -9,6 +10,7 @@ pub fn render(
     app: &mut App,
     focused: bool,
     claude_screen: Option<&vt100::Screen>,
+    grep_rows: &[grep_view::DisplayRow],
 ) {
     // worktree の情報を先に取得（借用の衝突回避）
     let wt_info = app.selected_worktree().map(|wt| {
@@ -41,13 +43,21 @@ pub fn render(
         render_branch_header(frame, chunks[0], &wt.branch, wt.pr_title.as_deref(), focused);
     }
 
-    // タブバー描画（immutable borrow で取得）
+    // タブバー描画（Search タブを含む）
+    let has_search = app.show_grep_results_view;
     if let Some(wt) = app.selected_worktree() {
-        render_tab_bar(frame, chunks[1], wt.active_tab, wt.claude_tabs, &wt.open_files, focused);
+        render_tab_bar(frame, chunks[1], wt.active_tab, wt.claude_tabs, &wt.open_files, has_search, focused);
     }
 
     // コンテンツ描画
-    if active_tab < claude_tabs {
+    // タブ構成: [Claude 0..N] [Search?] [File 0..N]
+    let search_tab_index = if has_search { Some(claude_tabs) } else { None };
+
+    if Some(active_tab) == search_tab_index {
+        // Search タブ
+        app.claude_content_area = None;
+        grep_view::render(frame, chunks[2], app, grep_rows, focused);
+    } else if active_tab < claude_tabs {
         // Claude タブ
         if let Some(screen) = claude_screen {
             render_claude_terminal(frame, chunks[2], screen, focused, app);
@@ -63,7 +73,8 @@ pub fn render(
         }
     } else {
         app.claude_content_area = None;
-        let file_index = active_tab - claude_tabs;
+        let file_offset = if has_search { claude_tabs + 1 } else { claude_tabs };
+        let file_index = active_tab - file_offset;
         if let Some(wt) = app.selected_worktree_mut() {
             if let Some(file) = wt.open_files.get_mut(file_index) {
                 render_file(frame, chunks[2], file, focused);
@@ -110,6 +121,7 @@ fn render_tab_bar(
     active_tab: usize,
     claude_tabs: usize,
     open_files: &[OpenFile],
+    has_search: bool,
     focused: bool,
 ) {
     let mut titles: Vec<String> = (0..claude_tabs)
@@ -121,6 +133,9 @@ fn render_tab_bar(
             }
         })
         .collect();
+    if has_search {
+        titles.push("Search".to_string());
+    }
     for f in open_files {
         let name = f
             .path
@@ -350,8 +365,10 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
 
 /// タブ切替のロジック
 pub fn next_tab(app: &mut App) {
+    let has_search = app.show_grep_results_view;
     if let Some(wt) = app.selected_worktree_mut() {
-        let tab_count = wt.claude_tabs + wt.open_files.len();
+        let search_count = if has_search { 1 } else { 0 };
+        let tab_count = wt.claude_tabs + search_count + wt.open_files.len();
         if tab_count > 0 {
             wt.active_tab = (wt.active_tab + 1) % tab_count;
         }
@@ -360,14 +377,37 @@ pub fn next_tab(app: &mut App) {
 
 /// ファイルタブを閉じる（Claude タブは Ctrl+\ で閉じる）
 pub fn close_current_tab(app: &mut App) {
+    let has_search = app.show_grep_results_view;
+    // Search タブを閉じる
+    if has_search {
+        if let Some(wt) = app.selected_worktree() {
+            if wt.active_tab == wt.claude_tabs {
+                app.show_grep_results_view = false;
+                // タブ位置を調整
+                if let Some(wt) = app.selected_worktree_mut() {
+                    let tab_count = wt.claude_tabs + wt.open_files.len();
+                    if wt.active_tab >= tab_count {
+                        wt.active_tab = tab_count.saturating_sub(1);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     if let Some(wt) = app.selected_worktree_mut() {
         if wt.active_tab < wt.claude_tabs {
             return; // Claude タブはここでは閉じない
         }
-        let file_index = wt.active_tab - wt.claude_tabs;
+        let offset = if has_search { wt.claude_tabs + 1 } else { wt.claude_tabs };
+        if wt.active_tab < offset {
+            return;
+        }
+        let file_index = wt.active_tab - offset;
         if file_index < wt.open_files.len() {
             wt.open_files.remove(file_index);
-            let tab_count = wt.claude_tabs + wt.open_files.len();
+            let search_count = if has_search { 1 } else { 0 };
+            let tab_count = wt.claude_tabs + search_count + wt.open_files.len();
             if tab_count == 0 {
                 wt.active_tab = 0;
             } else if wt.active_tab >= tab_count {
@@ -379,11 +419,13 @@ pub fn close_current_tab(app: &mut App) {
 
 /// ファイルを新しいタブで開く（既に開いていればそのタブに切替）
 pub fn open_file_tab(app: &mut App, path: std::path::PathBuf) {
+    let has_search = app.show_grep_results_view;
     if let Some(wt) = app.selected_worktree_mut() {
+        let offset = if has_search { wt.claude_tabs + 1 } else { wt.claude_tabs };
         // 既に開いているか確認
         for (i, f) in wt.open_files.iter().enumerate() {
             if f.path == path {
-                wt.active_tab = wt.claude_tabs + i;
+                wt.active_tab = offset + i;
                 return;
             }
         }
@@ -403,17 +445,19 @@ pub fn open_file_tab(app: &mut App, path: std::path::PathBuf) {
             search_matches: Vec::new(),
             search_match_idx: 0,
         });
-        wt.active_tab = wt.claude_tabs + wt.open_files.len() - 1;
+        wt.active_tab = offset + wt.open_files.len() - 1;
     }
 }
 
 /// カーソルを下に移動（Claude タブはターミナルが処理するので対象外）
 pub fn scroll_down(app: &mut App) {
+    let has_search = app.show_grep_results_view;
     if let Some(wt) = app.selected_worktree_mut() {
-        if wt.active_tab < wt.claude_tabs {
+        let offset = if has_search { wt.claude_tabs + 1 } else { wt.claude_tabs };
+        if wt.active_tab < offset {
             return;
         }
-        let file_index = wt.active_tab - wt.claude_tabs;
+        let file_index = wt.active_tab - offset;
         if let Some(file) = wt.open_files.get_mut(file_index) {
             let total_lines = file.highlighted.len();
             if total_lines > 0 && file.cursor_line < total_lines - 1 {
@@ -425,11 +469,13 @@ pub fn scroll_down(app: &mut App) {
 
 /// カーソルを上に移動（Claude タブはターミナルが処理するので対象外）
 pub fn scroll_up(app: &mut App) {
+    let has_search = app.show_grep_results_view;
     if let Some(wt) = app.selected_worktree_mut() {
-        if wt.active_tab < wt.claude_tabs {
+        let offset = if has_search { wt.claude_tabs + 1 } else { wt.claude_tabs };
+        if wt.active_tab < offset {
             return;
         }
-        let file_index = wt.active_tab - wt.claude_tabs;
+        let file_index = wt.active_tab - offset;
         if let Some(file) = wt.open_files.get_mut(file_index) {
             file.cursor_line = file.cursor_line.saturating_sub(1);
         }
@@ -442,21 +488,37 @@ pub fn is_file_search_active(app: &App) -> bool {
         Some(wt) => wt,
         None => return false,
     };
-    if wt.active_tab < wt.claude_tabs {
-        return false;
-    }
-    let file_index = wt.active_tab - wt.claude_tabs;
+    let idx = match file_tab_index(app, wt.active_tab, wt.claude_tabs) {
+        Some(i) => i,
+        None => return false,
+    };
     wt.open_files
-        .get(file_index)
+        .get(idx)
         .map(|f| f.search_active)
         .unwrap_or(false)
 }
 
+/// Search タブ分のオフセットを計算してファイルインデックスを返す
+fn file_tab_index(app: &App, active_tab: usize, claude_tabs: usize) -> Option<usize> {
+    let offset = if app.show_grep_results_view {
+        claude_tabs + 1
+    } else {
+        claude_tabs
+    };
+    if active_tab >= offset {
+        Some(active_tab - offset)
+    } else {
+        None
+    }
+}
+
 /// 現在のファイルに対して検索操作を行うヘルパー
 fn with_current_file_mut(app: &mut App, f: impl FnOnce(&mut OpenFile)) {
+    let has_search = app.show_grep_results_view;
     if let Some(wt) = app.selected_worktree_mut() {
-        if wt.active_tab >= wt.claude_tabs {
-            let file_index = wt.active_tab - wt.claude_tabs;
+        let offset = if has_search { wt.claude_tabs + 1 } else { wt.claude_tabs };
+        if wt.active_tab >= offset {
+            let file_index = wt.active_tab - offset;
             if let Some(file) = wt.open_files.get_mut(file_index) {
                 f(file);
             }
@@ -495,10 +557,7 @@ pub fn file_prev_match(app: &mut App) {
 /// 現在開いているファイルのパス:行番号を返す（1-indexed）
 pub fn current_file_location(app: &App) -> Option<String> {
     let wt = app.selected_worktree()?;
-    if wt.active_tab < wt.claude_tabs {
-        return None;
-    }
-    let file_index = wt.active_tab - wt.claude_tabs;
+    let file_index = file_tab_index(app, wt.active_tab, wt.claude_tabs)?;
     let file = wt.open_files.get(file_index)?;
     Some(format!("{}:{}", file.path.display(), file.cursor_line + 1))
 }

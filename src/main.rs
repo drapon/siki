@@ -235,6 +235,18 @@ async fn main() -> Result<()> {
         }
         let siki_init_screen = siki_init_terminal.as_ref().map(|emu| emu.screen());
 
+        // grep 結果の表示行を構築
+        let grep_rows = if app.show_grep_results_view {
+            let wt_path = app.selected_worktree().map(|wt| wt.path.clone());
+            if let Some(wt_path) = wt_path {
+                ui::grep_view::build_display_rows(&app.grep_results, &wt_path)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // UI 描画
         tui_terminal.draw(|frame| {
             let registry = session_registry.lock().unwrap();
@@ -249,6 +261,7 @@ async fn main() -> Result<()> {
                 claude_screen,
                 siki_init_screen,
                 Some(&registry),
+                &grep_rows,
             ));
         })?;
 
@@ -605,6 +618,26 @@ async fn handle_event(
                             app.focused_panel = panel;
                         }
                         let hit_panel = layout.hit_test(mouse.column, mouse.row);
+                        // Search タブでのクリック → カーソル移動
+                        if app.show_grep_results_view
+                            && hit_panel == Some(app::Panel::Main)
+                        {
+                            // main 領域の上部: ヘッダー(1) + タブバー(2) + ボーダー(1) + 検索入力(1) = 5行分オフセット
+                            let content_top = layout.main.y + 5;
+                            if mouse.row >= content_top {
+                                let clicked_row = (mouse.row - content_top) as usize;
+                                let target = app.grep_view_scroll + clicked_row;
+                                let wt_path = app.selected_worktree().map(|wt| wt.path.clone());
+                                let row_count = if let Some(ref wt_path) = wt_path {
+                                    ui::grep_view::build_display_rows(&app.grep_results, wt_path).len()
+                                } else {
+                                    0
+                                };
+                                if target < row_count {
+                                    app.grep_view_cursor = target;
+                                }
+                            }
+                        }
                         // Claude ペインのコンテンツ領域でクリック → 選択開始
                         let on_claude_tab = app
                             .selected_worktree()
@@ -753,6 +786,20 @@ async fn handle_event(
                                             }
                                         }
                                     }
+                                } else if app.show_grep_results_view {
+                                    // Search タブ: grep 結果のカーソル移動
+                                    let wt_path = app.selected_worktree().map(|wt| wt.path.clone());
+                                    let row_count = if let Some(ref wt_path) = wt_path {
+                                        ui::grep_view::build_display_rows(&app.grep_results, wt_path).len()
+                                    } else {
+                                        0
+                                    };
+                                    if is_up {
+                                        app.grep_view_cursor = app.grep_view_cursor.saturating_sub(1);
+                                    } else if app.grep_view_cursor < row_count.saturating_sub(1) {
+                                        app.grep_view_cursor += 1;
+                                    }
+                                    adjust_grep_scroll(app);
                                 } else if is_up {
                                     ui::main_panel::scroll_up(app);
                                 } else {
@@ -1293,6 +1340,15 @@ fn handle_terminal_key(
         return;
     }
 
+    // Ctrl+g で grep 検索を開く
+    if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.show_grep_popup = true;
+        app.grep_input.clear();
+        app.grep_results.clear();
+        app.grep_cursor = 0;
+        return;
+    }
+
     if !has_terminal {
         // ターミナル未作成時: Ctrl+t で新規作成、それ以外は無視
         if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1560,6 +1616,12 @@ fn handle_main_panel_key(
 ) {
     use crossterm::event::KeyCode;
 
+    // grep 結果ビュー表示中
+    if app.show_grep_results_view {
+        handle_grep_view_key(app, claude_terms, key);
+        return;
+    }
+
     // ファイル内検索モード中
     if ui::main_panel::is_file_search_active(app) {
         match key.code {
@@ -1719,6 +1781,110 @@ fn handle_siki_init_terminal_key(
 }
 
 /// Grep ポップアップのキー処理
+/// grep 結果ビュー（中央ペイン）のキー処理
+fn handle_grep_view_key(
+    app: &mut app::App,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+
+    // grep_rows を都度構築（カーソル位置の解決用）
+    let wt_path = app.selected_worktree().map(|wt| wt.path.clone());
+    let grep_rows = if let Some(ref wt_path) = wt_path {
+        ui::grep_view::build_display_rows(&app.grep_results, wt_path)
+    } else {
+        Vec::new()
+    };
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('w') => {
+            app.show_grep_results_view = false;
+            // Search タブが消えるのでタブ位置を調整
+            if let Some(wt) = app.selected_worktree_mut() {
+                if wt.active_tab >= wt.claude_tabs {
+                    wt.active_tab = wt.claude_tabs.saturating_sub(1);
+                }
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if app.grep_view_cursor < grep_rows.len().saturating_sub(1) {
+                app.grep_view_cursor += 1;
+            }
+            // スクロール追従（描画時に計算するので scroll_offset を更新）
+            adjust_grep_scroll(app);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.grep_view_cursor = app.grep_view_cursor.saturating_sub(1);
+            adjust_grep_scroll(app);
+        }
+        KeyCode::Enter => {
+            // 選択行のファイルを開く
+            if let Some((path, line)) =
+                ui::grep_view::location_at(&grep_rows, app.grep_view_cursor, &app.grep_results)
+            {
+                app.show_grep_results_view = false;
+                ui::main_panel::open_file_tab(app, path);
+                if let Some(wt) = app.selected_worktree_mut() {
+                    let file_index = wt.active_tab.saturating_sub(wt.claude_tabs);
+                    if let Some(file) = wt.open_files.get_mut(file_index) {
+                        let target = line.saturating_sub(1);
+                        if target < file.highlighted.len() {
+                            file.cursor_line = target;
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('y') => {
+            // path:line をクリップボードにコピー
+            if let Some(loc) = ui::grep_view::location_string_at(&grep_rows, app.grep_view_cursor)
+            {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(&loc);
+                    app.show_info(format!("コピー: {}", loc));
+                }
+            }
+        }
+        KeyCode::Char('s') => {
+            // path:line を Claude Code に送信
+            if let Some(loc) = ui::grep_view::location_string_at(&grep_rows, app.grep_view_cursor)
+            {
+                if let Some(wt_id) = app.selected_worktree {
+                    if let Some(emu) = claude_terms.get_mut(&(wt_id, 0)) {
+                        let msg = format!("{}\n", loc);
+                        if let Err(e) = emu.write(msg.as_bytes()) {
+                            app.show_error(format!("Claude への送信に失敗: {}", e));
+                        } else {
+                            app.show_info(format!("送信: {}", loc));
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('g') => {
+            // 再検索（grep ポップアップを開く）
+            app.show_grep_results_view = false;
+            app.show_grep_popup = true;
+            app.grep_results.clear();
+            app.grep_cursor = 0;
+        }
+        _ => {}
+    }
+}
+
+fn adjust_grep_scroll(app: &mut app::App) {
+    // 簡易スクロール追従: 概算の表示高さで調整
+    let visible = 20_usize; // 近似値、実際の描画時に再調整される
+    if app.grep_view_cursor >= app.grep_view_scroll + visible {
+        app.grep_view_scroll = app.grep_view_cursor - visible + 1;
+    }
+    if app.grep_view_cursor < app.grep_view_scroll {
+        app.grep_view_scroll = app.grep_view_cursor;
+    }
+}
+
+/// Grep ポップアップのキー処理
 fn handle_grep_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
     use crossterm::event::KeyCode;
 
@@ -1727,34 +1893,19 @@ fn handle_grep_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
             app.show_grep_popup = false;
         }
         KeyCode::Enter => {
-            if app.grep_results.is_empty() {
-                // 結果がない → 検索実行
-                app.run_grep();
-            } else {
-                // 結果あり → 選択中のファイルを開く
-                if let Some(result) = app.grep_results.get(app.grep_cursor).cloned() {
-                    app.show_grep_popup = false;
-                    ui::main_panel::open_file_tab(app, result.path);
-                    // 該当行にカーソルを移動
-                    if let Some(wt) = app.selected_worktree_mut() {
-                        let file_index = wt.active_tab.saturating_sub(wt.claude_tabs);
-                        if let Some(file) = wt.open_files.get_mut(file_index) {
-                            let target = result.line_number.saturating_sub(1); // 1-indexed → 0-indexed
-                            if target < file.highlighted.len() {
-                                file.cursor_line = target;
-                            }
-                        }
-                    }
+            // 検索を実行して結果を中央ペインに表示
+            app.run_grep();
+            if !app.grep_results.is_empty() {
+                app.show_grep_popup = false;
+                app.show_grep_results_view = true;
+                app.grep_view_cursor = 0;
+                app.grep_view_scroll = 0;
+                app.focused_panel = app::Panel::Main;
+                // Search タブに切り替え（claude_tabs の直後）
+                if let Some(wt) = app.selected_worktree_mut() {
+                    wt.active_tab = wt.claude_tabs;
                 }
             }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if !app.grep_results.is_empty() {
-                app.grep_cursor = (app.grep_cursor + 1).min(app.grep_results.len() - 1);
-            }
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.grep_cursor = app.grep_cursor.saturating_sub(1);
         }
         KeyCode::Backspace => {
             app.grep_input.pop();
@@ -2132,6 +2283,15 @@ fn handle_claude_terminal_key(
         } else {
             launch_claude(app, claude_terms, event_tx, wt_id);
         }
+        return;
+    }
+
+    // Ctrl+g で grep 検索を開く
+    if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.show_grep_popup = true;
+        app.grep_input.clear();
+        app.grep_results.clear();
+        app.grep_cursor = 0;
         return;
     }
 

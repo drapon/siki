@@ -270,6 +270,12 @@ pub struct App {
     pub claude_content_area: Option<Rect>,
     /// ターミナルペインのコンテンツ領域（レンダリング時に計算）
     pub terminal_content_area: Option<Rect>,
+    /// grep 検索結果を中央ペインに表示中か
+    pub show_grep_results_view: bool,
+    /// grep 結果ビューのカーソル位置
+    pub grep_view_cursor: usize,
+    /// grep 結果ビューのスクロールオフセット
+    pub grep_view_scroll: usize,
     pub running: bool,
 }
 
@@ -322,6 +328,9 @@ impl App {
             text_selection: None,
             claude_content_area: None,
             terminal_content_area: None,
+            show_grep_results_view: false,
+            grep_view_cursor: 0,
+            grep_view_scroll: 0,
             running: true,
         }
     }

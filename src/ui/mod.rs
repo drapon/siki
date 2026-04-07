@@ -1,4 +1,5 @@
 pub mod diff_view;
+pub mod grep_view;
 pub mod layout;
 pub mod left_panel;
 pub mod main_panel;
@@ -34,6 +35,7 @@ pub fn render(
     claude_screen: Option<&vt100::Screen>,
     siki_init_screen: Option<&vt100::Screen>,
     session_registry: Option<&SessionRegistry>,
+    grep_rows: &[grep_view::DisplayRow],
 ) -> layout::AppLayout {
     let areas = layout::compute_layout(frame.area());
 
@@ -47,6 +49,7 @@ pub fn render(
         app,
         app.focused_panel == Panel::Main,
         claude_screen,
+        grep_rows,
     );
 
     // 右パネル上部（SourceTree / DiffView）
@@ -379,100 +382,26 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
 }
 
 fn render_grep_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect(70, 60, frame.area());
+    let w = 50_u16.min(frame.area().width);
+    let h = 3_u16;
+    let x = (frame.area().width.saturating_sub(w)) / 2;
+    let y = (frame.area().height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Grep 検索")
+        .title("Search (Enter で検索)")
         .border_style(Style::default().fg(Color::Green));
 
     frame.render_widget(ratatui::widgets::Clear, area);
-    frame.render_widget(block.clone(), area);
 
-    let inner = block.inner(area);
-    let chunks = Layout::vertical([
-        Constraint::Length(1), // 入力行
-        Constraint::Length(1), // 区切り
-        Constraint::Min(0),    // 結果リスト
-    ])
-    .split(inner);
-
-    // 入力行
-    let input_text = if app.grep_results.is_empty() && !app.grep_input.is_empty() {
-        format!("grep: {}_ (Enter で検索)", app.grep_input)
-    } else if !app.grep_results.is_empty() {
-        format!(
-            "grep: {} [{}/{}]",
-            app.grep_input,
-            if app.grep_results.is_empty() {
-                0
-            } else {
-                app.grep_cursor + 1
-            },
-            app.grep_results.len()
-        )
-    } else {
-        format!("grep: {}_", app.grep_input)
-    };
+    let input_text = format!(" {}_", app.grep_input);
     frame.render_widget(
-        Paragraph::new(input_text).style(Style::default().fg(Color::Yellow)),
-        chunks[0],
+        Paragraph::new(input_text)
+            .block(block)
+            .style(Style::default().fg(Color::Yellow)),
+        area,
     );
-
-    // 区切り線
-    frame.render_widget(
-        Paragraph::new("─".repeat(chunks[1].width as usize))
-            .style(Style::default().fg(Color::DarkGray)),
-        chunks[1],
-    );
-
-    // 結果リスト
-    if app.grep_results.is_empty() {
-        if !app.grep_input.is_empty() {
-            frame.render_widget(
-                Paragraph::new("  (マッチなし)").style(Style::default().fg(Color::DarkGray)),
-                chunks[2],
-            );
-        }
-    } else {
-        let visible_height = chunks[2].height as usize;
-        // カーソルが見えるようにスクロール
-        let scroll = if app.grep_cursor >= visible_height {
-            app.grep_cursor - visible_height + 1
-        } else {
-            0
-        };
-
-        let lines: Vec<Line> = app
-            .grep_results
-            .iter()
-            .enumerate()
-            .skip(scroll)
-            .take(visible_height)
-            .map(|(i, result)| {
-                let is_selected = i == app.grep_cursor;
-                let path_str = result
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| result.path.display().to_string());
-                let text = format!(
-                    " {}:{} {}",
-                    path_str, result.line_number, result.line_content
-                );
-                if is_selected {
-                    Line::styled(
-                        text,
-                        Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 50)),
-                    )
-                } else {
-                    Line::styled(text, Style::default().fg(Color::White))
-                }
-            })
-            .collect();
-
-        frame.render_widget(Paragraph::new(lines), chunks[2]);
-    }
 }
 
 fn render_archive_confirm_popup(frame: &mut Frame, app: &App) {
