@@ -27,7 +27,7 @@ pub fn render_top(
                 RightPanelMode::Tree => 0,
                 RightPanelMode::Diff => 1,
             };
-            let tabs = Tabs::new(vec!["Tree", "Diff"])
+            let tabs = Tabs::new(vec!["Tree", "Changes"])
                 .select(active)
                 .highlight_style(
                     Style::default()

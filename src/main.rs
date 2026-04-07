@@ -2262,9 +2262,15 @@ fn handle_right_panel_key(
         }
         app::RightPanelMode::Diff => match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                diff_view.scroll_down();
+                diff_view.select_next();
             }
             KeyCode::Char('k') | KeyCode::Up => {
+                diff_view.select_prev();
+            }
+            KeyCode::Char('d') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                diff_view.scroll_down();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                 diff_view.scroll_up();
             }
             KeyCode::Char('t') => {
