@@ -297,9 +297,16 @@ fn render_rename_project_popup(frame: &mut Frame, app: &App) {
         .title(format!("表示名変更: {}", project_name))
         .border_style(Style::default().fg(Color::Yellow));
 
+    let len = app.rename_project_input.len();
+    let remaining = 100_usize.saturating_sub(len);
+    let counter = if remaining <= 20 {
+        format!(" ({}/100)", len)
+    } else {
+        String::new()
+    };
     let text = format!(
-        "\n  表示名: {}_\n\n  Enter: 確定  Esc: キャンセル\n  (空で確定すると元の名前に戻ります)",
-        app.rename_project_input,
+        "\n  表示名: {}_{}\n\n  Enter: 確定  Esc: キャンセル\n  (空で確定すると元の名前に戻ります)",
+        app.rename_project_input, counter,
     );
     let paragraph = Paragraph::new(text).block(block);
 

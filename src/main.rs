@@ -900,7 +900,7 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
             app.show_rename_project_popup = false;
             app.rename_project_input.clear();
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if app.rename_project_input.len() < 100 => {
             app.rename_project_input.push(c);
         }
         KeyCode::Backspace => {
