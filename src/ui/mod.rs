@@ -286,7 +286,11 @@ fn render_add_project_popup(frame: &mut Frame, app: &App) {
 fn render_rename_project_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 30, frame.area());
 
-    let project = match app.projects.get(app.rename_project_index) {
+    let project = match app
+        .rename_project_name
+        .as_deref()
+        .and_then(|name| app.projects.iter().find(|p| p.name == name))
+    {
         Some(p) => p,
         None => return, // プロジェクトが削除された場合は描画スキップ
     };

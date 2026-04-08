@@ -877,9 +877,12 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
         }
         KeyCode::Enter => {
             let input = app.rename_project_input.trim().to_string();
-            let pi = app.rename_project_index;
+            let target_name = app.rename_project_name.clone();
 
-            if let Some(project) = app.projects.get_mut(pi) {
+            if let Some(project) = target_name
+                .as_deref()
+                .and_then(|name| app.projects.iter_mut().find(|p| p.name == name))
+            {
                 let display_name = if input.is_empty() {
                     None
                 } else {
@@ -900,7 +903,7 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
             app.show_rename_project_popup = false;
             app.rename_project_input.clear();
         }
-        KeyCode::Char(c) if app.rename_project_input.chars().count() < 100 => {
+        KeyCode::Char(c) if !c.is_control() && app.rename_project_input.chars().count() < 100 => {
             app.rename_project_input.push(c);
         }
         KeyCode::Backspace => {
@@ -1443,7 +1446,7 @@ fn handle_left_panel_key(
                     .display_name
                     .clone()
                     .unwrap_or_default();
-                app.rename_project_index = pi;
+                app.rename_project_name = Some(app.projects[pi].name.clone());
                 app.rename_project_input = current_display;
                 app.show_rename_project_popup = true;
             }

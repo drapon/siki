@@ -266,7 +266,7 @@ pub struct App {
     /// プロジェクト表示名変更ポップアップ
     pub show_rename_project_popup: bool,
     pub rename_project_input: String,
-    pub rename_project_index: usize,
+    pub rename_project_name: Option<String>,
     /// テキスト選択状態（Claude / ターミナルペインのマウスドラッグ選択）
     pub text_selection: Option<TextSelection>,
     /// Claude ペインのコンテンツ領域（レンダリング時に計算）
@@ -324,7 +324,7 @@ impl App {
             session_choice_wt_id: None,
             show_rename_project_popup: false,
             rename_project_input: String::new(),
-            rename_project_index: 0,
+            rename_project_name: None,
             text_selection: None,
             claude_content_area: None,
             terminal_content_area: None,
