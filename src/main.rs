@@ -874,6 +874,7 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
         KeyCode::Esc => {
             app.show_rename_project_popup = false;
             app.rename_project_input.clear();
+            app.rename_project_name = None;
         }
         KeyCode::Enter => {
             let input = app.rename_project_input.trim().to_string();
@@ -902,6 +903,7 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
 
             app.show_rename_project_popup = false;
             app.rename_project_input.clear();
+            app.rename_project_name = None;
         }
         KeyCode::Char(c) if !c.is_control() && app.rename_project_input.chars().count() < 100 => {
             app.rename_project_input.push(c);
