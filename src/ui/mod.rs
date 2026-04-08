@@ -286,18 +286,18 @@ fn render_add_project_popup(frame: &mut Frame, app: &App) {
 fn render_rename_project_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 30, frame.area());
 
-    let project_name = app
-        .projects
-        .get(app.rename_project_index)
-        .map(|p| p.name.as_str())
-        .unwrap_or("???");
+    let project = match app.projects.get(app.rename_project_index) {
+        Some(p) => p,
+        None => return, // プロジェクトが削除された場合は描画スキップ
+    };
+    let project_name = project.name.as_str();
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!("表示名変更: {}", project_name))
         .border_style(Style::default().fg(Color::Yellow));
 
-    let len = app.rename_project_input.len();
+    let len = app.rename_project_input.chars().count();
     let remaining = 100_usize.saturating_sub(len);
     let counter = if remaining <= 20 {
         format!(" ({}/100)", len)
