@@ -929,6 +929,37 @@ async fn handle_event(
                                     }
                                 }
                             }
+                            Some(app::Panel::Terminal) => {
+                                if let Some(wt_id) = app.selected_worktree {
+                                    let active = app
+                                        .selected_worktree()
+                                        .map(|wt| wt.active_terminal)
+                                        .unwrap_or(0);
+                                    if let Some(emu) = terminals.get_mut(&(wt_id, active)) {
+                                        let mouse_mode = emu.screen().mouse_protocol_mode();
+                                        if mouse_mode != vt100::MouseProtocolMode::None {
+                                            let encoding = emu.screen().mouse_protocol_encoding();
+                                            let (col, row) = if let Some(ca) = app.terminal_content_area {
+                                                (
+                                                    mouse.column.saturating_sub(ca.x) + 1,
+                                                    mouse.row.saturating_sub(ca.y) + 1,
+                                                )
+                                            } else {
+                                                (1, 1)
+                                            };
+                                            let bytes = terminal::mouse_scroll_to_bytes(is_up, col, row, encoding);
+                                            let _ = emu.write(&bytes);
+                                        } else {
+                                            let current = emu.scrollback();
+                                            if is_up {
+                                                emu.set_scrollback(current.saturating_add(3));
+                                            } else {
+                                                emu.set_scrollback(current.saturating_sub(3));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1563,6 +1594,8 @@ fn handle_terminal_key(
     let bytes = terminal::key_to_bytes(&key);
     if !bytes.is_empty() {
         if let Some(emu) = terminals.get_mut(&(wt_id, active_tab)) {
+            // キー入力時はスクロールバックを最新に戻す
+            emu.set_scrollback(0);
             let _ = emu.write(&bytes);
         }
     }

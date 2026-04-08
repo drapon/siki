@@ -31,7 +31,7 @@ impl TerminalEmulator {
         worktree_id: WorktreeId,
         tab_index: usize,
     ) -> Result<Self> {
-        Self::spawn_internal(shell, &[], working_dir, size, event_tx, worktree_id, tab_index, &[], 0)
+        Self::spawn_internal(shell, &[], working_dir, size, event_tx, worktree_id, tab_index, &[], 5000)
     }
 
     /// 引数付きでコマンドを起動するターミナルエミュレータを作成する
