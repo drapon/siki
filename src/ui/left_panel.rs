@@ -114,7 +114,8 @@ impl LeftPanel {
                     ListEntry::Project { index } => {
                         let project = &app.projects[*index];
                         let arrow = if project.collapsed { "▸" } else { "▾" };
-                        let text = format!("{} {}", arrow, project.name);
+                        let display = project.display_name.as_deref().unwrap_or(&project.name);
+                        let text = format!("{} {}", arrow, display);
                         let mut style = Style::default().bold();
                         if is_cursor {
                             style = style.bg(Color::DarkGray);
@@ -207,6 +208,7 @@ mod tests {
         vec![
             Project {
                 name: "webapp".to_string(),
+                display_name: None,
                 path: PathBuf::from("/home/user/webapp"),
                 collapsed: false,
                 worktrees: vec![
@@ -246,6 +248,7 @@ mod tests {
             },
             Project {
                 name: "api".to_string(),
+                display_name: None,
                 path: PathBuf::from("/home/user/api"),
                 collapsed: false,
                 worktrees: vec![Worktree {
@@ -481,6 +484,7 @@ mod tests {
                 ProjectConfig {
                     name: "webapp".to_string(),
                     path: "/tmp/webapp".to_string(),
+                    display_name: None,
                     worktrees: vec![WorktreeConfig {
                         name: "wt1".to_string(),
                         branch: "main".to_string(),
@@ -516,6 +520,7 @@ mod tests {
             projects: vec![ProjectConfig {
                 name: "webapp".to_string(),
                 path: "/tmp/webapp".to_string(),
+                display_name: None,
                 worktrees: vec![WorktreeConfig {
                     name: "wt1".to_string(),
                     branch: "main".to_string(),
