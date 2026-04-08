@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
                 frame,
                 &mut app,
                 &left_panel,
-                &source_tree,
+                &mut source_tree,
                 &diff_view,
                 terminal_screen,
                 terminal_tab_info.as_ref(),
@@ -558,6 +558,24 @@ async fn handle_event(
                                 active: true,
                                 panel: selection::SelectionPanel::Terminal,
                             });
+                        } else if hit_panel == Some(app::Panel::Right) {
+                            app.text_selection = None;
+                            // Treeモードならクリックでアイテム選択・ディレクトリ開閉
+                            let mode = app
+                                .selected_worktree()
+                                .map(|wt| wt.right_panel_mode)
+                                .unwrap_or(app::RightPanelMode::Tree);
+                            if mode == app::RightPanelMode::Tree {
+                                let area = layout.right_top;
+                                if source_tree.click_at(area, mouse.row) {
+                                    // ファイルクリック時はファイルを開く
+                                    if !source_tree.current_is_dir() {
+                                        if let Some(path) = source_tree.current_file_path() {
+                                            ui::main_panel::open_file_tab(app, path);
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             app.text_selection = None;
                         }

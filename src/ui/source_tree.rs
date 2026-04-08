@@ -26,6 +26,8 @@ pub struct SourceTree {
     pub search_matches: Vec<usize>,
     /// 現在のマッチ位置
     pub search_match_idx: usize,
+    /// リストの表示状態（スクロールオフセット管理）
+    list_state: ListState,
 }
 
 impl SourceTree {
@@ -38,6 +40,7 @@ impl SourceTree {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            list_state: ListState::default(),
         }
     }
 
@@ -311,8 +314,45 @@ impl SourceTree {
         }
     }
 
+    /// マウスクリック時にクリック位置のアイテムを選択する
+    /// area: Treeペインの描画領域（ボーダー含む）
+    /// row: マウスのスクリーン上の行位置
+    /// 戻り値: クリックでアイテムが選択された場合 true
+    pub fn click_at(&mut self, area: Rect, row: u16) -> bool {
+        // 検索モード中はクリック無効（表示レイアウトが異なるため）
+        if self.search_active {
+            return false;
+        }
+
+        // ボーダー分を除いたコンテンツ領域の開始行
+        let content_y = area.y + 1;
+        let content_height = area.height.saturating_sub(2); // 上下ボーダー分
+
+        if row < content_y || row >= content_y + content_height {
+            return false;
+        }
+
+        let row_in_content = (row - content_y) as usize;
+        let offset = self.list_state.offset();
+        let clicked_index = offset + row_in_content;
+
+        let visible = self.visible_entries();
+        if clicked_index < visible.len() {
+            self.cursor_index = clicked_index;
+            // ディレクトリならトグル
+            if let Some(&idx) = visible.get(clicked_index) {
+                if self.entries[idx].is_dir {
+                    self.toggle();
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// 描画
-    pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
         } else {
@@ -375,9 +415,8 @@ impl SourceTree {
                 .position(|&i| i == self.cursor_index);
 
             let list = List::new(items);
-            let mut list_state = ListState::default();
-            list_state.select(selected_pos);
-            frame.render_stateful_widget(list, chunks[1], &mut list_state);
+            self.list_state.select(selected_pos);
+            frame.render_stateful_widget(list, chunks[1], &mut self.list_state);
         } else {
             // 通常モード
             let items: Vec<ListItem> = self
@@ -418,10 +457,9 @@ impl SourceTree {
                 .border_style(border_style);
 
             let list = List::new(items).block(block);
-            let mut list_state = ListState::default();
-            list_state.select(Some(self.cursor_index));
+            self.list_state.select(Some(self.cursor_index));
 
-            frame.render_stateful_widget(list, area, &mut list_state);
+            frame.render_stateful_widget(list, area, &mut self.list_state);
         }
     }
 }

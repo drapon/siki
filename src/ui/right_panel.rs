@@ -10,7 +10,7 @@ pub fn render_top(
     frame: &mut Frame,
     area: Rect,
     app: &App,
-    source_tree: &SourceTree,
+    source_tree: &mut SourceTree,
     diff_view: &DiffView,
     focused: bool,
 ) {
