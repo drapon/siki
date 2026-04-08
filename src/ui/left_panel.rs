@@ -153,7 +153,8 @@ impl LeftPanel {
                         };
 
                         let prefix = format!("  {} ", branch_char);
-                        let name_part = format!(" {} ", wt.name);
+                        let display = wt.display_name.as_deref().unwrap_or(&wt.name);
+                        let name_part = format!(" {} ", display);
                         let branch_part = format!(" {}", wt.branch);
                         let mut spans = vec![
                             Span::styled(prefix, Style::default().fg(name_fg)),
@@ -214,6 +215,7 @@ mod tests {
                 worktrees: vec![
                     Worktree {
                         name: "feature-auth".to_string(),
+                        display_name: None,
                         branch: "feature/auth".to_string(),
                         path: PathBuf::from("/tmp/wt1"),
                         status: WorktreeStatus::Running,
@@ -230,6 +232,7 @@ mod tests {
                     },
                     Worktree {
                         name: "fix-bug".to_string(),
+                        display_name: None,
                         branch: "fix/bug-123".to_string(),
                         path: PathBuf::from("/tmp/wt2"),
                         status: WorktreeStatus::Idle,
@@ -253,6 +256,7 @@ mod tests {
                 collapsed: false,
                 worktrees: vec![Worktree {
                     name: "refactor".to_string(),
+                    display_name: None,
                     branch: "refactor/db".to_string(),
                     path: PathBuf::from("/tmp/wt3"),
                     status: WorktreeStatus::Done,

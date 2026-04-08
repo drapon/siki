@@ -306,11 +306,19 @@ fn render_rename_project_popup(frame: &mut Frame, app: &App) {
         Some(p) => p,
         None => return, // プロジェクトが削除された場合は描画スキップ
     };
-    let project_name = project.name.as_str();
+    let title = if let Some((pi, wi)) = app.rename_worktree_target {
+        let wt_name = app.projects.get(pi)
+            .and_then(|p| p.worktrees.get(wi))
+            .map(|wt| wt.name.as_str())
+            .unwrap_or("?");
+        format!("worktree 表示名変更: {}", wt_name)
+    } else {
+        format!("表示名変更: {}", project.name)
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("表示名変更: {}", project_name))
+        .title(title)
         .border_style(Style::default().fg(Color::Yellow));
 
     let len = app.rename_project_input.chars().count();

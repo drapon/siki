@@ -192,6 +192,7 @@ impl AddWorktreeMode {
 #[derive(Debug)]
 pub struct Worktree {
     pub name: String,
+    pub display_name: Option<String>,
     pub branch: String,
     pub path: PathBuf,
     pub status: WorktreeStatus,
@@ -269,6 +270,8 @@ pub struct App {
     pub show_rename_project_popup: bool,
     pub rename_project_input: String,
     pub rename_project_name: Option<String>,
+    /// worktree リネーム対象 (project_index, worktree_index)
+    pub rename_worktree_target: Option<(usize, usize)>,
     /// テキスト選択状態（Claude / ターミナルペインのマウスドラッグ選択）
     pub text_selection: Option<TextSelection>,
     /// Claude ペインのコンテンツ領域（レンダリング時に計算）
@@ -335,6 +338,7 @@ impl App {
             show_rename_project_popup: false,
             rename_project_input: String::new(),
             rename_project_name: None,
+            rename_worktree_target: None,
             text_selection: None,
             claude_content_area: None,
             terminal_content_area: None,
@@ -557,8 +561,12 @@ impl Project {
         let worktrees = pc
             .worktrees
             .iter()
-            .map(|wc| Worktree {
+            .map(|wc| {
+                let display_name = config::load_worktree_meta(&pc.name, &wc.name)
+                    .and_then(|m| m.display_name);
+                Worktree {
                 name: wc.name.clone(),
+                display_name,
                 branch: wc.branch.clone(),
                 path: config::worktree_path(&pc.name, &wc.name),
                 status: WorktreeStatus::Idle,
@@ -572,7 +580,7 @@ impl Project {
                 claude_scroll_offsets: HashMap::new(),
                 pr_title: None,
                 claude_session_id: None,
-            })
+            }})
             .collect();
 
         Self {

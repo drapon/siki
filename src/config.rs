@@ -253,6 +253,48 @@ pub fn save_project_display_name(project_name: &str, display_name: Option<&str>)
     Ok(())
 }
 
+/// worktree メタデータ
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WorktreeMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// worktree.json のパスを返す
+pub fn worktree_meta_path(project_name: &str, worktree_name: &str) -> PathBuf {
+    workspaces_dir()
+        .join(project_name)
+        .join(worktree_name)
+        .join("worktree.json")
+}
+
+/// worktree.json を読み込む
+pub fn load_worktree_meta(project_name: &str, worktree_name: &str) -> Option<WorktreeMeta> {
+    let path = worktree_meta_path(project_name, worktree_name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// worktree.json の display_name を更新する
+pub fn save_worktree_display_name(
+    project_name: &str,
+    worktree_name: &str,
+    display_name: Option<&str>,
+) -> Result<()> {
+    let meta = WorktreeMeta {
+        display_name: display_name.map(|s| s.to_string()),
+    };
+    let dir = workspaces_dir().join(project_name).join(worktree_name);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("worktree ディレクトリの作成に失敗: {}", dir.display()))?;
+    let content =
+        serde_json::to_string_pretty(&meta).context("worktree.json のシリアライズに失敗")?;
+    let path = worktree_meta_path(project_name, worktree_name);
+    std::fs::write(&path, content)
+        .with_context(|| format!("worktree.json の保存に失敗: {}", path.display()))?;
+    Ok(())
+}
+
 /// プロジェクトディレクトリ（project.json 含む）を削除する
 pub fn remove_project_meta(project_name: &str) -> Result<()> {
     let dir = workspaces_dir().join(project_name);

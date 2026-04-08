@@ -1146,24 +1146,36 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
             app.show_rename_project_popup = false;
             app.rename_project_input.clear();
             app.rename_project_name = None;
+            app.rename_worktree_target = None;
         }
         KeyCode::Enter => {
             let input = app.rename_project_input.trim().to_string();
-            let target_name = app.rename_project_name.clone();
+            let display_name = if input.is_empty() { None } else { Some(input) };
 
-            if let Some(project) = target_name
+            if let Some((pi, wi)) = app.rename_worktree_target {
+                // worktree リネーム
+                let names = app.projects.get(pi).map(|p| {
+                    let wt_name = p.worktrees.get(wi).map(|wt| wt.name.clone());
+                    (p.name.clone(), wt_name)
+                });
+                if let Some((project_name, Some(wt_name))) = names {
+                    if let Some(wt) = app.projects[pi].worktrees.get_mut(wi) {
+                        wt.display_name = display_name.clone();
+                    }
+                    if let Err(e) = config::save_worktree_display_name(
+                        &project_name,
+                        &wt_name,
+                        display_name.as_deref(),
+                    ) {
+                        app.show_error(format!("表示名の保存に失敗: {}", e));
+                    }
+                }
+            } else if let Some(project) = app.rename_project_name
                 .as_deref()
                 .and_then(|name| app.projects.iter_mut().find(|p| p.name == name))
             {
-                let display_name = if input.is_empty() {
-                    None
-                } else {
-                    Some(input)
-                };
-
+                // プロジェクトリネーム
                 project.display_name = display_name.clone();
-
-                // project.json に永続化
                 if let Err(e) = config::save_project_display_name(
                     &project.name,
                     display_name.as_deref(),
@@ -1175,6 +1187,7 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
             app.show_rename_project_popup = false;
             app.rename_project_input.clear();
             app.rename_project_name = None;
+            app.rename_worktree_target = None;
         }
         KeyCode::Char(c) if !c.is_control() && app.rename_project_input.chars().count() < 100 => {
             app.rename_project_input.push(c);
@@ -1352,6 +1365,7 @@ fn finalize_add_worktree(
     // メモリ上に worktree を追加
     app.projects[pi].worktrees.push(app::Worktree {
         name: wt_name.clone(),
+        display_name: None,
         branch: branch.to_string(),
         path: wt_path.clone(),
         status: app::WorktreeStatus::Idle,
@@ -1860,18 +1874,32 @@ fn handle_left_panel_key(
             }
         }
         KeyCode::Char('R') => {
-            // プロジェクト行にカーソルがある場合のみ表示名変更ポップアップを開く
-            if let Some(ui::left_panel::ListEntry::Project { index }) =
-                left_panel.current_entry(&entries)
-            {
-                let pi = *index;
-                let current_display = app.projects[pi]
-                    .display_name
-                    .clone()
-                    .unwrap_or_default();
-                app.rename_project_name = Some(app.projects[pi].name.clone());
-                app.rename_project_input = current_display;
-                app.show_rename_project_popup = true;
+            // 表示名変更ポップアップを開く（プロジェクト行 or worktree 行）
+            match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => {
+                    let pi = *index;
+                    let current_display = app.projects[pi]
+                        .display_name
+                        .clone()
+                        .unwrap_or_default();
+                    app.rename_project_name = Some(app.projects[pi].name.clone());
+                    app.rename_worktree_target = None;
+                    app.rename_project_input = current_display;
+                    app.show_rename_project_popup = true;
+                }
+                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) => {
+                    let pi = *project_index;
+                    let wi = *worktree_index;
+                    let current_display = app.projects[pi].worktrees[wi]
+                        .display_name
+                        .clone()
+                        .unwrap_or_default();
+                    app.rename_project_name = Some(app.projects[pi].name.clone());
+                    app.rename_worktree_target = Some((pi, wi));
+                    app.rename_project_input = current_display;
+                    app.show_rename_project_popup = true;
+                }
+                None => {}
             }
         }
         KeyCode::Char('A') => {
