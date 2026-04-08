@@ -24,6 +24,15 @@ pub struct TerminalTabInfo {
     pub active: usize,
 }
 
+/// ターミナルタイトルのプレフィックス
+/// 対応する描画: render_terminal() 内の format!("Terminal {}", tabs_str)
+pub const TERMINAL_TITLE_PREFIX: &str = "Terminal ";
+/// 各タブの表示幅
+/// 対応する描画: render_terminal() 内の format!("[{}]", i + 1) / format!(" {} ", i + 1)
+pub const TERMINAL_TAB_WIDTH: usize = 3;
+/// ターミナルタブの最大数
+pub const MAX_TERMINAL_TABS: usize = 5;
+
 pub fn render(
     frame: &mut Frame,
     app: &mut App,

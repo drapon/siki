@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
 
             let screen = terminals.get(&(wt_id, active)).map(|emu| emu.screen());
 
-            let tabs: Vec<usize> = (0..5)
+            let tabs: Vec<usize> = (0..ui::MAX_TERMINAL_TABS)
                 .filter(|i| terminals.contains_key(&(wt_id, *i)))
                 .collect();
 
@@ -618,6 +618,14 @@ async fn handle_event(
                             app.focused_panel = panel;
                         }
                         let hit_panel = layout.hit_test(mouse.column, mouse.row);
+                        // ターミナルタブのクリック → タブ切替
+                        if hit_panel == Some(app::Panel::Terminal)
+                            && mouse.row == layout.right_bottom.y
+                        {
+                            handle_terminal_tab_click(
+                                app, terminals, layout.right_bottom, mouse.column,
+                            );
+                        }
                         // Search タブでのクリック → カーソル移動
                         if app.show_grep_results_view
                             && hit_panel == Some(app::Panel::Main)
@@ -1368,9 +1376,23 @@ fn handle_terminal_key(
             }
             return;
         }
-        // Ctrl+t で新規タブ（最大5つ）
+        // Ctrl+] で次のタブへ循環切替
+        // 注: Ctrl+[ は ESC と同じバイトシーケンスのため使用不可
+        if key.code == KeyCode::Char(']') {
+            let existing = existing_terminal_tabs(terminals, wt_id);
+            if existing.len() > 1 {
+                if let Some(cur_pos) = existing.iter().position(|&t| t == active_tab) {
+                    let next_pos = (cur_pos + 1) % existing.len();
+                    if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                        wt.active_terminal = existing[next_pos];
+                    }
+                }
+            }
+            return;
+        }
+        // Ctrl+t で新規タブ
         if key.code == KeyCode::Char('t') {
-            let next_tab = (0..5).find(|i| !terminals.contains_key(&(wt_id, *i)));
+            let next_tab = (0..ui::MAX_TERMINAL_TABS).find(|i| !terminals.contains_key(&(wt_id, *i)));
             if let Some(tab) = next_tab {
                 spawn_terminal(app, terminals, event_tx, shell, wt_id, tab);
                 if let Some(wt) = app.worktree_by_id_mut(wt_id) {
@@ -1386,6 +1408,45 @@ fn handle_terminal_key(
     if !bytes.is_empty() {
         if let Some(emu) = terminals.get_mut(&(wt_id, active_tab)) {
             let _ = emu.write(&bytes);
+        }
+    }
+}
+
+/// 指定 worktree に存在するターミナルタブのインデックス一覧を返す
+fn existing_terminal_tabs(
+    terminals: &HashMap<TerminalKey, terminal::TerminalEmulator>,
+    wt_id: app::WorktreeId,
+) -> Vec<usize> {
+    (0..ui::MAX_TERMINAL_TABS)
+        .filter(|i| terminals.contains_key(&(wt_id, *i)))
+        .collect()
+}
+
+/// ターミナルタイトルバーのタブクリックを処理する
+fn handle_terminal_tab_click(
+    app: &mut app::App,
+    terminals: &HashMap<TerminalKey, terminal::TerminalEmulator>,
+    term_area: ratatui::prelude::Rect,
+    click_x: u16,
+) {
+    let Some(wt_id) = app.selected_worktree else {
+        return;
+    };
+    let existing = existing_terminal_tabs(terminals, wt_id);
+    if existing.is_empty() {
+        return;
+    }
+    // ボーダー左端(1) + プレフィックス からタブ部分開始
+    let tabs_start_x = term_area.x + 1 + ui::TERMINAL_TITLE_PREFIX.len() as u16;
+    let tabs_end_x = tabs_start_x + (existing.len() as u16 * ui::TERMINAL_TAB_WIDTH as u16);
+    if click_x < tabs_start_x || click_x >= tabs_end_x {
+        return;
+    }
+    let offset = (click_x - tabs_start_x) as usize;
+    let tab_index = offset / ui::TERMINAL_TAB_WIDTH;
+    if let Some(&target_tab) = existing.get(tab_index) {
+        if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+            wt.active_terminal = target_tab;
         }
     }
 }
