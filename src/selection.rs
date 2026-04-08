@@ -12,6 +12,7 @@ pub struct TermPos {
 pub enum SelectionPanel {
     Claude,
     Terminal,
+    File,
 }
 
 /// テキスト選択状態

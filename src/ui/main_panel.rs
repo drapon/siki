@@ -56,9 +56,11 @@ pub fn render(
     if Some(active_tab) == search_tab_index {
         // Search タブ
         app.claude_content_area = None;
+        app.file_content_area = None;
         grep_view::render(frame, chunks[2], app, grep_rows, focused);
     } else if active_tab < claude_tabs {
         // Claude タブ
+        app.file_content_area = None;
         if let Some(screen) = claude_screen {
             render_claude_terminal(frame, chunks[2], screen, focused, app);
         } else {
@@ -75,10 +77,22 @@ pub fn render(
         app.claude_content_area = None;
         let file_offset = if has_search { claude_tabs + 1 } else { claude_tabs };
         let file_index = active_tab - file_offset;
+        let file_sel = app.text_selection.as_ref().and_then(|s| {
+            if s.panel == crate::selection::SelectionPanel::File {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
         if let Some(wt) = app.selected_worktree_mut() {
             if let Some(file) = wt.open_files.get_mut(file_index) {
-                render_file(frame, chunks[2], file, focused);
+                let content_rect = render_file(frame, chunks[2], file, focused, file_sel.as_ref());
+                app.file_content_area = Some(content_rect);
+            } else {
+                app.file_content_area = None;
             }
+        } else {
+            app.file_content_area = None;
         }
     }
 }
@@ -124,26 +138,7 @@ fn render_tab_bar(
     has_search: bool,
     focused: bool,
 ) {
-    let mut titles: Vec<String> = (0..claude_tabs)
-        .map(|i| {
-            if claude_tabs == 1 {
-                "Claude".to_string()
-            } else {
-                format!("Claude {}", i + 1)
-            }
-        })
-        .collect();
-    if has_search {
-        titles.push("Search".to_string());
-    }
-    for f in open_files {
-        let name = f
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "?".to_string());
-        titles.push(name);
-    }
+    let titles = build_tab_titles(claude_tabs, open_files, has_search);
 
     let tabs = Tabs::new(titles)
         .select(active_tab)
@@ -226,7 +221,14 @@ fn render_claude_terminal(
 }
 
 /// ファイル内容をシンタックスハイライト付きで描画（キャッシュ済みデータを使用）
-fn render_file(frame: &mut Frame, area: Rect, file: &mut OpenFile, focused: bool) {
+/// ファイルを描画し、コンテンツ領域の Rect を返す
+fn render_file(
+    frame: &mut Frame,
+    area: Rect,
+    file: &mut OpenFile,
+    focused: bool,
+    selection: Option<&crate::selection::TextSelection>,
+) -> Rect {
     let filename = file
         .path
         .file_name()
@@ -308,6 +310,22 @@ fn render_file(frame: &mut Frame, area: Rect, file: &mut OpenFile, focused: bool
         .get(file.search_match_idx)
         .copied();
 
+    // 選択範囲を正規化 (ファイル行に変換)
+    let sel_range = selection.and_then(|sel| {
+        if sel.is_empty() {
+            return None;
+        }
+        let (s, e) = sel.normalize();
+        Some((
+            file.scroll_offset + s.row as usize,
+            s.col,
+            file.scroll_offset + e.row as usize,
+            e.col,
+        ))
+    });
+
+    const LINE_NUM_WIDTH: u16 = 5;
+
     let lines: Vec<Line> = file
         .highlighted
         .iter()
@@ -316,6 +334,11 @@ fn render_file(frame: &mut Frame, area: Rect, file: &mut OpenFile, focused: bool
             let is_cursor_line = i == file.cursor_line;
             let is_current_match = current_match_line == Some(i);
             let is_other_match = !is_current_match && match_set.contains(&i);
+
+            // この行が選択範囲内かどうか
+            let in_selection = sel_range
+                .map(|(sr, _, er, _)| i >= sr && i <= er)
+                .unwrap_or(false);
 
             let line_num_style = if is_cursor_line {
                 Style::default().fg(Color::Yellow)
@@ -331,6 +354,49 @@ fn render_file(frame: &mut Frame, area: Rect, file: &mut OpenFile, focused: bool
                 format!("{:4} ", i + 1),
                 line_num_style,
             )];
+
+            if in_selection {
+                let (sr, sc, er, ec) = sel_range.unwrap();
+                // この行での選択開始/終了カラム (テキスト内の文字位置)
+                let sel_start = if i == sr { sc.saturating_sub(LINE_NUM_WIDTH) as usize } else { 0 };
+                let sel_end = if i == er { ec.saturating_sub(LINE_NUM_WIDTH) as usize + 1 } else { usize::MAX };
+
+                let mut col: usize = 0;
+                for (r, g, b, text) in spans {
+                    let span_end = col + text.len();
+                    if span_end <= sel_start || col >= sel_end {
+                        // 選択範囲外
+                        let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
+                        if is_cursor_line {
+                            style = style.bg(Color::Rgb(40, 40, 50));
+                        }
+                        line_spans.push(Span::styled(text.clone(), style));
+                    } else {
+                        // 部分的 or 全体が選択範囲内
+                        let start_in_span = sel_start.saturating_sub(col);
+                        let end_in_span = sel_end.saturating_sub(col).min(text.len());
+
+                        // 選択前の部分
+                        if start_in_span > 0 {
+                            let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
+                            if is_cursor_line { style = style.bg(Color::Rgb(40, 40, 50)); }
+                            line_spans.push(Span::styled(text[..start_in_span].to_string(), style));
+                        }
+                        // 選択部分
+                        let sel_style = Style::default()
+                            .fg(Color::Rgb(*r, *g, *b))
+                            .bg(Color::Rgb(60, 60, 100));
+                        line_spans.push(Span::styled(text[start_in_span..end_in_span].to_string(), sel_style));
+                        // 選択後の部分
+                        if end_in_span < text.len() {
+                            let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
+                            if is_cursor_line { style = style.bg(Color::Rgb(40, 40, 50)); }
+                            line_spans.push(Span::styled(text[end_in_span..].to_string(), style));
+                        }
+                    }
+                    col = span_end;
+                }
+            } else {
             for (r, g, b, text) in spans {
                 let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
                 if is_cursor_line {
@@ -342,6 +408,7 @@ fn render_file(frame: &mut Frame, area: Rect, file: &mut OpenFile, focused: bool
                 }
                 line_spans.push(Span::styled(text.clone(), style));
             }
+            }
             Line::from(line_spans)
         })
         .collect();
@@ -350,6 +417,7 @@ fn render_file(frame: &mut Frame, area: Rect, file: &mut OpenFile, focused: bool
         .scroll((file.scroll_offset as u16, 0));
 
     frame.render_widget(paragraph, content_area);
+    content_area
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
@@ -361,6 +429,48 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
         } else {
             Style::default().fg(Color::DarkGray)
         })
+}
+
+/// タブバーのクリック位置からタブインデックスを返す
+pub fn tab_index_at(app: &App, area_x: u16, click_x: u16) -> Option<usize> {
+    let wt = app.selected_worktree()?;
+    let titles = build_tab_titles(wt.claude_tabs, &wt.open_files, app.show_grep_results_view);
+    let rel_x = click_x.saturating_sub(area_x) as usize;
+    let mut pos: usize = 0;
+    for (i, title) in titles.iter().enumerate() {
+        let end = pos + title.len();
+        if rel_x >= pos && rel_x < end {
+            return Some(i);
+        }
+        // divider "|" = 1文字
+        pos = end + 1;
+    }
+    None
+}
+
+/// タブタイトル一覧を構築する (render_tab_bar と共通ロジック)
+fn build_tab_titles(claude_tabs: usize, open_files: &[OpenFile], has_search: bool) -> Vec<String> {
+    let mut titles: Vec<String> = (0..claude_tabs)
+        .map(|i| {
+            if claude_tabs == 1 {
+                "Claude".to_string()
+            } else {
+                format!("Claude {}", i + 1)
+            }
+        })
+        .collect();
+    if has_search {
+        titles.push("Search".to_string());
+    }
+    for f in open_files {
+        let name = f
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "?".to_string());
+        titles.push(name);
+    }
+    titles
 }
 
 /// タブ切替のロジック
@@ -553,6 +663,39 @@ pub fn file_next_match(app: &mut App) {
 pub fn file_prev_match(app: &mut App) {
     with_current_file_mut(app, |f| f.prev_match());
 }
+
+/// ファイルビューのコンテンツ領域でクリックした行にカーソルを移動する
+pub fn click_file_line(app: &mut App, main_area: Rect, click_row: u16) {
+    // main 領域の上部: ヘッダー(1) + タブバー(2) + ボーダー(1) = 4行
+    let base_top = main_area.y + 4;
+    // 検索バーの有無で追加オフセット
+    let has_search_bar = {
+        let wt = match app.selected_worktree() {
+            Some(wt) => wt,
+            None => return,
+        };
+        let file_index = match file_tab_index(app, wt.active_tab, wt.claude_tabs) {
+            Some(i) => i,
+            None => return,
+        };
+        match wt.open_files.get(file_index) {
+            Some(f) => f.search_active || !f.search_matches.is_empty(),
+            None => return,
+        }
+    };
+    let content_top = if has_search_bar { base_top + 1 } else { base_top };
+    if click_row < content_top {
+        return;
+    }
+    let clicked_row = (click_row - content_top) as usize;
+    with_current_file_mut(app, |file| {
+        let target = file.scroll_offset + clicked_row;
+        if target < file.highlighted.len() {
+            file.cursor_line = target;
+        }
+    });
+}
+
 
 /// 現在開いているファイルのパス:行番号を返す（1-indexed）
 pub fn current_file_location(app: &App) -> Option<String> {

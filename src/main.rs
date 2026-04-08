@@ -630,6 +630,24 @@ async fn handle_event(
                                 app, terminals, layout.right_bottom, mouse.column,
                             );
                         }
+                        // 中央ペインのタブバークリック → タブ切替
+                        if hit_panel == Some(app::Panel::Main)
+                            && mouse.row == layout.main.y + 1
+                        {
+                            let clicked_tab = ui::main_panel::tab_index_at(
+                                app, layout.main.x, mouse.column,
+                            );
+                            if let Some(idx) = clicked_tab {
+                                let has_search = app.show_grep_results_view;
+                                if let Some(wt) = app.selected_worktree_mut() {
+                                    let search_count = if has_search { 1 } else { 0 };
+                                    let tab_count = wt.claude_tabs + search_count + wt.open_files.len();
+                                    if idx < tab_count {
+                                        wt.active_tab = idx;
+                                    }
+                                }
+                            }
+                        }
                         // Search タブでのクリック → カーソル移動
                         if app.show_grep_results_view
                             && hit_panel == Some(app::Panel::Main)
@@ -650,8 +668,34 @@ async fn handle_event(
                                 }
                             }
                         }
+                        // ファイルタブのコンテンツ領域でクリック → カーソル移動 + 選択開始
+                        let mut file_selection_started = false;
+                        if hit_panel == Some(app::Panel::Main)
+                            && mouse.row > layout.main.y + 1
+                            && app.file_content_area.is_some()
+                        {
+                            let on_file_tab = app
+                                .selected_worktree()
+                                .map(|wt| {
+                                    let search_offset = if app.show_grep_results_view { 1 } else { 0 };
+                                    wt.active_tab >= wt.claude_tabs + search_offset
+                                })
+                                .unwrap_or(false);
+                            if on_file_tab {
+                                ui::main_panel::click_file_line(app, layout.main, mouse.row);
+                                let content_area = app.file_content_area.unwrap();
+                                let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
+                                app.text_selection = Some(selection::TextSelection {
+                                    anchor: pos,
+                                    current: pos,
+                                    active: true,
+                                    panel: selection::SelectionPanel::File,
+                                });
+                                file_selection_started = true;
+                            }
+                        }
                         // Claude ペインのコンテンツ領域でクリック → 選択開始
-                        let on_claude_tab = app
+                        let on_claude_tab = !file_selection_started && app
                             .selected_worktree()
                             .map(|wt| wt.active_tab < wt.claude_tabs)
                             .unwrap_or(false);
@@ -680,23 +724,33 @@ async fn handle_event(
                             });
                         } else if hit_panel == Some(app::Panel::Right) {
                             app.text_selection = None;
-                            // Treeモードならクリックでアイテム選択・ディレクトリ開閉
-                            let mode = app
-                                .selected_worktree()
-                                .map(|wt| wt.right_panel_mode)
-                                .unwrap_or(app::RightPanelMode::Tree);
-                            if mode == app::RightPanelMode::Tree {
-                                let area = layout.right_top;
-                                if source_tree.click_at(area, mouse.row) {
-                                    // ファイルクリック時はファイルを開く
-                                    if !source_tree.current_is_dir() {
-                                        if let Some(path) = source_tree.current_file_path() {
-                                            ui::main_panel::open_file_tab(app, path);
+                            // タブバー行のクリック → Tree/Changes 切替
+                            if mouse.row == layout.right_top.y {
+                                handle_right_panel_tab_click(
+                                    app, diff_view, layout.right_top, mouse.column,
+                                );
+                            } else {
+                                // Treeモードならクリックでアイテム選択・ディレクトリ開閉
+                                let mode = app
+                                    .selected_worktree()
+                                    .map(|wt| wt.right_panel_mode)
+                                    .unwrap_or(app::RightPanelMode::Tree);
+                                if mode == app::RightPanelMode::Tree {
+                                    // タブバー (1行) 分を除いた領域を渡す
+                                    let mut area = layout.right_top;
+                                    area.y += 1;
+                                    area.height = area.height.saturating_sub(1);
+                                    if source_tree.click_at(area, mouse.row) {
+                                        // ファイルクリック時はファイルを開く
+                                        if !source_tree.current_is_dir() {
+                                            if let Some(path) = source_tree.current_file_path() {
+                                                ui::main_panel::open_file_tab(app, path);
+                                            }
                                         }
                                     }
                                 }
                             }
-                        } else {
+                        } else if !file_selection_started {
                             app.text_selection = None;
                         }
                     }
@@ -707,6 +761,7 @@ async fn handle_event(
                             let content_area = match sel.panel {
                                 selection::SelectionPanel::Claude => app.claude_content_area,
                                 selection::SelectionPanel::Terminal => app.terminal_content_area,
+                                selection::SelectionPanel::File => app.file_content_area,
                             };
                             if let Some(ref area) = content_area {
                                 sel.current = selection::screen_to_term(mouse.column, mouse.row, area);
@@ -726,21 +781,37 @@ async fn handle_event(
                     }
                     if let Some((true, (start, end), panel)) = sel_info {
                         if let Some(wt_id) = app.selected_worktree {
-                            let screen = match panel {
-                                selection::SelectionPanel::Claude => {
-                                    let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_tab).unwrap_or(0);
-                                    claude_terms.get(&(wt_id, tab)).map(|emu| emu.screen())
+                            match panel {
+                                selection::SelectionPanel::File => {
+                                    // ファイルビューからテキスト抽出
+                                    let text = extract_file_selection(app, &start, &end);
+                                    if let Some(text) = text {
+                                        if !text.is_empty() {
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                let _ = clipboard.set_text(text);
+                                            }
+                                        }
+                                    }
                                 }
-                                selection::SelectionPanel::Terminal => {
-                                    let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_terminal).unwrap_or(0);
-                                    terminals.get(&(wt_id, tab)).map(|emu| emu.screen())
-                                }
-                            };
-                            if let Some(screen) = screen {
-                                let text = selection::extract_text(screen, &start, &end);
-                                if !text.is_empty() {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        let _ = clipboard.set_text(text);
+                                _ => {
+                                    let screen = match panel {
+                                        selection::SelectionPanel::Claude => {
+                                            let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_tab).unwrap_or(0);
+                                            claude_terms.get(&(wt_id, tab)).map(|emu| emu.screen())
+                                        }
+                                        selection::SelectionPanel::Terminal => {
+                                            let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_terminal).unwrap_or(0);
+                                            terminals.get(&(wt_id, tab)).map(|emu| emu.screen())
+                                        }
+                                        selection::SelectionPanel::File => unreachable!(),
+                                    };
+                                    if let Some(screen) = screen {
+                                        let text = selection::extract_text(screen, &start, &end);
+                                        if !text.is_empty() {
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                let _ = clipboard.set_text(text);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1522,6 +1593,88 @@ fn handle_terminal_tab_click(
     }
 }
 
+/// ファイルビューの選択範囲からテキストを抽出する
+fn extract_file_selection(
+    app: &app::App,
+    start: &selection::TermPos,
+    end: &selection::TermPos,
+) -> Option<String> {
+    let wt = app.selected_worktree()?;
+    let has_search = app.show_grep_results_view;
+    let offset = if has_search { wt.claude_tabs + 1 } else { wt.claude_tabs };
+    let file_index = wt.active_tab.checked_sub(offset)?;
+    let file = wt.open_files.get(file_index)?;
+
+    // 選択範囲の行 (content_area 内の相対行 + scroll_offset)
+    let start_line = file.scroll_offset + start.row as usize;
+    let end_line = file.scroll_offset + end.row as usize;
+
+    // 行番号プレフィックス "1234 " = 5文字分をスキップ
+    const LINE_NUM_WIDTH: u16 = 5;
+
+    let mut result = String::new();
+    for line_idx in start_line..=end_line {
+        let spans = file.highlighted.get(line_idx)?;
+        let line_text: String = spans.iter().map(|(_, _, _, t)| t.as_str()).collect();
+
+        if start_line == end_line {
+            // 単一行選択
+            let s = start.col.saturating_sub(LINE_NUM_WIDTH) as usize;
+            let e = (end.col.saturating_sub(LINE_NUM_WIDTH) as usize + 1).min(line_text.len());
+            if s < line_text.len() {
+                result.push_str(&line_text[s..e]);
+            }
+        } else if line_idx == start_line {
+            let s = start.col.saturating_sub(LINE_NUM_WIDTH) as usize;
+            if s < line_text.len() {
+                result.push_str(&line_text[s..]);
+            }
+            result.push('\n');
+        } else if line_idx == end_line {
+            let e = (end.col.saturating_sub(LINE_NUM_WIDTH) as usize + 1).min(line_text.len());
+            result.push_str(&line_text[..e]);
+        } else {
+            result.push_str(&line_text);
+            result.push('\n');
+        }
+    }
+    Some(result)
+}
+
+/// 右パネルのタブバー (Tree | Changes) のクリックを処理する
+fn handle_right_panel_tab_click(
+    app: &mut app::App,
+    diff_view: &mut ui::diff_view::DiffView,
+    right_top_area: ratatui::prelude::Rect,
+    click_x: u16,
+) {
+    let Some(wt_id) = app.selected_worktree else {
+        return;
+    };
+    // ratatui 0.30 Tabs: "Tree|Changes" (パディングなし)
+    // "Tree" = 4文字, "|" = 1文字, "Changes" = 7文字
+    let tab_x = click_x.saturating_sub(right_top_area.x);
+    let new_mode = if tab_x < 4 {
+        app::RightPanelMode::Tree
+    } else if tab_x >= 5 {
+        app::RightPanelMode::Diff
+    } else {
+        // divider 上のクリックは無視
+        return;
+    };
+    if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+        if wt.right_panel_mode != new_mode {
+            wt.right_panel_mode = new_mode;
+            // Diff モードに切り替えた時は最新の diff を取得
+            if new_mode == app::RightPanelMode::Diff {
+                let wt_path = wt.path.clone();
+                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                diff_view.load(&wt_path, &base);
+            }
+        }
+    }
+}
+
 /// siki.json のスクリプトをターミナルで実行する
 fn run_siki_script(
     app: &mut app::App,
@@ -1817,6 +1970,15 @@ fn handle_main_panel_key(
                     app.session_choice_wt_id = Some(wt_id);
                 } else {
                     launch_claude(app, claude_terms, event_tx, wt_id);
+                }
+            }
+        }
+        KeyCode::Char('y') => {
+            // path:line をクリップボードにコピー
+            if let Some(loc) = ui::main_panel::current_file_location(app) {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(&loc);
+                    app.show_info(format!("コピー: {}", loc));
                 }
             }
         }
