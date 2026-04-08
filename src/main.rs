@@ -379,6 +379,10 @@ async fn handle_event(
                 handle_add_project_popup_key(app, key);
                 return;
             }
+            if app.show_rename_project_popup {
+                handle_rename_project_popup_key(app, key);
+                return;
+            }
             if app.show_grep_popup {
                 handle_grep_popup_key(app, key);
                 return;
@@ -520,7 +524,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm {
                 return;
             }
             match mouse.kind {
@@ -837,6 +841,7 @@ fn handle_add_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEv
 
             app.projects.push(app::Project {
                 name: name.clone(),
+                display_name: None,
                 path: path.clone(),
                 worktrees: Vec::new(),
                 collapsed: false,
@@ -857,6 +862,49 @@ fn handle_add_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEv
         }
         KeyCode::Backspace => {
             app.add_project_input.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Esc => {
+            app.show_rename_project_popup = false;
+            app.rename_project_input.clear();
+        }
+        KeyCode::Enter => {
+            let input = app.rename_project_input.trim().to_string();
+            let pi = app.rename_project_index;
+
+            if let Some(project) = app.projects.get_mut(pi) {
+                let display_name = if input.is_empty() {
+                    None
+                } else {
+                    Some(input)
+                };
+
+                project.display_name = display_name.clone();
+
+                // project.json に永続化
+                if let Err(e) = config::save_project_display_name(
+                    &project.name,
+                    display_name.as_deref(),
+                ) {
+                    app.show_error(format!("表示名の保存に失敗: {}", e));
+                }
+            }
+
+            app.show_rename_project_popup = false;
+            app.rename_project_input.clear();
+        }
+        KeyCode::Char(c) => {
+            app.rename_project_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.rename_project_input.pop();
         }
         _ => {}
     }
@@ -1383,6 +1431,21 @@ fn handle_left_panel_key(
                     app.siki_json_confirm_project_path = Some(project_path.clone());
                     app.show_siki_json_confirm = true;
                 }
+            }
+        }
+        KeyCode::Char('R') => {
+            // プロジェクト行にカーソルがある場合のみ表示名変更ポップアップを開く
+            if let Some(ui::left_panel::ListEntry::Project { index }) =
+                left_panel.current_entry(&entries)
+            {
+                let pi = *index;
+                let current_display = app.projects[pi]
+                    .display_name
+                    .clone()
+                    .unwrap_or_default();
+                app.rename_project_index = pi;
+                app.rename_project_input = current_display;
+                app.show_rename_project_popup = true;
             }
         }
         KeyCode::Char('A') => {
@@ -2180,6 +2243,7 @@ mod tests {
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
                 path: "/tmp/test-project".to_string(),
+                display_name: None,
                 worktrees: vec![WorktreeConfig {
                     name: "feature".to_string(),
                     branch: "feature/test".to_string(),
@@ -2198,6 +2262,7 @@ mod tests {
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
                 path,
+                display_name: None,
                 worktrees: vec![WorktreeConfig {
                     name: "feature".to_string(),
                     branch: "feature/test".to_string(),
@@ -3451,6 +3516,7 @@ mod tests {
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
                 path: project_path.to_string_lossy().to_string(),
+                display_name: None,
                 worktrees: vec![WorktreeConfig {
                     name: "feature".to_string(),
                     branch: "feature/test".to_string(),

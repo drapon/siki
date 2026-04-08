@@ -482,6 +482,7 @@ mod tests {
             projects: vec![ProjectConfig {
                 name: "test".to_string(),
                 path: "/tmp/test".to_string(),
+                display_name: None,
                 worktrees: vec![WorktreeConfig {
                     name: "wt1".to_string(),
                     branch: "main".to_string(),

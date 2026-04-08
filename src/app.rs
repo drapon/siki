@@ -213,6 +213,7 @@ pub struct Worktree {
 #[derive(Debug)]
 pub struct Project {
     pub name: String,
+    pub display_name: Option<String>,
     pub path: PathBuf,
     pub worktrees: Vec<Worktree>,
     pub collapsed: bool,
@@ -262,6 +263,10 @@ pub struct App {
     pub show_session_choice: bool,
     /// セッション選択対象の worktree ID
     pub session_choice_wt_id: Option<WorktreeId>,
+    /// プロジェクト表示名変更ポップアップ
+    pub show_rename_project_popup: bool,
+    pub rename_project_input: String,
+    pub rename_project_index: usize,
     /// テキスト選択状態（Claude / ターミナルペインのマウスドラッグ選択）
     pub text_selection: Option<TextSelection>,
     /// Claude ペインのコンテンツ領域（レンダリング時に計算）
@@ -317,6 +322,9 @@ impl App {
             siki_json_init_spinner: 0,
             show_session_choice: false,
             session_choice_wt_id: None,
+            show_rename_project_popup: false,
+            rename_project_input: String::new(),
+            rename_project_index: 0,
             text_selection: None,
             claude_content_area: None,
             terminal_content_area: None,
@@ -551,6 +559,7 @@ impl Project {
 
         Self {
             name: pc.name.clone(),
+            display_name: pc.display_name.clone(),
             path: PathBuf::from(&pc.path),
             worktrees,
             collapsed: false,
@@ -585,6 +594,7 @@ mod tests {
                 ProjectConfig {
                     name: "webapp".to_string(),
                     path: "/home/user/webapp".to_string(),
+                    display_name: None,
                     worktrees: vec![
                         WorktreeConfig {
                             name: "feature-auth".to_string(),
@@ -599,6 +609,7 @@ mod tests {
                 ProjectConfig {
                     name: "api".to_string(),
                     path: "/home/user/api".to_string(),
+                    display_name: None,
                     worktrees: vec![WorktreeConfig {
                         name: "refactor".to_string(),
                         branch: "refactor/db".to_string(),

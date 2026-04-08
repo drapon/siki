@@ -100,6 +100,11 @@ pub fn render(
         render_add_project_popup(frame, app);
     }
 
+    // プロジェクト表示名変更ポップアップ
+    if app.show_rename_project_popup {
+        render_rename_project_popup(frame, app);
+    }
+
     // Grep 検索ポップアップ
     if app.show_grep_popup {
         render_grep_popup(frame, app);
@@ -188,6 +193,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  Enter      : worktree 選択",
         "  a          : worktree 追加",
         "  A          : プロジェクト追加",
+        "  R          : プロジェクト表示名変更",
         "  S          : siki.json 作成",
         "  r          : run スクリプト実行",
         "  d          : worktree アーカイブ / プロジェクト除外",
@@ -270,6 +276,30 @@ fn render_add_project_popup(frame: &mut Frame, app: &App) {
     let text = format!(
         "\n  パス: {}_\n\n  Enter: 追加  Esc: キャンセル",
         app.add_project_input,
+    );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_rename_project_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 30, frame.area());
+
+    let project_name = app
+        .projects
+        .get(app.rename_project_index)
+        .map(|p| p.name.as_str())
+        .unwrap_or("???");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("表示名変更: {}", project_name))
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let text = format!(
+        "\n  表示名: {}_\n\n  Enter: 確定  Esc: キャンセル\n  (空で確定すると元の名前に戻ります)",
+        app.rename_project_input,
     );
     let paragraph = Paragraph::new(text).block(block);
 

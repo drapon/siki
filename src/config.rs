@@ -56,6 +56,8 @@ pub struct SikiConfig {
 pub struct ProjectConfig {
     pub name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub worktrees: Vec<WorktreeConfig>,
 }
 
@@ -210,6 +212,8 @@ pub fn generate_worktree_name(existing_names: &[String]) -> String {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProjectMeta {
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// プロジェクトの project.json パスを返す
@@ -219,8 +223,11 @@ pub fn project_meta_path(project_name: &str) -> PathBuf {
 
 /// project.json を保存する
 pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
+    // 既存の display_name を保持する
+    let existing_display_name = load_project_meta(project_name).and_then(|m| m.display_name);
     let meta = ProjectMeta {
         path: source_path.to_string_lossy().to_string(),
+        display_name: existing_display_name,
     };
     let dir = workspaces_dir().join(project_name);
     std::fs::create_dir_all(&dir)
@@ -230,6 +237,19 @@ pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
     let path = project_meta_path(project_name);
     std::fs::write(&path, content)
         .with_context(|| format!("project.json の保存に失敗: {}", path.display()))?;
+    Ok(())
+}
+
+/// project.json の display_name のみを更新する
+pub fn save_project_display_name(project_name: &str, display_name: Option<&str>) -> Result<()> {
+    let meta_path = project_meta_path(project_name);
+    let mut meta = load_project_meta(project_name)
+        .ok_or_else(|| anyhow::anyhow!("project.json が見つかりません: {}", project_name))?;
+    meta.display_name = display_name.map(|s| s.to_string());
+    let content =
+        serde_json::to_string_pretty(&meta).context("project.json のシリアライズに失敗")?;
+    std::fs::write(&meta_path, content)
+        .with_context(|| format!("project.json の保存に失敗: {}", meta_path.display()))?;
     Ok(())
 }
 
@@ -284,7 +304,9 @@ pub fn discover_projects() -> Vec<ProjectConfig> {
         };
 
         // project.json からソースパスを取得、なければ worktree から推定
-        let source_path = if let Some(meta) = load_project_meta(&project_name) {
+        let loaded_meta = load_project_meta(&project_name);
+        let display_name = loaded_meta.as_ref().and_then(|m| m.display_name.clone());
+        let source_path = if let Some(meta) = loaded_meta {
             meta.path
         } else {
             // worktree から推定して project.json を自動生成（マイグレーション）
@@ -353,6 +375,7 @@ pub fn discover_projects() -> Vec<ProjectConfig> {
         projects.push(ProjectConfig {
             name: project_name,
             path: source_path,
+            display_name,
             worktrees,
         });
     }
@@ -707,6 +730,7 @@ worktrees = [
             projects: vec![ProjectConfig {
                 name: "myproject".to_string(),
                 path: "/tmp/myproject".to_string(),
+                display_name: None,
                 worktrees: vec![WorktreeConfig {
                     name: "tokyo".to_string(),
                     branch: "feature/auth".to_string(),
@@ -779,6 +803,7 @@ worktrees = [
         // save/load の中身を直接テスト
         let meta = ProjectMeta {
             path: "/tmp/my-project".to_string(),
+            display_name: None,
         };
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let meta_path = dir.path().join("project.json");
