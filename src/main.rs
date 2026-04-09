@@ -858,8 +858,6 @@ async fn handle_event(
                     }
                 }
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    // スクロール時は選択をクリア
-                    app.text_selection = None;
                     if let Some(layout) = last_layout {
                         let panel = layout.hit_test(mouse.column, mouse.row);
                         let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
@@ -1064,20 +1062,20 @@ async fn handle_event(
                 app.grep_input.push_str(&text);
                 return;
             }
-            // Claude / 通常ターミナルへ転送
+            // フォーカスに応じて Claude / 通常ターミナルへ転送
             if let Some(wt_id) = app.selected_worktree {
                 if let Some(wt) = app.worktree_by_id(wt_id) {
-                    let tab = wt.active_tab;
-                    if tab < wt.claude_tabs {
-                        if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
-                            let _ = emu.write(text.as_bytes());
-                        }
-                        return;
-                    }
-                    let active_terminal = wt.active_terminal;
                     if app.focused_panel == app::Panel::Terminal {
+                        let active_terminal = wt.active_terminal;
                         if let Some(emu) = terminals.get_mut(&(wt_id, active_terminal)) {
                             let _ = emu.write(text.as_bytes());
+                        }
+                    } else {
+                        let tab = wt.active_tab;
+                        if tab < wt.claude_tabs {
+                            if let Some(emu) = claude_terms.get_mut(&(wt_id, tab)) {
+                                let _ = emu.write(text.as_bytes());
+                            }
                         }
                     }
                 }
