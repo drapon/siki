@@ -36,7 +36,7 @@ pub const MAX_TERMINAL_TABS: usize = 5;
 pub fn render(
     frame: &mut Frame,
     app: &mut App,
-    left_panel: &left_panel::LeftPanel,
+    left_panel: &mut left_panel::LeftPanel,
     source_tree: &mut SourceTree,
     diff_view: &DiffView,
     terminal_screen: Option<&vt100::Screen>,

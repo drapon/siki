@@ -95,7 +95,7 @@ impl LeftPanel {
 
     /// 左パネルを描画する
     pub fn render(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         app: &App,
@@ -196,6 +196,9 @@ impl LeftPanel {
         list_state.select(Some(self.cursor_index));
 
         frame.render_stateful_widget(list, area, &mut list_state);
+
+        // 描画後のスクロールオフセットを保存（マウスクリック時の行計算に使用）
+        self.scroll_offset = list_state.offset();
     }
 }
 

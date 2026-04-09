@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
             last_layout = Some(ui::render(
                 frame,
                 &mut app,
-                &left_panel,
+                &mut left_panel,
                 &mut source_tree,
                 &diff_view,
                 terminal_screen,
@@ -746,6 +746,45 @@ async fn handle_event(
                                             if let Some(path) = source_tree.current_file_path() {
                                                 ui::main_panel::open_file_tab(app, path);
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if hit_panel == Some(app::Panel::Left) {
+                            app.text_selection = None;
+                            // ボーダー1行分を除いたコンテンツ領域の行を計算
+                            let content_top = layout.left.y + 1;
+                            if mouse.row >= content_top {
+                                let clicked_row = (mouse.row - content_top) as usize;
+                                let entries = LeftPanel::build_entries(&app.projects);
+                                let target_index = left_panel.scroll_offset + clicked_row;
+                                if target_index < entries.len() {
+                                    left_panel.cursor_index = target_index;
+                                    match &entries[target_index] {
+                                        ui::left_panel::ListEntry::Worktree { project_index, worktree_index } => {
+                                            let wt_id = (*project_index, *worktree_index);
+                                            app.selected_worktree = Some(wt_id);
+                                            app.focused_panel = app::Panel::Main;
+                                            let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+                                            let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                                            source_tree.load(&wt_path);
+                                            diff_view.load(&wt_path, &base);
+                                            let has_claude = app
+                                                .worktree_by_id(wt_id)
+                                                .map(|wt| wt.claude_tabs > 0)
+                                                .unwrap_or(false);
+                                            if !has_claude {
+                                                launch_claude(app, claude_terms, event_tx, wt_id);
+                                            }
+                                            if !terminals.contains_key(&(wt_id, 0)) {
+                                                spawn_terminal(app, terminals, event_tx, shell, wt_id, 0);
+                                            }
+                                        }
+                                        ui::left_panel::ListEntry::Project { index } => {
+                                            // プロジェクト行クリックで折りたたみ/展開
+                                            app.projects[*index].collapsed = !app.projects[*index].collapsed;
+                                            let new_entries = LeftPanel::build_entries(&app.projects);
+                                            left_panel.clamp_cursor(new_entries.len());
                                         }
                                     }
                                 }
