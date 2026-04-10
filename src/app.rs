@@ -262,6 +262,24 @@ pub struct App {
     pub siki_json_init_scroll: usize,
     /// オーバーレイターミナルのスピナーカウンタ
     pub siki_json_init_spinner: usize,
+    /// スキル名入力ポップアップ
+    pub show_skill_name_popup: bool,
+    /// スキル名入力バッファ
+    pub skill_name_input: String,
+    /// スキル作成対象のプロジェクト名
+    pub skill_project_name: Option<String>,
+    /// スキル作成オーバーレイターミナル表示中フラグ
+    pub show_skill_create_terminal: bool,
+    /// スキル作成オーバーレイのスクロールオフセット
+    pub skill_create_scroll: usize,
+    /// スキル作成オーバーレイのスピナーカウンタ
+    pub skill_create_spinner: usize,
+    /// スキル一覧ポップアップ表示フラグ
+    pub show_skill_list: bool,
+    /// スキル一覧データ (name, content)
+    pub skill_list_items: Vec<(String, String)>,
+    /// スキル一覧カーソル位置
+    pub skill_list_cursor: usize,
     /// セッション選択ポップアップ（新規 Claude タブ起動時）
     pub show_session_choice: bool,
     /// セッション選択対象の worktree ID
@@ -333,6 +351,15 @@ impl App {
             show_siki_json_init_terminal: false,
             siki_json_init_scroll: 0,
             siki_json_init_spinner: 0,
+            show_skill_name_popup: false,
+            skill_name_input: String::new(),
+            skill_project_name: None,
+            show_skill_create_terminal: false,
+            skill_create_scroll: 0,
+            skill_create_spinner: 0,
+            show_skill_list: false,
+            skill_list_items: Vec::new(),
+            skill_list_cursor: 0,
             show_session_choice: false,
             session_choice_wt_id: None,
             show_rename_project_popup: false,

@@ -43,6 +43,7 @@ pub fn render(
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
     siki_init_screen: Option<&vt100::Screen>,
+    skill_create_screen: Option<&vt100::Screen>,
     session_registry: Option<&SessionRegistry>,
     grep_rows: &[grep_view::DisplayRow],
 ) -> layout::AppLayout {
@@ -151,6 +152,27 @@ pub fn render(
         );
     }
 
+    // スキル名入力ポップアップ
+    if app.show_skill_name_popup {
+        render_skill_name_popup(frame, app);
+    }
+
+    // スキル作成オーバーレイターミナル
+    if app.show_skill_create_terminal {
+        render_skill_create_terminal(
+            frame,
+            skill_create_screen,
+            app.skill_create_scroll,
+            app.skill_create_spinner,
+            app.skill_name_input.as_str(),
+        );
+    }
+
+    // スキル一覧ポップアップ
+    if app.show_skill_list {
+        render_skill_list_popup(frame, app);
+    }
+
     areas
 }
 
@@ -210,6 +232,8 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  R          : プロジェクト表示名変更",
         "  S          : siki.json 作成",
         "  r          : run スクリプト実行",
+        "  K          : スキル作成",
+        "  L          : スキル一覧",
         "  d          : worktree アーカイブ / プロジェクト除外",
         "",
         "[中央パネル]",
@@ -678,6 +702,132 @@ fn render_terminal(
                 area,
             );
         }
+    }
+}
+
+fn render_skill_name_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 20, frame.area());
+    let project = app.skill_project_name.as_deref().unwrap_or("?");
+    let title = format!("Skill 作成: {}", project);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Green));
+
+    let text = format!(
+        "\n  スキル名: {}_\n\n  Enter: 作成  Esc: キャンセル",
+        app.skill_name_input,
+    );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_skill_create_terminal(
+    frame: &mut Frame,
+    screen: Option<&vt100::Screen>,
+    scroll_offset: usize,
+    spinner: usize,
+    skill_name: &str,
+) {
+    let area = centered_rect(90, 80, frame.area());
+
+    let spinner_chars = ['|', '/', '-', '\\'];
+    let spinner_char = spinner_chars[spinner % spinner_chars.len()];
+
+    let title = if scroll_offset > 0 {
+        format!(
+            "Skill: {} [↑{}行] (Scroll: ホイール/Shift+PgUp,PgDn  Esc で閉じる)",
+            skill_name, scroll_offset
+        )
+    } else {
+        format!(
+            "Skill: {} (Scroll: ホイール/Shift+PgUp,PgDn  Esc で閉じる)",
+            skill_name
+        )
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Green));
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let is_loading = match screen {
+        Some(screen) => screen.contents().trim().is_empty(),
+        None => true,
+    };
+
+    if is_loading {
+        let loading_text = format!("\n\n  {} Claude を起動中...", spinner_char);
+        frame.render_widget(
+            Paragraph::new(loading_text)
+                .block(block)
+                .style(Style::default().fg(Color::Green)),
+            area,
+        );
+    } else if let Some(screen) = screen {
+        let pseudo_term = tui_term::widget::PseudoTerminal::new(screen).block(block);
+        frame.render_widget(pseudo_term, area);
+    }
+}
+
+fn render_skill_list_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(80, 80, frame.area());
+
+    let project = app.skill_project_name.as_deref().unwrap_or("?");
+    let title = format!("Skills: {} (j/k: 移動  d: 削除  Esc: 閉じる)", project);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.skill_list_items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("  (スキルなし)").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    // 左: スキル名リスト (幅20), 右: 内容プレビュー
+    let chunks = Layout::horizontal([
+        Constraint::Length(24),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    // 左パネル: スキル名リスト
+    let list_items: Vec<ratatui::widgets::ListItem> = app
+        .skill_list_items
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            let style = if i == app.skill_list_cursor {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ratatui::widgets::ListItem::new(format!("  /{}", name)).style(style)
+        })
+        .collect();
+    let list = ratatui::widgets::List::new(list_items);
+    frame.render_widget(list, chunks[0]);
+
+    // 右パネル: 選択中のスキルの内容
+    if let Some((_, content)) = app.skill_list_items.get(app.skill_list_cursor) {
+        let preview = Paragraph::new(content.as_str())
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::default().fg(Color::Gray));
+        frame.render_widget(preview, chunks[1]);
     }
 }
 

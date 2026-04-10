@@ -214,6 +214,12 @@ pub struct ProjectMeta {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// プロジェクト個別のスクリプト設定（siki.json が無い場合に使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scripts: Option<SikiScripts>,
+    /// プロジェクト個別のベースブランチ（siki.json が無い場合に使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// プロジェクトの project.json パスを返す
@@ -223,11 +229,13 @@ pub fn project_meta_path(project_name: &str) -> PathBuf {
 
 /// project.json を保存する
 pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
-    // 既存の display_name を保持する
-    let existing_display_name = load_project_meta(project_name).and_then(|m| m.display_name);
+    // 既存のフィールドを保持する
+    let existing = load_project_meta(project_name);
     let meta = ProjectMeta {
         path: source_path.to_string_lossy().to_string(),
-        display_name: existing_display_name,
+        display_name: existing.as_ref().and_then(|m| m.display_name.clone()),
+        scripts: existing.as_ref().and_then(|m| m.scripts.clone()),
+        base_branch: existing.as_ref().and_then(|m| m.base_branch.clone()),
     };
     let dir = workspaces_dir().join(project_name);
     std::fs::create_dir_all(&dir)
@@ -464,10 +472,13 @@ pub struct SikiJson {
 }
 
 /// siki.json の scripts セクション
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SikiScripts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<String>,
 }
 
@@ -510,6 +521,71 @@ pub fn load_siki_json(project_path: &Path) -> Option<SikiJson> {
     let path = project_path.join("siki.json");
     let content = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// siki.json を優先し、無ければ project.json のスクリプト設定にフォールバック
+pub fn load_effective_siki_json(project_path: &Path, project_name: &str) -> Option<SikiJson> {
+    // 1. siki.json があればそちらを使用
+    if let Some(sj) = load_siki_json(project_path) {
+        return Some(sj);
+    }
+    // 2. project.json のスクリプト設定にフォールバック
+    let meta = load_project_meta(project_name)?;
+    if meta.scripts.is_none() && meta.base_branch.is_none() {
+        return None;
+    }
+    Some(SikiJson {
+        scripts: meta.scripts.unwrap_or_default(),
+        base_branch: meta.base_branch,
+    })
+}
+
+/// プロジェクト固有の Claude Code skills ディレクトリパスを返す
+pub fn project_skills_dir(project_name: &str) -> PathBuf {
+    workspaces_dir().join(project_name).join("skills")
+}
+
+/// スキル作成用の Claude Code プロンプトを返す
+pub fn skill_create_prompt(project_name: &str, skill_name: &str) -> String {
+    format!(
+        r#"あなたはプロジェクト "{project_name}" 用の Claude Code skill "/{skill_name}" を作成するアシスタントです。
+
+## 手順
+
+1. ユーザーに「/{skill_name}」スキルがどのような処理を行うべきか質問してください
+2. プロジェクトのコード構造を分析してコンテキストを把握してください
+3. スキルの内容を作成してください
+
+## スキルファイルのフォーマット
+
+スキルファイルは Markdown 形式の .md ファイルです。以下の構造に従ってください：
+
+```markdown
+# スキル名 - 簡潔な説明
+
+## 説明
+このスキルが何をするか
+
+## 動作手順
+1. ステップ1
+2. ステップ2
+...
+```
+
+## 保存方法
+
+スキルの内容が完成したら、必ず `save_skill` MCP ツールを使って保存してください：
+- project_name: "{project_name}"
+- skill_name: "{skill_name}"
+- content: スキルの全内容（SKILL.md として保存されます）
+
+## 注意事項
+- まず `list_skills` ツールで既存のスキルを確認し、重複を避けてください
+- スキルはこのプロジェクト固有のものです
+- 実用的で具体的な内容にしてください
+
+ユーザーに /{skill_name} の目的を聞いてください。"#
+    )
 }
 
 /// Unix ソケットのパスを返す: ~/.siki/sock
@@ -846,6 +922,8 @@ worktrees = [
         let meta = ProjectMeta {
             path: "/tmp/my-project".to_string(),
             display_name: None,
+            scripts: None,
+            base_branch: None,
         };
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let meta_path = dir.path().join("project.json");

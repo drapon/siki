@@ -33,6 +33,10 @@ const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 const SIKI_INIT_WORKTREE_ID: app::WorktreeId = (usize::MAX, usize::MAX);
 const SIKI_INIT_TAB_INDEX: usize = usize::MAX;
 
+/// スキル作成用オーバーレイターミナルのセンチネル値
+const SKILL_CREATE_WORKTREE_ID: app::WorktreeId = (usize::MAX, usize::MAX - 1);
+const SKILL_CREATE_TAB_INDEX: usize = usize::MAX - 1;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -136,6 +140,7 @@ async fn main() -> Result<()> {
     let mut claude_terms: HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator> =
         HashMap::new();
     let mut siki_init_terminal: Option<terminal::TerminalEmulator> = None;
+    let mut skill_create_terminal: Option<terminal::TerminalEmulator> = None;
 
     // セッションレジストリ・DB・broker の起動
     let session_registry = Arc::new(Mutex::new(session::SessionRegistry::new()));
@@ -235,6 +240,12 @@ async fn main() -> Result<()> {
         }
         let siki_init_screen = siki_init_terminal.as_ref().map(|emu| emu.screen());
 
+        // スキル作成用オーバーレイターミナルの画面
+        if let Some(emu) = skill_create_terminal.as_mut() {
+            emu.set_scrollback(app.skill_create_scroll);
+        }
+        let skill_create_screen = skill_create_terminal.as_ref().map(|emu| emu.screen());
+
         // grep 結果の表示行を構築
         let grep_rows = if app.show_grep_results_view {
             let wt_path = app.selected_worktree().map(|wt| wt.path.clone());
@@ -260,6 +271,7 @@ async fn main() -> Result<()> {
                 terminal_tab_info.as_ref(),
                 claude_screen,
                 siki_init_screen,
+                skill_create_screen,
                 Some(&registry),
                 &grep_rows,
             ));
@@ -272,6 +284,7 @@ async fn main() -> Result<()> {
                 &mut terminals,
                 &mut claude_terms,
                 &mut siki_init_terminal,
+                &mut skill_create_terminal,
                 layout,
             );
         }
@@ -287,6 +300,7 @@ async fn main() -> Result<()> {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &event_tx,
             &shell,
             ev,
@@ -318,6 +332,7 @@ async fn handle_event(
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
+    skill_create_terminal: &mut Option<terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     shell: &str,
     event: event::AppEvent,
@@ -333,6 +348,18 @@ async fn handle_event(
             // siki.json 作成オーバーレイターミナル表示中
             if app.show_siki_json_init_terminal {
                 handle_siki_init_terminal_key(app, siki_init_terminal, key);
+                return;
+            }
+
+            // スキル作成オーバーレイターミナル表示中
+            if app.show_skill_create_terminal {
+                handle_skill_create_terminal_key(app, skill_create_terminal, key);
+                return;
+            }
+
+            // スキル一覧ポップアップ表示中
+            if app.show_skill_list {
+                handle_skill_list_key(app, key);
                 return;
             }
 
@@ -422,6 +449,10 @@ async fn handle_event(
             }
             if app.show_siki_json_confirm {
                 handle_siki_json_confirm_key(app, siki_init_terminal, event_tx, key);
+                return;
+            }
+            if app.show_skill_name_popup {
+                handle_skill_name_popup_key(app, skill_create_terminal, event_tx, key);
                 return;
             }
 
@@ -534,7 +565,7 @@ async fn handle_event(
             if app.selected_worktree == Some(worktree_id) {
                 if let Some(wt) = app.worktree_by_id(worktree_id) {
                     let wt_path = wt.path.clone();
-                    let base = resolve_base_branch(&app.projects[worktree_id.0].path);
+                    let base = resolve_base_branch(&app.projects[worktree_id.0].path, &app.projects[worktree_id.0].name);
                     diff_view.load(&wt_path, &base);
                     source_tree.load(&wt_path);
                 }
@@ -568,6 +599,10 @@ async fn handle_event(
                 if let Some(emu) = siki_init_terminal.as_mut() {
                     emu.process(&data);
                 }
+            } else if worktree_id == SKILL_CREATE_WORKTREE_ID && tab_index == SKILL_CREATE_TAB_INDEX {
+                if let Some(emu) = skill_create_terminal.as_mut() {
+                    emu.process(&data);
+                }
             } else if tab_index >= CLAUDE_TAB_BASE {
                 let claude_idx = tab_index - CLAUDE_TAB_BASE;
                 if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
@@ -591,6 +626,10 @@ async fn handle_event(
         } => {
             if worktree_id == SIKI_INIT_WORKTREE_ID && tab_index == SIKI_INIT_TAB_INDEX {
                 if let Some(emu) = siki_init_terminal.as_mut() {
+                    emu.mark_exited();
+                }
+            } else if worktree_id == SKILL_CREATE_WORKTREE_ID && tab_index == SKILL_CREATE_TAB_INDEX {
+                if let Some(emu) = skill_create_terminal.as_mut() {
                     emu.mark_exited();
                 }
             } else if tab_index >= CLAUDE_TAB_BASE {
@@ -628,8 +667,21 @@ async fn handle_event(
                 }
                 return;
             }
+            // スキル作成オーバーレイ表示中はスクロールのみ処理
+            if app.show_skill_create_terminal {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.skill_create_scroll = app.skill_create_scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.skill_create_scroll = app.skill_create_scroll.saturating_sub(3);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_list {
                 return;
             }
             match mouse.kind {
@@ -800,7 +852,7 @@ async fn handle_event(
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
                                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
-                                            let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                                            let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                             source_tree.load(&wt_path);
                                             diff_view.load(&wt_path, &base);
                                             let has_claude = app
@@ -1037,6 +1089,13 @@ async fn handle_event(
                 }
                 return;
             }
+            // スキル作成オーバーレイ表示中
+            if app.show_skill_create_terminal {
+                if let Some(emu) = skill_create_terminal.as_mut() {
+                    let _ = emu.write(text.as_bytes());
+                }
+                return;
+            }
             // メッセージポップアップ: 入力欄に追加
             if app.show_message_popup {
                 app.popup_input.push_str(&text);
@@ -1080,6 +1139,9 @@ async fn handle_event(
             app.clear_expired_status();
             if app.show_siki_json_init_terminal {
                 app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
+            }
+            if app.show_skill_create_terminal {
+                app.skill_create_spinner = app.skill_create_spinner.wrapping_add(1);
             }
             // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
             if let Some(registry) = session_registry {
@@ -1458,10 +1520,11 @@ fn finalize_add_worktree(
 
     app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
 
-    // siki.json の setup スクリプトがあれば実行
+    // setup スクリプトがあれば実行（siki.json 優先、なければ project.json）
     let wi = app.projects[pi].worktrees.len() - 1;
     let wt_id = (pi, wi);
-    if let Some(siki_json) = config::load_siki_json(&project_path) {
+    let project_name = &app.projects[pi].name;
+    if let Some(siki_json) = config::load_effective_siki_json(&project_path, project_name) {
         if let Some(ref setup_script) = siki_json.scripts.setup {
             run_siki_script(
                 app, terminals, event_tx, shell,
@@ -1797,7 +1860,7 @@ fn handle_right_panel_tab_click(
             // Diff モードに切り替えた時は最新の diff を取得
             if new_mode == app::RightPanelMode::Diff {
                 let wt_path = wt.path.clone();
-                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                 diff_view.load(&wt_path, &base);
             }
         }
@@ -1924,7 +1987,8 @@ fn handle_left_panel_key(
                 app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
 
                 // base_branch を解決: siki.json > config.toml > "origin/main"
-                app.add_worktree_base_branch = resolve_base_branch(project_path);
+                let project_name = &app.projects[pi].name;
+                app.add_worktree_base_branch = resolve_base_branch(project_path, project_name);
 
                 app.show_add_worktree_popup = true;
             }
@@ -1941,7 +2005,8 @@ fn handle_left_panel_key(
                 let wt_name = app.projects[pi].worktrees[wi].name.clone();
                 let wt_path = app.projects[pi].worktrees[wi].path.clone();
 
-                if let Some(siki_json) = config::load_siki_json(&project_path) {
+                let project_name = &app.projects[pi].name;
+                if let Some(siki_json) = config::load_effective_siki_json(&project_path, project_name) {
                     if let Some(ref run_script) = siki_json.scripts.run {
                         run_siki_script(
                             app, terminals, event_tx, shell,
@@ -1949,10 +2014,10 @@ fn handle_left_panel_key(
                         );
                         app.focused_panel = app::Panel::Terminal;
                     } else {
-                        app.show_info("siki.json に run スクリプトが定義されていません".to_string());
+                        app.show_info("run スクリプトが定義されていません".to_string());
                     }
                 } else {
-                    app.show_info("siki.json が見つかりません".to_string());
+                    app.show_info("スクリプト設定が見つかりません（siki.json または project.json）".to_string());
                 }
             }
         }
@@ -1985,6 +2050,56 @@ fn handle_left_panel_key(
                 } else {
                     app.siki_json_confirm_project_path = Some(project_path.clone());
                     app.show_siki_json_confirm = true;
+                }
+            }
+        }
+        KeyCode::Char('K') => {
+            // スキル作成ポップアップを開く
+            let project_index = match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
+                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => Some(*project_index),
+                None => None,
+            };
+            if let Some(pi) = project_index {
+                app.skill_project_name = Some(app.projects[pi].name.clone());
+                app.skill_name_input.clear();
+                app.show_skill_name_popup = true;
+            }
+        }
+        KeyCode::Char('L') => {
+            // スキル一覧ポップアップを開く
+            let project_index = match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
+                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => Some(*project_index),
+                None => None,
+            };
+            if let Some(pi) = project_index {
+                let project_name = &app.projects[pi].name;
+                app.skill_project_name = Some(project_name.clone());
+                let skills_dir = config::project_skills_dir(project_name);
+                let mut items = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            let skill_file = path.join("SKILL.md");
+                            if skill_file.exists() {
+                                let name = path.file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+                                items.push((name, content));
+                            }
+                        }
+                    }
+                }
+                items.sort_by(|a, b| a.0.cmp(&b.0));
+                app.skill_list_items = items;
+                app.skill_list_cursor = 0;
+                if app.skill_list_items.is_empty() {
+                    app.show_info("スキルがありません。K キーで作成できます".to_string());
+                } else {
+                    app.show_skill_list = true;
                 }
             }
         }
@@ -2030,7 +2145,7 @@ fn handle_left_panel_key(
                 app.focused_panel = app::Panel::Main;
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
-                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                 source_tree.load(&wt_path);
                 diff_view.load(&wt_path, &base);
                 // Claude Code とターミナルを自動起動
@@ -2229,6 +2344,163 @@ fn handle_siki_init_terminal_key(
         if let Some(emu) = siki_init_terminal.as_mut() {
             let _ = emu.write(&bytes);
         }
+    }
+}
+
+/// スキル名入力ポップアップのキー処理
+fn handle_skill_name_popup_key(
+    app: &mut app::App,
+    skill_create_terminal: &mut Option<terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Esc => {
+            app.show_skill_name_popup = false;
+            app.skill_name_input.clear();
+        }
+        KeyCode::Enter => {
+            let skill_name = app.skill_name_input.trim().to_string();
+            if skill_name.is_empty() {
+                return;
+            }
+            let project_name = match app.skill_project_name.as_deref() {
+                Some(name) => name.to_string(),
+                None => return,
+            };
+            app.show_skill_name_popup = false;
+
+            // Claude Code をオーバーレイターミナルで起動
+            let prompt = config::skill_create_prompt(&project_name, &skill_name);
+            // プロジェクトのソースパスを探す
+            let project_path = app.projects.iter()
+                .find(|p| p.name == project_name)
+                .map(|p| p.path.clone());
+            if let Some(project_path) = project_path {
+                let sock = config::sock_path();
+                // worktree のパスとしてプロジェクトのソースパスを使用
+                let _ = hooks::ensure_hooks_configured(&project_path, &sock, &project_name);
+                match terminal::TerminalEmulator::with_args(
+                    "claude",
+                    &[&prompt],
+                    &project_path,
+                    (80, 24),
+                    event_tx.clone(),
+                    SKILL_CREATE_WORKTREE_ID,
+                    SKILL_CREATE_TAB_INDEX,
+                ) {
+                    Ok(emu) => {
+                        *skill_create_terminal = Some(emu);
+                        app.show_skill_create_terminal = true;
+                        app.skill_create_scroll = 0;
+                        app.skill_create_spinner = 0;
+                    }
+                    Err(e) => {
+                        app.show_error(format!("Claude 起動に失敗: {}", e));
+                    }
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            app.skill_name_input.pop();
+        }
+        KeyCode::Char(c) => {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                app.skill_name_input.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// スキル作成オーバーレイターミナルのキー処理
+fn handle_skill_create_terminal_key(
+    app: &mut app::App,
+    skill_create_terminal: &mut Option<terminal::TerminalEmulator>,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('\\') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        // オーバーレイを閉じる → 全 worktree にスキルを同期
+        if let Some(project_name) = app.skill_project_name.as_deref() {
+            for project in &app.projects {
+                if project.name == project_name {
+                    for wt in &project.worktrees {
+                        hooks::sync_project_skills(&wt.path, project_name);
+                    }
+                    break;
+                }
+            }
+        }
+        *skill_create_terminal = None;
+        app.show_skill_create_terminal = false;
+        app.skill_create_scroll = 0;
+        return;
+    }
+
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::PageUp => {
+                app.skill_create_scroll = app.skill_create_scroll.saturating_add(10);
+                return;
+            }
+            KeyCode::PageDown => {
+                app.skill_create_scroll = app.skill_create_scroll.saturating_sub(10);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    app.skill_create_scroll = 0;
+
+    let bytes = terminal::key_to_bytes(&key);
+    if !bytes.is_empty() {
+        if let Some(emu) = skill_create_terminal.as_mut() {
+            let _ = emu.write(&bytes);
+        }
+    }
+}
+
+/// スキル一覧ポップアップのキー処理
+fn handle_skill_list_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Esc => {
+            app.show_skill_list = false;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.skill_list_items.is_empty() && app.skill_list_cursor < app.skill_list_items.len() - 1 {
+                app.skill_list_cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.skill_list_cursor = app.skill_list_cursor.saturating_sub(1);
+        }
+        KeyCode::Char('d') => {
+            // スキル削除
+            if let Some((name, _)) = app.skill_list_items.get(app.skill_list_cursor) {
+                if let Some(project_name) = app.skill_project_name.as_deref() {
+                    let path = config::project_skills_dir(project_name).join(name);
+                    let _ = std::fs::remove_dir_all(&path);
+                    app.skill_list_items.remove(app.skill_list_cursor);
+                    if app.skill_list_cursor >= app.skill_list_items.len() && app.skill_list_cursor > 0 {
+                        app.skill_list_cursor -= 1;
+                    }
+                    if app.skill_list_items.is_empty() {
+                        app.show_skill_list = false;
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2465,8 +2737,9 @@ fn handle_archive_confirm_key(
                 let wt_path = app.projects[pi].worktrees[wi].path.clone();
                 let wt_id = (pi, wi);
 
-                // siki.json の archive スクリプトがあれば実行
-                if let Some(siki_json) = config::load_siki_json(&project_path) {
+                // archive スクリプトがあれば実行（siki.json 優先、なければ project.json）
+                let project_name = &app.projects[pi].name;
+                if let Some(siki_json) = config::load_effective_siki_json(&project_path, project_name) {
                     if let Some(ref archive_script) = siki_json.scripts.archive {
                         run_siki_script(
                             app, terminals, event_tx, shell,
@@ -2538,6 +2811,7 @@ fn resize_terminals(
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
+    skill_create_terminal: &mut Option<terminal::TerminalEmulator>,
     layout: &ui::layout::AppLayout,
 ) {
     // Claude ターミナル: main パネルからタブバー(2行) + ボーダー(2行2列) を引いた内部サイズ
@@ -2578,6 +2852,21 @@ fn resize_terminals(
         let full_width = layout.left.width + layout.main.width + layout.right_top.width;
         let full_height = layout.left.height + layout.status_bar.height;
         // centered_rect(90, 80) と同じ割合
+        let overlay_cols = full_width.saturating_mul(90).saturating_div(100).saturating_sub(2);
+        let overlay_rows = full_height.saturating_mul(80).saturating_div(100).saturating_sub(2);
+        if overlay_cols > 0 && overlay_rows > 0 {
+            let screen = emu.screen();
+            let (cur_rows, cur_cols) = screen.size();
+            if cur_cols != overlay_cols || cur_rows != overlay_rows {
+                let _ = emu.resize(overlay_cols, overlay_rows);
+            }
+        }
+    }
+
+    // スキル作成オーバーレイターミナル: 同じサイズ
+    if let Some(emu) = skill_create_terminal.as_mut() {
+        let full_width = layout.left.width + layout.main.width + layout.right_top.width;
+        let full_height = layout.left.height + layout.status_bar.height;
         let overlay_cols = full_width.saturating_mul(90).saturating_div(100).saturating_sub(2);
         let overlay_rows = full_height.saturating_mul(80).saturating_div(100).saturating_sub(2);
         if overlay_cols > 0 && overlay_rows > 0 {
@@ -2636,10 +2925,11 @@ fn launch_claude_with_args(
     args: &[&str],
 ) {
     let project_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+    let project_name = app.projects[wt_id.0].name.clone();
 
     // worktree に siki 用 hook を注入
     let sock = config::sock_path();
-    if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock) {
+    if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock, &project_name) {
         app.show_error(format!("hook 注入に失敗: {}", e));
     }
     let claude_idx = app
@@ -2860,7 +3150,7 @@ fn handle_right_panel_key(
                         if let Some(wt) = app.worktree_by_id(wt_id) {
                             if wt.right_panel_mode == app::RightPanelMode::Diff {
                                 let wt_path = wt.path.clone();
-                                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                 diff_view.load(&wt_path, &base);
                             }
                         }
@@ -2890,9 +3180,9 @@ fn handle_right_panel_key(
     }
 }
 
-/// プロジェクトパスから base_branch を解決する
-fn resolve_base_branch(project_path: &std::path::Path) -> String {
-    config::load_siki_json(project_path)
+/// プロジェクトパスとプロジェクト名から base_branch を解決する
+fn resolve_base_branch(project_path: &std::path::Path, project_name: &str) -> String {
+    config::load_effective_siki_json(project_path, project_name)
         .and_then(|sj| sj.base_branch)
         .or_else(|| {
             config::load_config(&config::default_config_path())
@@ -2994,6 +3284,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(app.running);
@@ -3006,6 +3297,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -3028,6 +3320,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(!app.show_help);
@@ -3040,6 +3333,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('?'))),
@@ -3062,6 +3356,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_help = true;
@@ -3074,6 +3369,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -3096,6 +3392,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_help = true;
@@ -3109,6 +3406,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -3132,6 +3430,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -3144,6 +3443,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
@@ -3166,6 +3466,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.focused_panel = app::Panel::Main;
@@ -3178,6 +3479,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Tab)),
@@ -3201,6 +3503,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -3213,6 +3516,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::BackTab)),
@@ -3235,6 +3539,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -3247,6 +3552,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(shift_key(KeyCode::Tab)),
@@ -3271,6 +3577,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -3284,6 +3591,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -3307,6 +3615,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -3320,6 +3629,7 @@ mod tests {
                 &mut terminals,
                 &mut claude_terms,
                 &mut siki_init_terminal,
+                &mut skill_create_terminal,
                 &tx,
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
@@ -3343,6 +3653,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -3356,6 +3667,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
@@ -3378,6 +3690,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_message_popup = true;
@@ -3391,6 +3704,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -3416,6 +3730,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.selected_worktree = Some((0, 0));
@@ -3429,6 +3744,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(ctrl_key('\\')),
@@ -3451,6 +3767,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // worktree 未選択で Terminal パネルにキーを送る
@@ -3464,6 +3781,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -3488,6 +3806,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_info("test".to_string());
@@ -3504,6 +3823,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Tick,
@@ -3526,6 +3846,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_info("fresh".to_string());
@@ -3539,6 +3860,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Tick,
@@ -3563,6 +3885,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_event(
@@ -3574,6 +3897,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::ClaudeOutput {
@@ -3604,6 +3928,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
@@ -3617,6 +3942,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::ClaudeComplete {
@@ -3645,6 +3971,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
@@ -3658,6 +3985,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::ClaudeError {
@@ -3692,6 +4020,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(left_panel.cursor_index, 0);
@@ -3704,6 +4033,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('j'))),
@@ -3726,6 +4056,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.focused_panel = app::Panel::Main;
@@ -3740,6 +4071,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('i'))),
@@ -3770,6 +4102,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.focused_panel = app::Panel::Right;
@@ -3788,6 +4121,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('t'))),
@@ -3815,6 +4149,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // レイアウトを作成（200x50 ターミナル想定）
@@ -3838,6 +4173,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
@@ -3860,6 +4196,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let layout = ui::layout::compute_layout(ratatui::prelude::Rect::new(0, 0, 200, 50));
@@ -3882,6 +4219,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Mouse(mouse),
@@ -3909,6 +4247,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // カーソルはプロジェクト行 (index 0)
@@ -3922,6 +4261,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -3948,6 +4288,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // カーソルを worktree 行に移動
@@ -3961,6 +4302,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -3986,6 +4328,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_event(
@@ -3997,6 +4340,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('a'))),
@@ -4022,6 +4366,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_event(
@@ -4033,6 +4378,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('S'))),
@@ -4055,6 +4401,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -4068,6 +4415,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -4091,6 +4439,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -4104,6 +4453,7 @@ mod tests {
                 &mut terminals,
                 &mut claude_terms,
                 &mut siki_init_terminal,
+                &mut skill_create_terminal,
                 &tx,
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
@@ -4127,6 +4477,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -4140,6 +4491,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Backspace)),
@@ -4162,6 +4514,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -4176,6 +4529,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -4200,6 +4554,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -4213,6 +4568,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -4262,6 +4618,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_worktree_popup = true;
@@ -4279,6 +4636,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -4313,6 +4671,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(!app.show_add_project_popup);
@@ -4325,6 +4684,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('A'))),
@@ -4349,6 +4709,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -4362,6 +4723,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Esc)),
@@ -4385,6 +4747,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -4398,6 +4761,7 @@ mod tests {
                 &mut terminals,
                 &mut claude_terms,
                 &mut siki_init_terminal,
+                &mut skill_create_terminal,
                 &tx,
                 "/bin/sh",
                 event::AppEvent::Key(key(KeyCode::Char(c))),
@@ -4421,6 +4785,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -4435,6 +4800,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -4458,6 +4824,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -4472,6 +4839,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -4500,6 +4868,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // /tmp は実在するディレクトリ
@@ -4515,6 +4884,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Enter)),
@@ -4541,6 +4911,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         app.show_add_project_popup = true;
@@ -4553,6 +4924,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Key(key(KeyCode::Char('q'))),
@@ -4576,6 +4948,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
+        let mut skill_create_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         assert_eq!(app.focused_panel, app::Panel::Left);
@@ -4596,6 +4969,7 @@ mod tests {
             &mut terminals,
             &mut claude_terms,
             &mut siki_init_terminal,
+            &mut skill_create_terminal,
             &tx,
             "/bin/sh",
             event::AppEvent::Mouse(mouse),

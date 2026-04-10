@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 ///
 /// 既存の設定がある場合はマージし、siki の hook を追加・更新する。
 /// 既存の hook は保持される。
-pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result<()> {
+pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_name: &str) -> Result<()> {
     let claude_dir = worktree_path.join(".claude");
     std::fs::create_dir_all(&claude_dir)
         .with_context(|| format!(".claude ディレクトリの作成に失敗: {}", claude_dir.display()))?;
@@ -58,6 +58,14 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path) -> Result
     std::fs::write(&settings_path, content)
         .with_context(|| format!("settings.json の書き込みに失敗: {}", settings_path.display()))?;
 
+    // プロジェクト固有の Claude Code skills を同期
+    sync_project_skills(worktree_path, project_name);
+
+    // siki が生成したファイルを git 追跡から除外
+    exclude_from_git(worktree_path, ".mcp.json");
+    exclude_from_git(worktree_path, ".claude/rules/siki.md");
+    exclude_from_git(worktree_path, ".claude/siki-handoff.md");
+
     Ok(())
 }
 
@@ -104,11 +112,59 @@ fn inject_mcp_json(worktree_path: &Path) {
     if let Ok(content) = serde_json::to_string_pretty(&config) {
         let _ = std::fs::write(&mcp_path, content);
     }
+}
 
-    // siki が生成したファイルを git 追跡から除外
-    exclude_from_git(worktree_path, ".mcp.json");
-    exclude_from_git(worktree_path, ".claude/rules/siki.md");
-    exclude_from_git(worktree_path, ".claude/siki-handoff.md");
+/// ~/.siki/workspaces/<project>/skills/<name>/ ディレクトリを
+/// worktree の .claude/skills/<name> にシンボリックリンクする
+pub fn sync_project_skills(worktree_path: &Path, project_name: &str) {
+    let skills_src = crate::config::project_skills_dir(project_name);
+    if !skills_src.is_dir() {
+        return;
+    }
+
+    let skills_dst = worktree_path.join(".claude").join("skills");
+    let _ = std::fs::create_dir_all(&skills_dst);
+
+    let entries = match std::fs::read_dir(&skills_src) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // ディレクトリのみ対象（skills/<name>/SKILL.md 形式）
+        if !path.is_dir() {
+            continue;
+        }
+        // SKILL.md が存在しないディレクトリはスキップ
+        if !path.join("SKILL.md").exists() {
+            continue;
+        }
+        let dir_name = match path.file_name() {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+        let dst = skills_dst.join(&dir_name);
+
+        // リポジトリ側に同名ディレクトリが既にあればスキップ（リポジトリ側優先）
+        if dst.exists() && !dst.is_symlink() {
+            continue;
+        }
+
+        // 既存のシンボリックリンクは再作成
+        if dst.is_symlink() {
+            let _ = std::fs::remove_file(&dst);
+        }
+
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&path, &dst);
+        }
+
+        // シンボリックリンクを git 追跡から除外
+        let relative = format!(".claude/skills/{}", dir_name.to_string_lossy());
+        exclude_from_git(worktree_path, &relative);
+    }
 }
 
 /// .claude/rules/siki.md にセッション開始ルールを書き込む
@@ -294,7 +350,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let sock_path = dir.path().join("test.sock");
 
-        ensure_hooks_configured(dir.path(), &sock_path).unwrap();
+        ensure_hooks_configured(dir.path(), &sock_path, "test-project").unwrap();
 
         let settings_path = dir.path().join(".claude/settings.json");
         assert!(settings_path.exists());
@@ -332,7 +388,7 @@ mod tests {
         .unwrap();
 
         let sock_path = dir.path().join("test.sock");
-        ensure_hooks_configured(dir.path(), &sock_path).unwrap();
+        ensure_hooks_configured(dir.path(), &sock_path, "test-project").unwrap();
 
         let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
         let settings: Value = serde_json::from_str(&content).unwrap();
