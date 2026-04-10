@@ -26,6 +26,8 @@ pub struct TextSelection {
     pub active: bool,
     /// 選択が開始されたパネル
     pub panel: SelectionPanel,
+    /// 選択開始時のスクロールオフセット（Claude/Terminal: scrollback, File: scroll_offset）
+    pub scroll_at_select: usize,
 }
 
 impl TextSelection {
@@ -43,6 +45,27 @@ impl TextSelection {
     /// start == end なら空選択
     pub fn is_empty(&self) -> bool {
         self.anchor == self.current
+    }
+
+    /// 現在のスクロールオフセットに合わせて座標を調整した (start, end) を返す
+    /// スクロールアップ → 選択行は画面の下方向にずれる
+    pub fn adjusted_normalize(&self, current_scroll: usize, max_row: u16) -> Option<(TermPos, TermPos)> {
+        let delta = current_scroll as i32 - self.scroll_at_select as i32;
+        let adjust = |pos: TermPos| -> Option<TermPos> {
+            let new_row = pos.row as i32 + delta;
+            if new_row < 0 || new_row > max_row as i32 {
+                None
+            } else {
+                Some(TermPos { row: new_row as u16, col: pos.col })
+            }
+        };
+        let a = adjust(self.anchor)?;
+        let b = adjust(self.current)?;
+        if a.row < b.row || (a.row == b.row && a.col <= b.col) {
+            Some((a, b))
+        } else {
+            Some((b, a))
+        }
     }
 }
 
@@ -85,6 +108,7 @@ mod tests {
             current: TermPos { row: 2, col: 3 },
             active: false,
             panel: SelectionPanel::Claude,
+            scroll_at_select: 0,
         };
         let (start, end) = sel.normalize();
         assert_eq!(start, TermPos { row: 0, col: 5 });
@@ -98,6 +122,7 @@ mod tests {
             current: TermPos { row: 0, col: 5 },
             active: false,
             panel: SelectionPanel::Claude,
+            scroll_at_select: 0,
         };
         let (start, end) = sel.normalize();
         assert_eq!(start, TermPos { row: 0, col: 5 });
@@ -122,6 +147,7 @@ mod tests {
             current: TermPos { row: 1, col: 5 },
             active: false,
             panel: SelectionPanel::Claude,
+            scroll_at_select: 0,
         };
         assert!(sel.is_empty());
     }

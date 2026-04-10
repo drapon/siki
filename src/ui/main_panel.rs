@@ -191,7 +191,11 @@ fn render_claude_terminal(
         if sel.panel != crate::selection::SelectionPanel::Claude {
             return;
         }
-        let (start, end) = sel.normalize();
+        let current_scroll = screen.scrollback();
+        let max_row = content_area.height.saturating_sub(1);
+        let Some((start, end)) = sel.adjusted_normalize(current_scroll, max_row) else {
+            return;
+        };
         let buf = frame.buffer_mut();
         for row in start.row..=end.row {
             let screen_y = content_area.y + row;
@@ -310,16 +314,17 @@ fn render_file(
         .get(file.search_match_idx)
         .copied();
 
-    // 選択範囲を正規化 (ファイル行に変換)
+    // 選択範囲を正規化 (ファイル行に変換、選択時のスクロールオフセットを使用)
     let sel_range = selection.and_then(|sel| {
         if sel.is_empty() {
             return None;
         }
         let (s, e) = sel.normalize();
+        let base = sel.scroll_at_select;
         Some((
-            file.scroll_offset + s.row as usize,
+            base + s.row as usize,
             s.col,
-            file.scroll_offset + e.row as usize,
+            base + e.row as usize,
             e.col,
         ))
     });

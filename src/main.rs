@@ -425,6 +425,23 @@ async fn handle_event(
                 return;
             }
 
+            // 選択中の y / Ctrl+C でコピー、Esc で選択解除
+            if app.text_selection.is_some() {
+                let is_copy = key.code == KeyCode::Char('y')
+                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+                if is_copy {
+                    copy_selection(app, claude_terms, terminals);
+                    app.text_selection = None;
+                    return;
+                } else if key.code == KeyCode::Esc {
+                    app.text_selection = None;
+                    return;
+                } else {
+                    // その他のキーで選択解除して通常処理へ
+                    app.text_selection = None;
+                }
+            }
+
             // Terminal パネルフォーカス中は特別処理
             if app.focused_panel == app::Panel::Terminal {
                 handle_terminal_key(app, terminals, event_tx, shell, key);
@@ -685,11 +702,19 @@ async fn handle_event(
                                 ui::main_panel::click_file_line(app, layout.main, mouse.row);
                                 let content_area = app.file_content_area.unwrap();
                                 let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
+                                let file_scroll = app.selected_worktree()
+                                    .and_then(|wt| {
+                                        let search_offset = if app.show_grep_results_view { 1 } else { 0 };
+                                        let fi = wt.active_tab.checked_sub(wt.claude_tabs + search_offset)?;
+                                        wt.open_files.get(fi).map(|f| f.scroll_offset)
+                                    })
+                                    .unwrap_or(0);
                                 app.text_selection = Some(selection::TextSelection {
                                     anchor: pos,
                                     current: pos,
                                     active: true,
                                     panel: selection::SelectionPanel::File,
+                                    scroll_at_select: file_scroll,
                                 });
                                 file_selection_started = true;
                             }
@@ -705,22 +730,31 @@ async fn handle_event(
                         {
                             let content_area = app.claude_content_area.unwrap();
                             let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
+                            let wt_id = app.selected_worktree.unwrap();
+                            let tab = app.selected_worktree().map(|wt| wt.active_tab).unwrap_or(0);
+                            let scrollback = claude_terms.get(&(wt_id, tab)).map(|emu| emu.scrollback()).unwrap_or(0);
                             app.text_selection = Some(selection::TextSelection {
                                 anchor: pos,
                                 current: pos,
                                 active: true,
                                 panel: selection::SelectionPanel::Claude,
+                                scroll_at_select: scrollback,
                             });
                         } else if hit_panel == Some(app::Panel::Terminal)
                             && app.terminal_content_area.is_some()
                         {
                             let content_area = app.terminal_content_area.unwrap();
                             let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
+                            let scrollback = app.selected_worktree.and_then(|wt_id| {
+                                let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_terminal).unwrap_or(0);
+                                terminals.get(&(wt_id, tab)).map(|emu| emu.scrollback())
+                            }).unwrap_or(0);
                             app.text_selection = Some(selection::TextSelection {
                                 anchor: pos,
                                 current: pos,
                                 active: true,
                                 panel: selection::SelectionPanel::Terminal,
+                                scroll_at_select: scrollback,
                             });
                         } else if hit_panel == Some(app::Panel::Right) {
                             app.text_selection = None;
@@ -809,50 +843,11 @@ async fn handle_event(
                     }
                 }
                 MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                    let sel_info = app.text_selection.as_ref().map(|s| (s.active && !s.is_empty(), s.normalize(), s.panel));
                     if let Some(ref mut sel) = app.text_selection {
                         if sel.active {
                             sel.active = false;
                             if sel.is_empty() {
                                 app.text_selection = None;
-                            }
-                        }
-                    }
-                    if let Some((true, (start, end), panel)) = sel_info {
-                        if let Some(wt_id) = app.selected_worktree {
-                            match panel {
-                                selection::SelectionPanel::File => {
-                                    // ファイルビューからテキスト抽出
-                                    let text = extract_file_selection(app, &start, &end);
-                                    if let Some(text) = text {
-                                        if !text.is_empty() {
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                let _ = clipboard.set_text(text);
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    let screen = match panel {
-                                        selection::SelectionPanel::Claude => {
-                                            let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_tab).unwrap_or(0);
-                                            claude_terms.get(&(wt_id, tab)).map(|emu| emu.screen())
-                                        }
-                                        selection::SelectionPanel::Terminal => {
-                                            let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_terminal).unwrap_or(0);
-                                            terminals.get(&(wt_id, tab)).map(|emu| emu.screen())
-                                        }
-                                        selection::SelectionPanel::File => unreachable!(),
-                                    };
-                                    if let Some(screen) = screen {
-                                        let text = selection::extract_text(screen, &start, &end);
-                                        if !text.is_empty() {
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                let _ = clipboard.set_text(text);
-                                            }
-                                        }
-                                    }
-                                }
                             }
                         }
                     }
@@ -1677,9 +1672,59 @@ fn handle_terminal_tab_click(
     }
 }
 
+/// 選択範囲のテキストをクリップボードにコピーする
+fn copy_selection(
+    app: &app::App,
+    claude_terms: &HashMap<TerminalKey, terminal::TerminalEmulator>,
+    terminals: &HashMap<TerminalKey, terminal::TerminalEmulator>,
+) {
+    let sel = match app.text_selection.as_ref() {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+    let text = match sel.panel {
+        selection::SelectionPanel::File => {
+            let (start, end) = sel.normalize();
+            extract_file_selection(app, sel, &start, &end)
+        }
+        _ => {
+            let wt_id = match app.selected_worktree {
+                Some(id) => id,
+                None => return,
+            };
+            let (emu, content_area) = match sel.panel {
+                selection::SelectionPanel::Claude => {
+                    let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_tab).unwrap_or(0);
+                    (claude_terms.get(&(wt_id, tab)), app.claude_content_area)
+                }
+                selection::SelectionPanel::Terminal => {
+                    let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_terminal).unwrap_or(0);
+                    (terminals.get(&(wt_id, tab)), app.terminal_content_area)
+                }
+                selection::SelectionPanel::File => unreachable!(),
+            };
+            emu.and_then(|emu| {
+                let current_scroll = emu.scrollback();
+                let max_row = content_area.map(|a| a.height.saturating_sub(1)).unwrap_or(0);
+                let (start, end) = sel.adjusted_normalize(current_scroll, max_row)?;
+                let text = selection::extract_text(emu.screen(), &start, &end);
+                Some(text)
+            })
+        }
+    };
+    if let Some(text) = text {
+        if !text.is_empty() {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(text);
+            }
+        }
+    }
+}
+
 /// ファイルビューの選択範囲からテキストを抽出する
 fn extract_file_selection(
     app: &app::App,
+    sel: &selection::TextSelection,
     start: &selection::TermPos,
     end: &selection::TermPos,
 ) -> Option<String> {
@@ -1689,9 +1734,9 @@ fn extract_file_selection(
     let file_index = wt.active_tab.checked_sub(offset)?;
     let file = wt.open_files.get(file_index)?;
 
-    // 選択範囲の行 (content_area 内の相対行 + scroll_offset)
-    let start_line = file.scroll_offset + start.row as usize;
-    let end_line = file.scroll_offset + end.row as usize;
+    // 選択時のスクロールオフセットを使用して絶対行番号に変換
+    let start_line = sel.scroll_at_select + start.row as usize;
+    let end_line = sel.scroll_at_select + end.row as usize;
 
     // 行番号プレフィックス "1234 " = 5文字分をスキップ
     const LINE_NUM_WIDTH: u16 = 5;

@@ -196,6 +196,8 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  Tab        : 次のパネルへ",
         "  Shift+Tab  : 前のパネルへ",
         "  クリック    : パネル切替",
+        "  ドラッグ    : テキスト選択",
+        "  y          : 選択範囲をコピー",
         "  ホイール    : スクロール",
         "",
         "[左パネル]",
@@ -632,7 +634,9 @@ fn render_terminal(
             // 選択範囲のハイライト描画
             if let Some(ref sel) = app.text_selection {
                 if sel.panel == SelectionPanel::Terminal {
-                    let (start, end) = sel.normalize();
+                    let current_scroll = screen.scrollback();
+                    let max_row = content_area.height.saturating_sub(1);
+                    if let Some((start, end)) = sel.adjusted_normalize(current_scroll, max_row) {
                     let buf = frame.buffer_mut();
                     for row in start.row..=end.row {
                         let screen_y = content_area.y + row;
@@ -656,6 +660,7 @@ fn render_terminal(
                             cell.set_fg(if bg == Color::Reset { Color::Black } else { bg });
                             cell.set_bg(if fg == Color::Reset { Color::White } else { fg });
                         }
+                    }
                     }
                 }
             }
