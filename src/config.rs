@@ -398,6 +398,11 @@ pub fn discover_projects() -> Vec<ProjectConfig> {
                     None => continue,
                 };
 
+                // .git が存在しないディレクトリは worktree ではない（skills 等をスキップ）
+                if !sub_path.join(".git").exists() {
+                    continue;
+                }
+
                 // git ブランチ名を取得
                 let branch = std::process::Command::new("git")
                     .args(["-C", &sub_path.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"])
@@ -543,49 +548,6 @@ pub fn load_effective_siki_json(project_path: &Path, project_name: &str) -> Opti
 /// プロジェクト固有の Claude Code skills ディレクトリパスを返す
 pub fn project_skills_dir(project_name: &str) -> PathBuf {
     workspaces_dir().join(project_name).join("skills")
-}
-
-/// スキル作成用の Claude Code プロンプトを返す
-pub fn skill_create_prompt(project_name: &str, skill_name: &str) -> String {
-    format!(
-        r#"あなたはプロジェクト "{project_name}" 用の Claude Code skill "/{skill_name}" を作成するアシスタントです。
-
-## 手順
-
-1. ユーザーに「/{skill_name}」スキルがどのような処理を行うべきか質問してください
-2. プロジェクトのコード構造を分析してコンテキストを把握してください
-3. スキルの内容を作成してください
-
-## スキルファイルのフォーマット
-
-スキルファイルは Markdown 形式の .md ファイルです。以下の構造に従ってください：
-
-```markdown
-# スキル名 - 簡潔な説明
-
-## 説明
-このスキルが何をするか
-
-## 動作手順
-1. ステップ1
-2. ステップ2
-...
-```
-
-## 保存方法
-
-スキルの内容が完成したら、必ず `save_skill` MCP ツールを使って保存してください：
-- project_name: "{project_name}"
-- skill_name: "{skill_name}"
-- content: スキルの全内容（SKILL.md として保存されます）
-
-## 注意事項
-- まず `list_skills` ツールで既存のスキルを確認し、重複を避けてください
-- スキルはこのプロジェクト固有のものです
-- 実用的で具体的な内容にしてください
-
-ユーザーに /{skill_name} の目的を聞いてください。"#
-    )
 }
 
 /// Unix ソケットのパスを返す: ~/.siki/sock

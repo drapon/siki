@@ -43,7 +43,6 @@ pub fn render(
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
     siki_init_screen: Option<&vt100::Screen>,
-    skill_create_screen: Option<&vt100::Screen>,
     session_registry: Option<&SessionRegistry>,
     grep_rows: &[grep_view::DisplayRow],
 ) -> layout::AppLayout {
@@ -157,15 +156,9 @@ pub fn render(
         render_skill_name_popup(frame, app);
     }
 
-    // スキル作成オーバーレイターミナル
-    if app.show_skill_create_terminal {
-        render_skill_create_terminal(
-            frame,
-            skill_create_screen,
-            app.skill_create_scroll,
-            app.skill_create_spinner,
-            app.skill_name_input.as_str(),
-        );
+    // スキル内容入力ポップアップ
+    if app.show_skill_edit_popup {
+        render_skill_edit_popup(frame, app);
     }
 
     // スキル一覧ポップアップ
@@ -725,29 +718,10 @@ fn render_skill_name_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_skill_create_terminal(
-    frame: &mut Frame,
-    screen: Option<&vt100::Screen>,
-    scroll_offset: usize,
-    spinner: usize,
-    skill_name: &str,
-) {
-    let area = centered_rect(90, 80, frame.area());
-
-    let spinner_chars = ['|', '/', '-', '\\'];
-    let spinner_char = spinner_chars[spinner % spinner_chars.len()];
-
-    let title = if scroll_offset > 0 {
-        format!(
-            "Skill: {} [↑{}行] (Scroll: ホイール/Shift+PgUp,PgDn  Esc で閉じる)",
-            skill_name, scroll_offset
-        )
-    } else {
-        format!(
-            "Skill: {} (Scroll: ホイール/Shift+PgUp,PgDn  Esc で閉じる)",
-            skill_name
-        )
-    };
+fn render_skill_edit_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(80, 80, frame.area());
+    let skill_name = &app.skill_name_input;
+    let title = format!("Skill: /{} (Enter: 保存  Shift+Enter: 改行  Esc: キャンセル)", skill_name);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -756,23 +730,28 @@ fn render_skill_create_terminal(
 
     frame.render_widget(ratatui::widgets::Clear, area);
 
-    let is_loading = match screen {
-        Some(screen) => screen.contents().trim().is_empty(),
-        None => true,
+    let s = &app.skill_content_input;
+    let cur = app.skill_content_cursor;
+
+    // カーソル位置の文字を反転表示するために Span に分割
+    let (before, cursor_char, after) = if cur >= s.len() {
+        (s.as_str(), " ", "")
+    } else {
+        let ch_len = s[cur..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        (&s[..cur], &s[cur..cur + ch_len], &s[cur + ch_len..])
     };
 
-    if is_loading {
-        let loading_text = format!("\n\n  {} Claude を起動中...", spinner_char);
-        frame.render_widget(
-            Paragraph::new(loading_text)
-                .block(block)
-                .style(Style::default().fg(Color::Green)),
-            area,
-        );
-    } else if let Some(screen) = screen {
-        let pseudo_term = tui_term::widget::PseudoTerminal::new(screen).block(block);
-        frame.render_widget(pseudo_term, area);
-    }
+    let line = Line::from(vec![
+        Span::raw(before),
+        Span::styled(cursor_char, Style::default().bg(Color::White).fg(Color::Black)),
+        Span::raw(after),
+    ]);
+
+    let paragraph = Paragraph::new(line)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
 }
 
 fn render_skill_list_popup(frame: &mut Frame, app: &App) {

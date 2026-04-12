@@ -268,12 +268,12 @@ pub struct App {
     pub skill_name_input: String,
     /// スキル作成対象のプロジェクト名
     pub skill_project_name: Option<String>,
-    /// スキル作成オーバーレイターミナル表示中フラグ
-    pub show_skill_create_terminal: bool,
-    /// スキル作成オーバーレイのスクロールオフセット
-    pub skill_create_scroll: usize,
-    /// スキル作成オーバーレイのスピナーカウンタ
-    pub skill_create_spinner: usize,
+    /// スキル内容入力ポップアップ表示フラグ
+    pub show_skill_edit_popup: bool,
+    /// スキル内容入力バッファ
+    pub skill_content_input: String,
+    /// スキル内容入力のカーソル位置（バイトオフセット）
+    pub skill_content_cursor: usize,
     /// スキル一覧ポップアップ表示フラグ
     pub show_skill_list: bool,
     /// スキル一覧データ (name, content)
@@ -354,9 +354,9 @@ impl App {
             show_skill_name_popup: false,
             skill_name_input: String::new(),
             skill_project_name: None,
-            show_skill_create_terminal: false,
-            skill_create_scroll: 0,
-            skill_create_spinner: 0,
+            show_skill_edit_popup: false,
+            skill_content_input: String::new(),
+            skill_content_cursor: 0,
             show_skill_list: false,
             skill_list_items: Vec::new(),
             skill_list_cursor: 0,
