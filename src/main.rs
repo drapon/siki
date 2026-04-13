@@ -1985,11 +1985,20 @@ fn handle_left_panel_key(
     shell: &str,
     key: crossterm::event::KeyEvent,
 ) {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // 一部ターミナルでは Shift+l が KeyCode::Char('l') + SHIFT として送られるため、
+    // 大文字に正規化する
+    let code = match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() => {
+            KeyCode::Char(c.to_ascii_uppercase())
+        }
+        other => other,
+    };
 
     let entries = LeftPanel::build_entries(&app.projects);
 
-    match key.code {
+    match code {
         KeyCode::Char('j') | KeyCode::Down => {
             left_panel.move_down(entries.len());
         }
