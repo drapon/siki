@@ -274,6 +274,10 @@ pub struct App {
     pub skill_content_input: String,
     /// スキル内容入力のカーソル位置（バイトオフセット）
     pub skill_content_cursor: usize,
+    /// スキル内容を Claude で整形中
+    pub skill_refining: bool,
+    /// スキル整形中のスピナーカウンタ
+    pub skill_refine_spinner: usize,
     /// スキル一覧ポップアップ表示フラグ
     pub show_skill_list: bool,
     /// スキル一覧データ (name, content)
@@ -357,6 +361,8 @@ impl App {
             show_skill_edit_popup: false,
             skill_content_input: String::new(),
             skill_content_cursor: 0,
+            skill_refining: false,
+            skill_refine_spinner: 0,
             show_skill_list: false,
             skill_list_items: Vec::new(),
             skill_list_cursor: 0,

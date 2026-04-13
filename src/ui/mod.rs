@@ -225,8 +225,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  R          : プロジェクト表示名変更",
         "  S          : siki.json 作成",
         "  r          : run スクリプト実行",
-        "  K          : スキル作成",
-        "  L          : スキル一覧",
+        "  K          : スキル管理",
         "  d          : worktree アーカイブ / プロジェクト除外",
         "",
         "[中央パネル]",
@@ -721,7 +720,10 @@ fn render_skill_name_popup(frame: &mut Frame, app: &App) {
 fn render_skill_edit_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(80, 80, frame.area());
     let skill_name = &app.skill_name_input;
-    let title = format!("Skill: /{} (Enter: 保存  Shift+Enter: 改行  Esc: キャンセル)", skill_name);
+    let title = format!(
+        "Skill: /{} (Enter: 保存  Shift+Enter: 改行  Ctrl+R: Claude整形  Esc: キャンセル)",
+        skill_name
+    );
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -733,35 +735,79 @@ fn render_skill_edit_popup(frame: &mut Frame, app: &App) {
     let s = &app.skill_content_input;
     let cur = app.skill_content_cursor;
 
-    // カーソル位置の文字を反転表示するために Span に分割
-    let (before, cursor_char, after) = if cur >= s.len() {
+    // カーソル位置で before / cursor_char / after に分割
+    let (before_str, cursor_str, after_str) = if cur >= s.len() {
         (s.as_str(), " ", "")
     } else {
         let ch_len = s[cur..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         (&s[..cur], &s[cur..cur + ch_len], &s[cur + ch_len..])
     };
 
-    let line = Line::from(vec![
-        Span::raw(before),
-        Span::styled(cursor_char, Style::default().bg(Color::White).fg(Color::Black)),
-        Span::raw(after),
-    ]);
+    // 改行を含むテキストを行ごとに分割して Line のリストを構築
+    let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+    let full = format!("{}\x00{}", before_str, after_str); // \x00 をカーソル位置マーカーに
+    let _ = full; // unused
 
-    let paragraph = Paragraph::new(line)
-        .block(block)
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    // before の行数でカーソルの行を特定
+    let before_lines: Vec<&str> = before_str.split('\n').collect();
+    let after_lines: Vec<&str> = after_str.split('\n').collect();
+    let cursor_line_idx = before_lines.len() - 1;
 
-    frame.render_widget(paragraph, area);
+    // 全体を行ごとに構築
+    let mut lines: Vec<Line> = Vec::new();
+
+    // カーソル前の行（カーソル行より前）
+    for line_str in &before_lines[..cursor_line_idx] {
+        lines.push(Line::from(*line_str));
+    }
+
+    // カーソル行: before の最後の部分 + カーソル文字 + after の最初の部分
+    let cursor_line_before = before_lines[cursor_line_idx];
+    let cursor_line_after = after_lines.first().copied().unwrap_or("");
+    let cursor_display = if cursor_str == "\n" { " " } else { cursor_str };
+    lines.push(Line::from(vec![
+        Span::raw(cursor_line_before),
+        Span::styled(cursor_display, cursor_style),
+        Span::raw(cursor_line_after),
+    ]));
+
+    // カーソル後の行（after の2行目以降）
+    for line_str in after_lines.iter().skip(1) {
+        lines.push(Line::from(*line_str));
+    }
+
+    // カーソルが改行文字上にある場合、afterの最初の行は次の行に入るので追加行は不要
+
+    // 整形中はスピナーを左下に表示
+    if app.skill_refining {
+        let spinner_chars = ['|', '/', '-', '\\'];
+        let spinner = spinner_chars[app.skill_refine_spinner % spinner_chars.len()];
+        let block = block.title_bottom(format!(" {} Claude で整形中... ", spinner));
+
+        let text = ratatui::text::Text::from(lines)
+            .style(Style::default().fg(Color::DarkGray));
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    } else {
+        let text = ratatui::text::Text::from(lines);
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
 }
 
 fn render_skill_list_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(80, 80, frame.area());
 
     let project = app.skill_project_name.as_deref().unwrap_or("?");
-    let title = format!("Skills: {} (j/k: 移動  d: 削除  Esc: 閉じる)", project);
+    let title = format!("Skills: {}", project);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
+        .title_bottom(" n: 新規  Enter: 編集  d: 削除  Esc: 閉じる ")
         .border_style(Style::default().fg(Color::Cyan));
 
     frame.render_widget(ratatui::widgets::Clear, area);
@@ -771,13 +817,13 @@ fn render_skill_list_popup(frame: &mut Frame, app: &App) {
 
     if app.skill_list_items.is_empty() {
         frame.render_widget(
-            Paragraph::new("  (スキルなし)").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("\n  スキルがありません\n\n  n キーで新規作成").style(Style::default().fg(Color::DarkGray)),
             inner,
         );
         return;
     }
 
-    // 左: スキル名リスト (幅20), 右: 内容プレビュー
+    // 左: スキル名リスト (幅24), 右: 内容プレビュー
     let chunks = Layout::horizontal([
         Constraint::Length(24),
         Constraint::Min(0),

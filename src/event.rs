@@ -59,6 +59,8 @@ pub enum AppEvent {
         project_index: usize,
         branches: Vec<String>,
     },
+    /// スキル整形完了（claude -c の結果）
+    SkillRefineResult(Result<String, String>),
     /// ペースト入力（ブラケットペーストモード）
     Paste(String),
 }

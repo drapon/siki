@@ -339,7 +339,7 @@ async fn handle_event(
 
             // スキル内容入力ポップアップ表示中
             if app.show_skill_edit_popup {
-                handle_skill_edit_popup_key(app, key);
+                handle_skill_edit_popup_key(app, key, event_tx);
                 return;
             }
 
@@ -1099,10 +1099,25 @@ async fn handle_event(
                 }
             }
         }
+        AppEvent::SkillRefineResult(result) => {
+            app.skill_refining = false;
+            match result {
+                Ok(text) => {
+                    app.skill_content_input = text.trim().to_string();
+                    app.skill_content_cursor = app.skill_content_input.len();
+                }
+                Err(e) => {
+                    app.show_error(format!("Claude 整形エラー: {}", e));
+                }
+            }
+        }
         AppEvent::Tick => {
             app.clear_expired_status();
             if app.show_siki_json_init_terminal {
                 app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
+            }
+            if app.skill_refining {
+                app.skill_refine_spinner = app.skill_refine_spinner.wrapping_add(1);
             }
             // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
             if let Some(registry) = session_registry {
@@ -2022,21 +2037,9 @@ fn handle_left_panel_key(
                 None => None,
             };
             if let Some(pi) = project_index {
-                app.skill_project_name = Some(app.projects[pi].name.clone());
-                app.skill_name_input.clear();
-                app.show_skill_name_popup = true;
-            }
-        }
-        KeyCode::Char('L') => {
-            // スキル一覧ポップアップを開く
-            let project_index = match left_panel.current_entry(&entries) {
-                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
-                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => Some(*project_index),
-                None => None,
-            };
-            if let Some(pi) = project_index {
                 let project_name = &app.projects[pi].name;
                 app.skill_project_name = Some(project_name.clone());
+                // 既存スキルを読み込む
                 let skills_dir = config::project_skills_dir(project_name);
                 let mut items = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(&skills_dir) {
@@ -2057,11 +2060,7 @@ fn handle_left_panel_key(
                 items.sort_by(|a, b| a.0.cmp(&b.0));
                 app.skill_list_items = items;
                 app.skill_list_cursor = 0;
-                if app.skill_list_items.is_empty() {
-                    app.show_info("スキルがありません。K キーで作成できます".to_string());
-                } else {
-                    app.show_skill_list = true;
-                }
+                app.show_skill_list = true;
             }
         }
         KeyCode::Char('R') => {
@@ -2374,8 +2373,21 @@ fn save_skill_content(app: &mut app::App) {
 fn handle_skill_edit_popup_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    // 整形中はキー入力を無視
+    if app.skill_refining {
+        return;
+    }
+
+    // Shift+Enter → Ctrl+J として来る → 改行
+    if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.skill_content_input.insert(app.skill_content_cursor, '\n');
+        app.skill_content_cursor += 1;
+        return;
+    }
 
     // Ctrl+S で保存
     if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2383,21 +2395,62 @@ fn handle_skill_edit_popup_key(
         return;
     }
 
-    // Enter（修飾キーなし）で保存
-    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
-        save_skill_content(app);
+    // Ctrl+R で Claude 整形
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app.skill_content_input.trim().is_empty() {
+            app.show_info("整形するテキストがありません".to_string());
+            return;
+        }
+        app.skill_refining = true;
+        app.skill_refine_spinner = 0;
+        let content = app.skill_content_input.clone();
+        let skill_name = app.skill_name_input.clone();
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let prompt = format!(
+                "以下のテキストを Claude Code の skill ファイル（SKILL.md）として適切なフォーマットに整形してください。\n\
+                スキル名: /{}\n\n\
+                整形ルール:\n\
+                - Markdown形式で構造化する\n\
+                - 説明、動作手順、注意事項などのセクションを適切に追加する\n\
+                - 元のテキストの意図を保持する\n\
+                - 整形結果のみを出力し、説明や前置きは不要\n\n\
+                ---\n{}", skill_name, content
+            );
+            let result = tokio::process::Command::new("claude")
+                .args(["-p", &prompt])
+                .output()
+                .await;
+            match result {
+                Ok(output) if output.status.success() => {
+                    let text = String::from_utf8_lossy(&output.stdout).to_string();
+                    let _ = tx.send(event::AppEvent::SkillRefineResult(Ok(text)));
+                }
+                Ok(output) => {
+                    let err = String::from_utf8_lossy(&output.stderr).to_string();
+                    let _ = tx.send(event::AppEvent::SkillRefineResult(Err(err)));
+                }
+                Err(e) => {
+                    let _ = tx.send(event::AppEvent::SkillRefineResult(Err(e.to_string())));
+                }
+            }
+        });
         return;
     }
 
-    // Shift+Enter で改行（Shift+Enter が別キーとして来る場合も対応）
-    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
-        app.skill_content_input.insert(app.skill_content_cursor, '\n');
-        app.skill_content_cursor += 1;
+    // Enter: 修飾キーなしで保存、それ以外（Shift等）は改行
+    if key.code == KeyCode::Enter {
+        if key.modifiers == KeyModifiers::NONE {
+            save_skill_content(app);
+        } else {
+            app.skill_content_input.insert(app.skill_content_cursor, '\n');
+            app.skill_content_cursor += 1;
+        }
         return;
     }
 
-    // Ctrl/Super/Meta 付きはスキップ
-    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::META) {
+    // Ctrl/Super/Meta 付きはスキップ（Shiftは通す）
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) {
         return;
     }
 
@@ -2445,6 +2498,11 @@ fn handle_skill_edit_popup_key(
             let line_end = s[*cur..].find('\n').map(|i| *cur + i).unwrap_or(s.len());
             *cur = line_end;
         }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_control() => {
+            // Shift+Enter が制御文字として来た場合 → 改行
+            s.insert(*cur, '\n');
+            *cur += 1;
+        }
         KeyCode::Char(c) => {
             s.insert(*cur, c);
             *cur += c.len_utf8();
@@ -2471,18 +2529,43 @@ fn handle_skill_list_key(
         KeyCode::Char('k') | KeyCode::Up => {
             app.skill_list_cursor = app.skill_list_cursor.saturating_sub(1);
         }
+        KeyCode::Enter => {
+            // 既存スキルを編集
+            if let Some((name, content)) = app.skill_list_items.get(app.skill_list_cursor) {
+                app.skill_name_input = name.clone();
+                app.skill_content_input = content.clone();
+                app.skill_content_cursor = content.len();
+                app.show_skill_list = false;
+                app.show_skill_edit_popup = true;
+            }
+        }
+        KeyCode::Char('n') => {
+            // 新規作成 → スキル名入力へ
+            app.show_skill_list = false;
+            app.skill_name_input.clear();
+            app.show_skill_name_popup = true;
+        }
         KeyCode::Char('d') => {
             // スキル削除
             if let Some((name, _)) = app.skill_list_items.get(app.skill_list_cursor) {
                 if let Some(project_name) = app.skill_project_name.as_deref() {
                     let path = config::project_skills_dir(project_name).join(name);
                     let _ = std::fs::remove_dir_all(&path);
+                    // worktreeのシンボリックリンクも削除
+                    for project in &app.projects {
+                        if project.name == project_name {
+                            for wt in &project.worktrees {
+                                let link = wt.path.join(".claude").join("skills").join(name);
+                                if link.is_symlink() {
+                                    let _ = std::fs::remove_file(&link);
+                                }
+                            }
+                            break;
+                        }
+                    }
                     app.skill_list_items.remove(app.skill_list_cursor);
                     if app.skill_list_cursor >= app.skill_list_items.len() && app.skill_list_cursor > 0 {
                         app.skill_list_cursor -= 1;
-                    }
-                    if app.skill_list_items.is_empty() {
-                        app.show_skill_list = false;
                     }
                 }
             }
