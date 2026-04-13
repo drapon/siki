@@ -220,6 +220,9 @@ pub struct ProjectMeta {
     /// プロジェクト個別のベースブランチ（siki.json が無い場合に使用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    /// プロジェクト個別の共有ディレクトリ（worktree にシンボリックリンクする）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_dirs: Option<Vec<String>>,
 }
 
 /// プロジェクトの project.json パスを返す
@@ -236,6 +239,7 @@ pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
         display_name: existing.as_ref().and_then(|m| m.display_name.clone()),
         scripts: existing.as_ref().and_then(|m| m.scripts.clone()),
         base_branch: existing.as_ref().and_then(|m| m.base_branch.clone()),
+        shared_dirs: existing.as_ref().and_then(|m| m.shared_dirs.clone()),
     };
     let dir = workspaces_dir().join(project_name);
     std::fs::create_dir_all(&dir)
@@ -259,6 +263,63 @@ pub fn save_project_display_name(project_name: &str, display_name: Option<&str>)
     std::fs::write(&meta_path, content)
         .with_context(|| format!("project.json の保存に失敗: {}", meta_path.display()))?;
     Ok(())
+}
+
+/// project.json の shared_dirs のみを更新する
+pub fn save_project_shared_dirs(project_name: &str, shared_dirs: Vec<String>) -> Result<()> {
+    let meta_path = project_meta_path(project_name);
+    let mut meta = load_project_meta(project_name)
+        .ok_or_else(|| anyhow::anyhow!("project.json が見つかりません: {}", project_name))?;
+    meta.shared_dirs = Some(shared_dirs);
+    let content =
+        serde_json::to_string_pretty(&meta).context("project.json のシリアライズに失敗")?;
+    std::fs::write(&meta_path, content)
+        .with_context(|| format!("project.json の保存に失敗: {}", meta_path.display()))?;
+    Ok(())
+}
+
+/// プロジェクト固有の shared_dirs を取得し、無ければグローバル設定にフォールバック
+pub fn load_effective_shared_dirs(project_name: &str) -> Vec<String> {
+    if let Some(meta) = load_project_meta(project_name) {
+        if let Some(dirs) = meta.shared_dirs {
+            return dirs;
+        }
+    }
+    load_config(&default_config_path())
+        .map(|c| c.siki.shared_dirs)
+        .unwrap_or_default()
+}
+
+/// .gitignore からシンボリックリンク候補のディレクトリを発見する
+pub fn discover_symlink_candidates(project_path: &Path) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let gitignore_path = project_path.join(".gitignore");
+    if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                continue;
+            }
+            // 先頭の `/` を除去（ルート指定）してからディレクトリ名を取得
+            let dir_name = line.trim_start_matches('/').trim_end_matches('/');
+            // 単純なディレクトリ名のみ対象（ワイルドカードやネストパスは除外）
+            if dir_name.is_empty()
+                || dir_name.contains('*')
+                || dir_name.contains('?')
+                || dir_name.contains('/')
+                || dir_name == ".git"
+            {
+                continue;
+            }
+            // 実際にディレクトリとして存在するもののみ
+            if project_path.join(dir_name).is_dir() {
+                candidates.push(dir_name.to_string());
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 /// worktree メタデータ
@@ -886,6 +947,7 @@ worktrees = [
             display_name: None,
             scripts: None,
             base_branch: None,
+            shared_dirs: None,
         };
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let meta_path = dir.path().join("project.json");

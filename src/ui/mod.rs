@@ -166,6 +166,11 @@ pub fn render(
         render_skill_list_popup(frame, app);
     }
 
+    // シンボリックリンク設定ポップアップ
+    if app.show_symlink_settings {
+        render_symlink_settings_popup(frame, app);
+    }
+
     areas
 }
 
@@ -226,6 +231,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  S          : siki.json 作成",
         "  r          : run スクリプト実行",
         "  K          : スキル管理",
+        "  L          : シンボリックリンク設定",
         "  d          : worktree アーカイブ / プロジェクト除外",
         "",
         "[中央パネル]",
@@ -853,6 +859,74 @@ fn render_skill_list_popup(frame: &mut Frame, app: &App) {
             .wrap(ratatui::widgets::Wrap { trim: false })
             .style(Style::default().fg(Color::Gray));
         frame.render_widget(preview, chunks[1]);
+    }
+}
+
+fn render_symlink_settings_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 60, frame.area());
+
+    let project = app.symlink_project_name.as_deref().unwrap_or("?");
+    let title = format!("Symlinks: {}", project);
+    let bottom = if app.symlink_input_mode {
+        " Enter: 追加  Esc: キャンセル "
+    } else {
+        " Space: 切替  a: 追加  d: 削除  Enter: 保存  Esc: 戻る "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(bottom)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.symlink_items.is_empty() && !app.symlink_input_mode {
+        frame.render_widget(
+            Paragraph::new("\n  候補が見つかりません\n\n  a キーで手動追加")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    // 入力モード用に下部を確保
+    let (list_area, input_area) = if app.symlink_input_mode {
+        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+
+    // チェックボックスリスト
+    let list_items: Vec<ratatui::widgets::ListItem> = app
+        .symlink_items
+        .iter()
+        .enumerate()
+        .map(|(i, (name, enabled))| {
+            let check = if *enabled { "[x]" } else { "[ ]" };
+            let style = if i == app.symlink_cursor {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if *enabled {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ratatui::widgets::ListItem::new(format!("  {} {}", check, name)).style(style)
+        })
+        .collect();
+    let list = ratatui::widgets::List::new(list_items);
+    frame.render_widget(list, list_area);
+
+    // 入力行
+    if let Some(input_area) = input_area {
+        let input_text = format!("  > {}_ ", app.symlink_input);
+        frame.render_widget(
+            Paragraph::new(input_text).style(Style::default().fg(Color::Yellow)),
+            input_area,
+        );
     }
 }
 

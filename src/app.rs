@@ -284,6 +284,18 @@ pub struct App {
     pub skill_list_items: Vec<(String, String)>,
     /// スキル一覧カーソル位置
     pub skill_list_cursor: usize,
+    /// シンボリックリンク設定ポップアップ表示フラグ
+    pub show_symlink_settings: bool,
+    /// シンボリックリンク設定対象のプロジェクト名
+    pub symlink_project_name: Option<String>,
+    /// シンボリックリンク候補リスト (dir_name, is_enabled)
+    pub symlink_items: Vec<(String, bool)>,
+    /// シンボリックリンク設定カーソル位置
+    pub symlink_cursor: usize,
+    /// シンボリックリンク手動入力モード
+    pub symlink_input_mode: bool,
+    /// シンボリックリンク手動入力バッファ
+    pub symlink_input: String,
     /// セッション選択ポップアップ（新規 Claude タブ起動時）
     pub show_session_choice: bool,
     /// セッション選択対象の worktree ID
@@ -366,6 +378,12 @@ impl App {
             show_skill_list: false,
             skill_list_items: Vec::new(),
             skill_list_cursor: 0,
+            show_symlink_settings: false,
+            symlink_project_name: None,
+            symlink_items: Vec::new(),
+            symlink_cursor: 0,
+            symlink_input_mode: false,
+            symlink_input: String::new(),
             show_session_choice: false,
             session_choice_wt_id: None,
             show_rename_project_popup: false,

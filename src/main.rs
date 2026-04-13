@@ -343,6 +343,12 @@ async fn handle_event(
                 return;
             }
 
+            // シンボリックリンク設定ポップアップ表示中
+            if app.show_symlink_settings {
+                handle_symlink_settings_key(app, key);
+                return;
+            }
+
             // スキル一覧ポップアップ表示中
             if app.show_skill_list {
                 handle_skill_list_key(app, key);
@@ -646,7 +652,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings {
                 return;
             }
             match mouse.kind {
@@ -1444,9 +1450,7 @@ fn finalize_add_worktree(
     let project_path = app.projects[pi].path.clone();
     let wt_path = config::worktree_path(&project_name, &wt_name);
 
-    let shared_dirs = config::load_config(&config::default_config_path())
-        .map(|c| c.siki.shared_dirs)
-        .unwrap_or_default();
+    let shared_dirs = config::load_effective_shared_dirs(&project_name);
 
     if let Err(e) = git::WorktreeManager::create_worktree_from_ref(
         &project_path,
@@ -2063,6 +2067,44 @@ fn handle_left_panel_key(
                 app.show_skill_list = true;
             }
         }
+        KeyCode::Char('L') => {
+            // シンボリックリンク設定ポップアップを開く
+            let project_index = match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
+                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => Some(*project_index),
+                None => None,
+            };
+            if let Some(pi) = project_index {
+                let project_name = &app.projects[pi].name;
+                let project_path = &app.projects[pi].path;
+
+                // .gitignore から候補を発見
+                let candidates = config::discover_symlink_candidates(project_path);
+
+                // 現在の設定を取得
+                let current = config::load_effective_shared_dirs(project_name);
+
+                // マージ: 候補 + 現在有効だが候補にないもの（実在するディレクトリのみ）
+                let mut items: Vec<(String, bool)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for c in &candidates {
+                    seen.insert(c.clone());
+                    items.push((c.clone(), current.contains(c)));
+                }
+                for c in &current {
+                    if seen.insert(c.clone()) && project_path.join(c).is_dir() {
+                        items.push((c.clone(), true));
+                    }
+                }
+
+                app.symlink_project_name = Some(project_name.clone());
+                app.symlink_items = items;
+                app.symlink_cursor = 0;
+                app.symlink_input_mode = false;
+                app.symlink_input.clear();
+                app.show_symlink_settings = true;
+            }
+        }
         KeyCode::Char('R') => {
             // 表示名変更ポップアップを開く（プロジェクト行 or worktree 行）
             match left_panel.current_entry(&entries) {
@@ -2512,6 +2554,108 @@ fn handle_skill_edit_popup_key(
 }
 
 /// スキル一覧ポップアップのキー処理
+fn handle_symlink_settings_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+    if app.symlink_input_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.symlink_input_mode = false;
+                app.symlink_input.clear();
+            }
+            KeyCode::Enter => {
+                let name = app.symlink_input.trim().to_string();
+                if !name.is_empty() && !app.symlink_items.iter().any(|(n, _)| n == &name) {
+                    app.symlink_items.push((name, true));
+                    app.symlink_cursor = app.symlink_items.len() - 1;
+                }
+                app.symlink_input_mode = false;
+                app.symlink_input.clear();
+            }
+            KeyCode::Backspace => {
+                app.symlink_input.pop();
+            }
+            KeyCode::Char(c) => {
+                app.symlink_input.push(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.show_symlink_settings = false;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.symlink_items.is_empty() {
+                app.symlink_cursor = (app.symlink_cursor + 1).min(app.symlink_items.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.symlink_cursor = app.symlink_cursor.saturating_sub(1);
+        }
+        KeyCode::Char(' ') => {
+            if let Some(item) = app.symlink_items.get_mut(app.symlink_cursor) {
+                item.1 = !item.1;
+            }
+        }
+        KeyCode::Char('a') => {
+            app.symlink_input_mode = true;
+            app.symlink_input.clear();
+        }
+        KeyCode::Char('d') => {
+            if !app.symlink_items.is_empty() {
+                app.symlink_items.remove(app.symlink_cursor);
+                if app.symlink_cursor >= app.symlink_items.len() && app.symlink_cursor > 0 {
+                    app.symlink_cursor -= 1;
+                }
+            }
+        }
+        KeyCode::Enter => {
+            // 保存＆既存 worktree に適用
+            let enabled: Vec<String> = app
+                .symlink_items
+                .iter()
+                .filter(|(_, checked)| *checked)
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            if let Some(ref project_name) = app.symlink_project_name {
+                if let Err(e) = config::save_project_shared_dirs(project_name, enabled.clone()) {
+                    app.show_error(format!("shared_dirs の保存に失敗: {}", e));
+                } else {
+                    // 既存 worktree にシンボリックリンクを適用
+                    let mut applied = 0;
+                    for project in &app.projects {
+                        if project.name == *project_name {
+                            for wt in &project.worktrees {
+                                for dir_name in &enabled {
+                                    let _ = git::setup_shared_dir(
+                                        &project.path,
+                                        &wt.path,
+                                        dir_name,
+                                    );
+                                }
+                                applied += 1;
+                            }
+                            break;
+                        }
+                    }
+                    app.show_info(format!(
+                        "Symlink 設定を保存しました ({} dirs, {} worktrees)",
+                        enabled.len(),
+                        applied
+                    ));
+                }
+            }
+            app.show_symlink_settings = false;
+        }
+        _ => {}
+    }
+}
+
 fn handle_skill_list_key(
     app: &mut app::App,
     key: crossterm::event::KeyEvent,

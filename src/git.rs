@@ -168,7 +168,7 @@ impl WorktreeManager {
 ///
 /// worktree 内の対応ディレクトリを削除し、メインリポジトリのディレクトリへの
 /// シンボリックリンクを作成する。
-fn setup_shared_dir(
+pub(crate) fn setup_shared_dir(
     project_path: &Path,
     worktree_path: &Path,
     dir_name: &str,
