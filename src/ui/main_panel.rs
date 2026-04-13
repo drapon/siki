@@ -226,6 +226,108 @@ fn render_claude_terminal(
 
 /// ファイル内容をシンタックスハイライト付きで描画（キャッシュ済みデータを使用）
 /// ファイルを描画し、コンテンツ領域の Rect を返す
+/// Diff タブを描画し、コンテンツ領域の Rect を返す
+fn render_diff_tab(
+    frame: &mut Frame,
+    area: Rect,
+    file: &mut OpenFile,
+    focused: bool,
+    selection: Option<&crate::selection::TextSelection>,
+) -> Rect {
+    let filename = file
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "?".to_string());
+
+    let title = format!("[diff] {} L{}", filename, file.cursor_line + 1);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+
+    let content_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    let diff_content = file.diff_content.as_deref().unwrap_or("");
+    let lines: Vec<Line> = diff_content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let style = super::diff_view::classify_line_style(line);
+            let is_cursor = i == file.cursor_line;
+            if is_cursor && focused {
+                Line::styled(line, style.bg(Color::DarkGray))
+            } else {
+                Line::styled(line, style)
+            }
+        })
+        .collect();
+
+    // highlighted のキャッシュを diff 行数に合わせる（scroll_down/up で使用）
+    let total_lines = lines.len();
+    if file.highlighted.len() != total_lines {
+        file.highlighted = vec![Vec::new(); total_lines];
+    }
+
+    // ビューポート内にカーソルが収まるよう自動スクロール
+    let visible_lines = content_area.height as usize;
+    if visible_lines > 0 {
+        if file.cursor_line < file.scroll_offset {
+            file.scroll_offset = file.cursor_line;
+        } else if file.cursor_line >= file.scroll_offset + visible_lines {
+            file.scroll_offset = file.cursor_line - visible_lines + 1;
+        }
+    }
+
+    let scroll_y = u16::try_from(file.scroll_offset).unwrap_or(u16::MAX);
+    let paragraph = Paragraph::new(lines).scroll((scroll_y, 0));
+    frame.render_widget(paragraph, content_area);
+
+    // テキスト選択のハイライト描画
+    if let Some(sel) = selection {
+        if sel.panel == crate::selection::SelectionPanel::File {
+            let scroll = file.scroll_offset;
+            let (start, end) = sel.normalize();
+            let buf = frame.buffer_mut();
+            for row in start.row..=end.row {
+                let content_row = row as usize + scroll;
+                if content_row < file.scroll_offset || content_row >= file.scroll_offset + visible_lines {
+                    continue;
+                }
+                let screen_y = content_area.y + (content_row - file.scroll_offset) as u16;
+                if screen_y >= content_area.y + content_area.height {
+                    break;
+                }
+                let col_start = if row == start.row { start.col } else { 0 };
+                let col_end = if row == end.row {
+                    end.col
+                } else {
+                    content_area.width.saturating_sub(1)
+                };
+                for col in col_start..=col_end {
+                    let screen_x = content_area.x + col;
+                    if screen_x >= content_area.x + content_area.width {
+                        break;
+                    }
+                    let cell = &mut buf[(screen_x, screen_y)];
+                    let fg = cell.fg;
+                    let bg = cell.bg;
+                    cell.set_fg(if bg == Color::Reset { Color::Black } else { bg });
+                    cell.set_bg(if fg == Color::Reset { Color::White } else { fg });
+                }
+            }
+        }
+    }
+
+    content_area
+}
+
 fn render_file(
     frame: &mut Frame,
     area: Rect,
@@ -233,6 +335,11 @@ fn render_file(
     focused: bool,
     selection: Option<&crate::selection::TextSelection>,
 ) -> Rect {
+    // diff タブの場合は専用描画
+    if file.diff_content.is_some() {
+        return render_diff_tab(frame, area, file, focused, selection);
+    }
+
     let filename = file
         .path
         .file_name()
@@ -473,7 +580,11 @@ fn build_tab_titles(claude_tabs: usize, open_files: &[OpenFile], has_search: boo
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "?".to_string());
-        titles.push(name);
+        if f.diff_content.is_some() {
+            titles.push(format!("[diff] {}", name));
+        } else {
+            titles.push(name);
+        }
     }
     titles
 }
@@ -559,6 +670,40 @@ pub fn open_file_tab(app: &mut App, path: std::path::PathBuf) {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
+        });
+        wt.active_tab = offset + wt.open_files.len() - 1;
+    }
+}
+
+/// Diff タブを開く（既に同じパスのdiffタブがあればそちらに切り替え）
+pub fn open_diff_tab(app: &mut App, path: &str, diff_content: String) {
+    let has_search = app.show_grep_results_view;
+    if let Some(wt) = app.selected_worktree_mut() {
+        let offset = if has_search { wt.claude_tabs + 1 } else { wt.claude_tabs };
+        let diff_path = std::path::PathBuf::from(path);
+        // 既に同じパスの diff タブがあれば切り替え（内容は更新）
+        for (i, f) in wt.open_files.iter_mut().enumerate() {
+            if f.diff_content.is_some() && f.path == diff_path {
+                f.diff_content = Some(diff_content);
+                f.cursor_line = 0;
+                f.scroll_offset = 0;
+                wt.active_tab = offset + i;
+                return;
+            }
+        }
+        let total_lines = diff_content.lines().count();
+        wt.open_files.push(OpenFile {
+            path: diff_path,
+            content: String::new(),
+            scroll_offset: 0,
+            cursor_line: 0,
+            highlighted: vec![Vec::new(); total_lines],
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
+            diff_content: Some(diff_content),
         });
         wt.active_tab = offset + wt.open_files.len() - 1;
     }
@@ -707,7 +852,11 @@ pub fn current_file_location(app: &App) -> Option<String> {
     let wt = app.selected_worktree()?;
     let file_index = file_tab_index(app, wt.active_tab, wt.claude_tabs)?;
     let file = wt.open_files.get(file_index)?;
-    Some(format!("{}:{}", file.path.display(), file.cursor_line + 1))
+    if file.diff_content.is_some() {
+        Some(format!("[diff] {}:{}", file.path.display(), file.cursor_line + 1))
+    } else {
+        Some(format!("{}:{}", file.path.display(), file.cursor_line + 1))
+    }
 }
 
 #[cfg(test)]
@@ -761,6 +910,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/lib.rs"),
@@ -772,6 +922,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
 
         // Claude(0) → test.rs(1) → lib.rs(2) → Claude(0)
@@ -798,6 +949,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
@@ -809,6 +961,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
 
         // a.rs(0) → b.rs(1) → a.rs(0)
@@ -845,6 +998,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 0; // claude_tabs=0 なのでファイルタブ
 
@@ -868,6 +1022,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 1; // ファイルタブ
 
@@ -891,6 +1046,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
@@ -902,6 +1058,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/c.rs"),
@@ -913,6 +1070,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 2; // b.rs (claude=1, a=1, b=2, c=3)
 
@@ -939,6 +1097,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.open_files.push(OpenFile {
             path: PathBuf::from("/tmp/b.rs"),
@@ -950,6 +1109,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 2; // b.rs (last file tab)
 
@@ -997,6 +1157,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 0; // Claude タブ
 
@@ -1032,6 +1193,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 0;
 
@@ -1058,6 +1220,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 1; // ファイルタブ
 
@@ -1079,6 +1242,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 0;
 
@@ -1100,6 +1264,7 @@ mod tests {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            diff_content: None,
         });
         wt.active_tab = 0;
 

@@ -34,6 +34,15 @@ pub enum RightPanelMode {
     Diff,
 }
 
+/// Changes モード内の上下パネルフォーカス
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffFocus {
+    /// PR 差分ファイル一覧（base...HEAD）
+    PrDiff,
+    /// ローカル未コミット変更一覧（git diff HEAD）
+    LocalChanges,
+}
+
 /// チャットメッセージのロール
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -49,7 +58,7 @@ pub struct ChatMessage {
     pub timestamp: DateTime<Utc>,
 }
 
-/// 開いているファイル
+/// 開いているファイル（diff_content が Some ならdiffタブ）
 #[derive(Debug, Clone)]
 pub struct OpenFile {
     pub path: PathBuf,
@@ -67,6 +76,8 @@ pub struct OpenFile {
     pub search_matches: Vec<usize>,
     /// 現在フォーカス中のマッチインデックス
     pub search_match_idx: usize,
+    /// diff タブの場合、差分内容を保持（Some ならdiff表示モード）
+    pub diff_content: Option<String>,
 }
 
 impl OpenFile {
@@ -202,6 +213,8 @@ pub struct Worktree {
     /// 起動中の Claude Code タブ数（タブ 0..claude_tabs-1 が Claude）
     pub claude_tabs: usize,
     pub right_panel_mode: RightPanelMode,
+    /// Changes モード内のフォーカス位置
+    pub diff_focus: DiffFocus,
     pub active_terminal: usize,
     pub chat_scroll_offset: usize,
     /// Claude ターミナルのスクロールバックオフセット（タブごと）
@@ -626,6 +639,7 @@ impl Project {
                 active_tab: 0,
                 claude_tabs: 0,
                 right_panel_mode: RightPanelMode::Tree,
+                diff_focus: DiffFocus::PrDiff,
                 active_terminal: 0,
                 chat_scroll_offset: 0,
                 claude_scroll_offsets: HashMap::new(),

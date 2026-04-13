@@ -205,7 +205,7 @@ impl LeftPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Project, Worktree, WorktreeStatus, RightPanelMode};
+    use crate::app::{Project, Worktree, WorktreeStatus, RightPanelMode, DiffFocus};
     use std::path::PathBuf;
 
     fn sample_projects() -> Vec<Project> {
@@ -227,6 +227,7 @@ mod tests {
                         active_tab: 0,
                         claude_tabs: 0,
                         right_panel_mode: RightPanelMode::Tree,
+                        diff_focus: DiffFocus::PrDiff,
                         active_terminal: 0,
                         chat_scroll_offset: 0,
                         claude_scroll_offsets: std::collections::HashMap::new(),
@@ -244,6 +245,7 @@ mod tests {
                         active_tab: 0,
                         claude_tabs: 0,
                         right_panel_mode: RightPanelMode::Tree,
+                        diff_focus: DiffFocus::PrDiff,
                         active_terminal: 0,
                         chat_scroll_offset: 0,
                         claude_scroll_offsets: std::collections::HashMap::new(),
@@ -268,6 +270,7 @@ mod tests {
                     active_tab: 0,
                     claude_tabs: 0,
                     right_panel_mode: RightPanelMode::Tree,
+                    diff_focus: DiffFocus::PrDiff,
                     active_terminal: 0,
                     chat_scroll_offset: 0,
                     claude_scroll_offsets: std::collections::HashMap::new(),

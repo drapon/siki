@@ -75,8 +75,20 @@ impl DiffView {
             .unwrap_or(0)
     }
 
-    /// 描画
-    pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+    /// 選択中ファイルの diff_content を返す
+    pub fn selected_diff_content(&self) -> Option<&str> {
+        self.files
+            .get(self.selected_file)
+            .map(|f| f.diff_content.as_str())
+    }
+
+    /// 選択中ファイルのパスを返す
+    pub fn selected_path(&self) -> Option<&str> {
+        self.files.get(self.selected_file).map(|f| f.path.as_str())
+    }
+
+    /// 描画（ファイル一覧のみ）
+    pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool, title: Option<&str>) {
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
         } else {
@@ -84,9 +96,12 @@ impl DiffView {
         };
 
         if self.files.is_empty() {
-            let block = Block::default()
+            let mut block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style);
+            if let Some(t) = title {
+                block = block.title(t);
+            }
             frame.render_widget(
                 Paragraph::new("変更なし")
                     .block(block)
@@ -96,26 +111,16 @@ impl DiffView {
             return;
         }
 
-        // ファイル一覧の高さ: ファイル数 + ボーダー上下 (capped)
-        let file_list_height = (self.files.len() as u16 + 2).min(area.height / 2).max(3);
-
-        let chunks = Layout::vertical([
-            Constraint::Length(file_list_height),
-            Constraint::Min(3),
-        ])
-        .split(area);
-
-        // --- ファイル一覧 ---
-        self.render_file_list(frame, chunks[0], focused, border_style);
-
-        // --- 選択ファイルの diff ---
-        self.render_diff_content(frame, chunks[1], border_style);
+        self.render_file_list(frame, area, focused, border_style, title);
     }
 
-    fn render_file_list(&self, frame: &mut Frame, area: Rect, focused: bool, border_style: Style) {
-        let block = Block::default()
+    fn render_file_list(&self, frame: &mut Frame, area: Rect, focused: bool, border_style: Style, title: Option<&str>) {
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style);
+        if let Some(t) = title {
+            block = block.title(t);
+        }
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -184,20 +189,69 @@ impl DiffView {
         frame.render_widget(paragraph, inner);
     }
 
-    fn render_diff_content(&self, frame: &mut Frame, area: Rect, border_style: Style) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style);
+}
 
-        let content = self
-            .files
+/// ローカル未コミット変更の状態（ファイルベース）
+#[derive(Debug)]
+pub struct LocalChangesView {
+    pub files: Vec<DiffFile>,
+    pub selected_file: usize,
+}
+
+impl LocalChangesView {
+    pub fn new() -> Self {
+        Self {
+            files: Vec::new(),
+            selected_file: 0,
+        }
+    }
+
+    /// worktree パスのローカル未コミット変更を取得・パースする
+    pub fn load(&mut self, worktree_path: &Path) {
+        self.selected_file = 0;
+        let raw = get_local_diff(worktree_path);
+        self.files = parse_diff(&raw);
+    }
+
+    pub fn select_next(&mut self) {
+        if !self.files.is_empty() && self.selected_file < self.files.len() - 1 {
+            self.selected_file += 1;
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.selected_file > 0 {
+            self.selected_file -= 1;
+        }
+    }
+
+    pub fn selected_diff_content(&self) -> Option<&str> {
+        self.files
             .get(self.selected_file)
             .map(|f| f.diff_content.as_str())
-            .unwrap_or("");
+    }
 
-        if content.is_empty() {
+    pub fn selected_path(&self) -> Option<&str> {
+        self.files.get(self.selected_file).map(|f| f.path.as_str())
+    }
+
+    /// 描画（ファイル一覧のみ、DiffView と同じ形式）
+    pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool, title: Option<&str>) {
+        let border_style = if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        if self.files.is_empty() {
+            let mut block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style);
+            if let Some(t) = title {
+                block = block.title(t);
+            }
             frame.render_widget(
-                Paragraph::new("差分なし")
+                Paragraph::new("変更なし")
                     .block(block)
                     .style(Style::default().fg(Color::DarkGray)),
                 area,
@@ -205,21 +259,70 @@ impl DiffView {
             return;
         }
 
-        let lines: Vec<Line> = content
-            .lines()
-            .map(|line| {
-                let style = classify_line_style(line);
-                Line::styled(line, style)
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style);
+        if let Some(t) = title {
+            block = block.title(t);
+        }
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let lines: Vec<Line> = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                let status_style = match file.status {
+                    'A' => Style::default().fg(Color::Green),
+                    'D' => Style::default().fg(Color::Red),
+                    _ => Style::default().fg(Color::Yellow),
+                };
+                let stat = format_stat(file.additions, file.deletions);
+                let is_selected = i == self.selected_file;
+                let base_style = if is_selected && focused {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                let mut spans = vec![
+                    Span::styled(format!(" {} ", file.status), status_style.patch(base_style)),
+                    Span::styled(&file.path, Style::default().fg(Color::White).patch(base_style)),
+                ];
+                let used = 3 + file.path.len() + stat.len();
+                let padding = (inner.width as usize).saturating_sub(used);
+                spans.push(Span::styled(" ".repeat(padding), base_style));
+                if file.additions > 0 {
+                    spans.push(Span::styled(
+                        format!("+{}", file.additions),
+                        Style::default().fg(Color::Green).patch(base_style),
+                    ));
+                }
+                if file.additions > 0 && file.deletions > 0 {
+                    spans.push(Span::styled(" ", base_style));
+                }
+                if file.deletions > 0 {
+                    spans.push(Span::styled(
+                        format!("-{}", file.deletions),
+                        Style::default().fg(Color::Red).patch(base_style),
+                    ));
+                }
+                Line::from(spans)
             })
             .collect();
 
-        let scroll_y = u16::try_from(self.diff_scroll_offset).unwrap_or(u16::MAX);
-        let paragraph = Paragraph::new(lines).block(block).scroll((scroll_y, 0));
-        frame.render_widget(paragraph, area);
+        let visible_height = inner.height as usize;
+        let scroll = if self.selected_file >= visible_height {
+            self.selected_file - visible_height + 1
+        } else {
+            0
+        };
+        let paragraph = Paragraph::new(lines).scroll((scroll as u16, 0));
+        frame.render_widget(paragraph, inner);
     }
 }
 
-fn classify_line_style(line: &str) -> Style {
+pub fn classify_line_style(line: &str) -> Style {
     if line.starts_with('+') && !line.starts_with("+++") {
         Style::default().fg(Color::Green)
     } else if line.starts_with('-') && !line.starts_with("---") {
@@ -325,6 +428,21 @@ fn count_changes(content: &str) -> (usize, usize) {
         }
     }
     (additions, deletions)
+}
+
+/// ローカル未コミット変更（staged + unstaged）の diff を取得する
+fn get_local_diff(worktree_path: &Path) -> String {
+    let output = Command::new("git")
+        .args(["diff", "HEAD"])
+        .current_dir(worktree_path)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 /// git diff コマンドを実行して結果を返す

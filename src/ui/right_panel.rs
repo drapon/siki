@@ -1,8 +1,8 @@
-use crate::app::{App, RightPanelMode};
+use crate::app::{App, DiffFocus, RightPanelMode};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
-use super::diff_view::DiffView;
+use super::diff_view::{DiffView, LocalChangesView};
 use super::source_tree::SourceTree;
 
 /// 右パネル上部を描画する
@@ -12,6 +12,7 @@ pub fn render_top(
     app: &App,
     source_tree: &mut SourceTree,
     diff_view: &DiffView,
+    local_changes: &LocalChangesView,
     focused: bool,
 ) {
     match app.selected_worktree() {
@@ -48,7 +49,18 @@ pub fn render_top(
                     source_tree.render(frame, chunks[1], focused);
                 }
                 RightPanelMode::Diff => {
-                    diff_view.render(frame, chunks[1], focused);
+                    // PR差分（上）とローカル変更（下）の2分割
+                    let diff_chunks = Layout::vertical([
+                        Constraint::Percentage(50),
+                        Constraint::Percentage(50),
+                    ])
+                    .split(chunks[1]);
+
+                    let pr_focused = focused && wt.diff_focus == DiffFocus::PrDiff;
+                    let local_focused = focused && wt.diff_focus == DiffFocus::LocalChanges;
+
+                    diff_view.render(frame, diff_chunks[0], pr_focused, Some("PR Changes"));
+                    local_changes.render(frame, diff_chunks[1], local_focused, Some("Local"));
                 }
             }
         }

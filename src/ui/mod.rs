@@ -13,7 +13,7 @@ use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use diff_view::DiffView;
+use diff_view::{DiffView, LocalChangesView};
 use source_tree::SourceTree;
 
 /// ターミナルタブ情報（描画用）
@@ -39,6 +39,7 @@ pub fn render(
     left_panel: &mut left_panel::LeftPanel,
     source_tree: &mut SourceTree,
     diff_view: &DiffView,
+    local_changes: &LocalChangesView,
     terminal_screen: Option<&vt100::Screen>,
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
@@ -68,6 +69,7 @@ pub fn render(
         app,
         source_tree,
         diff_view,
+        local_changes,
         app.focused_panel == Panel::Right,
     );
 
