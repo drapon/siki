@@ -871,6 +871,9 @@ async fn handle_event(
                             sel.active = false;
                             if sel.is_empty() {
                                 app.text_selection = None;
+                            } else {
+                                // マウスアップ時に自動コピー
+                                copy_selection(app, claude_terms, terminals);
                             }
                         }
                     }
@@ -1718,8 +1721,8 @@ fn handle_terminal_tab_click(
 /// 選択範囲のテキストをクリップボードにコピーする
 fn copy_selection(
     app: &app::App,
-    claude_terms: &HashMap<TerminalKey, terminal::TerminalEmulator>,
-    terminals: &HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
 ) {
     let sel = match app.text_selection.as_ref() {
         Some(s) if !s.is_empty() => s,
@@ -1735,22 +1738,24 @@ fn copy_selection(
                 Some(id) => id,
                 None => return,
             };
-            let (emu, content_area) = match sel.panel {
+            let emu = match sel.panel {
                 selection::SelectionPanel::Claude => {
                     let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_tab).unwrap_or(0);
-                    (claude_terms.get(&(wt_id, tab)), app.claude_content_area)
+                    claude_terms.get_mut(&(wt_id, tab))
                 }
                 selection::SelectionPanel::Terminal => {
                     let tab = app.worktree_by_id(wt_id).map(|wt| wt.active_terminal).unwrap_or(0);
-                    (terminals.get(&(wt_id, tab)), app.terminal_content_area)
+                    terminals.get_mut(&(wt_id, tab))
                 }
                 selection::SelectionPanel::File => unreachable!(),
             };
             emu.and_then(|emu| {
+                // 選択時のスクロール位置に戻してテキストを抽出し、元に戻す
                 let current_scroll = emu.scrollback();
-                let max_row = content_area.map(|a| a.height.saturating_sub(1)).unwrap_or(0);
-                let (start, end) = sel.adjusted_normalize(current_scroll, max_row)?;
+                emu.set_scrollback(sel.scroll_at_select);
+                let (start, end) = sel.normalize();
                 let text = selection::extract_text(emu.screen(), &start, &end);
+                emu.set_scrollback(current_scroll);
                 Some(text)
             })
         }
