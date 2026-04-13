@@ -33,6 +33,7 @@ const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 const SIKI_INIT_WORKTREE_ID: app::WorktreeId = (usize::MAX, usize::MAX);
 const SIKI_INIT_TAB_INDEX: usize = usize::MAX;
 
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -336,6 +337,18 @@ async fn handle_event(
                 return;
             }
 
+            // スキル内容入力ポップアップ表示中
+            if app.show_skill_edit_popup {
+                handle_skill_edit_popup_key(app, key, event_tx);
+                return;
+            }
+
+            // スキル一覧ポップアップ表示中
+            if app.show_skill_list {
+                handle_skill_list_key(app, key);
+                return;
+            }
+
             // ポップアップ表示中はポップアップ専用の処理
             if app.show_help {
                 match key.code {
@@ -422,6 +435,10 @@ async fn handle_event(
             }
             if app.show_siki_json_confirm {
                 handle_siki_json_confirm_key(app, siki_init_terminal, event_tx, key);
+                return;
+            }
+            if app.show_skill_name_popup {
+                handle_skill_name_popup_key(app, key);
                 return;
             }
 
@@ -534,7 +551,7 @@ async fn handle_event(
             if app.selected_worktree == Some(worktree_id) {
                 if let Some(wt) = app.worktree_by_id(worktree_id) {
                     let wt_path = wt.path.clone();
-                    let base = resolve_base_branch(&app.projects[worktree_id.0].path);
+                    let base = resolve_base_branch(&app.projects[worktree_id.0].path, &app.projects[worktree_id.0].name);
                     diff_view.load(&wt_path, &base);
                     source_tree.load(&wt_path);
                 }
@@ -629,7 +646,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list {
                 return;
             }
             match mouse.kind {
@@ -800,7 +817,7 @@ async fn handle_event(
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
                                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
-                                            let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                                            let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                             source_tree.load(&wt_path);
                                             diff_view.load(&wt_path, &base);
                                             let has_claude = app
@@ -1037,6 +1054,12 @@ async fn handle_event(
                 }
                 return;
             }
+            // スキル内容入力ポップアップ表示中
+            if app.show_skill_edit_popup {
+                app.skill_content_input.insert_str(app.skill_content_cursor, &text);
+                app.skill_content_cursor += text.len();
+                return;
+            }
             // メッセージポップアップ: 入力欄に追加
             if app.show_message_popup {
                 app.popup_input.push_str(&text);
@@ -1076,10 +1099,25 @@ async fn handle_event(
                 }
             }
         }
+        AppEvent::SkillRefineResult(result) => {
+            app.skill_refining = false;
+            match result {
+                Ok(text) => {
+                    app.skill_content_input = text.trim().to_string();
+                    app.skill_content_cursor = app.skill_content_input.len();
+                }
+                Err(e) => {
+                    app.show_error(format!("Claude 整形エラー: {}", e));
+                }
+            }
+        }
         AppEvent::Tick => {
             app.clear_expired_status();
             if app.show_siki_json_init_terminal {
                 app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
+            }
+            if app.skill_refining {
+                app.skill_refine_spinner = app.skill_refine_spinner.wrapping_add(1);
             }
             // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
             if let Some(registry) = session_registry {
@@ -1458,10 +1496,11 @@ fn finalize_add_worktree(
 
     app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
 
-    // siki.json の setup スクリプトがあれば実行
+    // setup スクリプトがあれば実行（siki.json 優先、なければ project.json）
     let wi = app.projects[pi].worktrees.len() - 1;
     let wt_id = (pi, wi);
-    if let Some(siki_json) = config::load_siki_json(&project_path) {
+    let project_name = &app.projects[pi].name;
+    if let Some(siki_json) = config::load_effective_siki_json(&project_path, project_name) {
         if let Some(ref setup_script) = siki_json.scripts.setup {
             run_siki_script(
                 app, terminals, event_tx, shell,
@@ -1797,7 +1836,7 @@ fn handle_right_panel_tab_click(
             // Diff モードに切り替えた時は最新の diff を取得
             if new_mode == app::RightPanelMode::Diff {
                 let wt_path = wt.path.clone();
-                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                 diff_view.load(&wt_path, &base);
             }
         }
@@ -1924,7 +1963,8 @@ fn handle_left_panel_key(
                 app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
 
                 // base_branch を解決: siki.json > config.toml > "origin/main"
-                app.add_worktree_base_branch = resolve_base_branch(project_path);
+                let project_name = &app.projects[pi].name;
+                app.add_worktree_base_branch = resolve_base_branch(project_path, project_name);
 
                 app.show_add_worktree_popup = true;
             }
@@ -1941,7 +1981,8 @@ fn handle_left_panel_key(
                 let wt_name = app.projects[pi].worktrees[wi].name.clone();
                 let wt_path = app.projects[pi].worktrees[wi].path.clone();
 
-                if let Some(siki_json) = config::load_siki_json(&project_path) {
+                let project_name = &app.projects[pi].name;
+                if let Some(siki_json) = config::load_effective_siki_json(&project_path, project_name) {
                     if let Some(ref run_script) = siki_json.scripts.run {
                         run_siki_script(
                             app, terminals, event_tx, shell,
@@ -1949,10 +1990,10 @@ fn handle_left_panel_key(
                         );
                         app.focused_panel = app::Panel::Terminal;
                     } else {
-                        app.show_info("siki.json に run スクリプトが定義されていません".to_string());
+                        app.show_info("run スクリプトが定義されていません".to_string());
                     }
                 } else {
-                    app.show_info("siki.json が見つかりません".to_string());
+                    app.show_info("スクリプト設定が見つかりません（siki.json または project.json）".to_string());
                 }
             }
         }
@@ -1986,6 +2027,40 @@ fn handle_left_panel_key(
                     app.siki_json_confirm_project_path = Some(project_path.clone());
                     app.show_siki_json_confirm = true;
                 }
+            }
+        }
+        KeyCode::Char('K') => {
+            // スキル作成ポップアップを開く
+            let project_index = match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
+                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => Some(*project_index),
+                None => None,
+            };
+            if let Some(pi) = project_index {
+                let project_name = &app.projects[pi].name;
+                app.skill_project_name = Some(project_name.clone());
+                // 既存スキルを読み込む
+                let skills_dir = config::project_skills_dir(project_name);
+                let mut items = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            let skill_file = path.join("SKILL.md");
+                            if skill_file.exists() {
+                                let name = path.file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+                                items.push((name, content));
+                            }
+                        }
+                    }
+                }
+                items.sort_by(|a, b| a.0.cmp(&b.0));
+                app.skill_list_items = items;
+                app.skill_list_cursor = 0;
+                app.show_skill_list = true;
             }
         }
         KeyCode::Char('R') => {
@@ -2030,7 +2105,7 @@ fn handle_left_panel_key(
                 app.focused_panel = app::Panel::Main;
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
-                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                 source_tree.load(&wt_path);
                 diff_view.load(&wt_path, &base);
                 // Claude Code とターミナルを自動起動
@@ -2229,6 +2304,273 @@ fn handle_siki_init_terminal_key(
         if let Some(emu) = siki_init_terminal.as_mut() {
             let _ = emu.write(&bytes);
         }
+    }
+}
+
+/// スキル名入力ポップアップのキー処理
+fn handle_skill_name_popup_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Esc => {
+            app.show_skill_name_popup = false;
+            app.skill_name_input.clear();
+        }
+        KeyCode::Enter => {
+            let skill_name = app.skill_name_input.trim().to_string();
+            if skill_name.is_empty() {
+                return;
+            }
+            app.show_skill_name_popup = false;
+            // 既存スキルがあれば内容を読み込む
+            if let Some(project_name) = app.skill_project_name.as_deref() {
+                let skill_file = config::project_skills_dir(project_name)
+                    .join(&skill_name)
+                    .join("SKILL.md");
+                app.skill_content_input = std::fs::read_to_string(&skill_file).unwrap_or_default();
+            }
+            app.skill_content_cursor = app.skill_content_input.len();
+            app.show_skill_edit_popup = true;
+        }
+        KeyCode::Backspace => {
+            app.skill_name_input.pop();
+        }
+        KeyCode::Char(c) => {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                app.skill_name_input.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// スキル内容入力ポップアップの保存処理
+fn save_skill_content(app: &mut app::App) {
+    let skill_name = app.skill_name_input.trim().to_string();
+    if let Some(project_name) = app.skill_project_name.as_deref() {
+        let skill_dir = config::project_skills_dir(project_name).join(&skill_name);
+        let _ = std::fs::create_dir_all(&skill_dir);
+        let _ = std::fs::write(skill_dir.join("SKILL.md"), &app.skill_content_input);
+        for project in &app.projects {
+            if project.name == project_name {
+                for wt in &project.worktrees {
+                    hooks::sync_project_skills(&wt.path, project_name);
+                }
+                break;
+            }
+        }
+        app.show_info(format!("スキル /{} を保存しました", skill_name));
+    }
+    app.show_skill_edit_popup = false;
+    app.skill_content_input.clear();
+    app.skill_content_cursor = 0;
+    app.skill_name_input.clear();
+}
+
+/// スキル内容入力ポップアップのキー処理
+fn handle_skill_edit_popup_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // 整形中はキー入力を無視
+    if app.skill_refining {
+        return;
+    }
+
+    // Shift+Enter → Ctrl+J として来る → 改行
+    if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.skill_content_input.insert(app.skill_content_cursor, '\n');
+        app.skill_content_cursor += 1;
+        return;
+    }
+
+    // Ctrl+S で保存
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        save_skill_content(app);
+        return;
+    }
+
+    // Ctrl+R で Claude 整形
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app.skill_content_input.trim().is_empty() {
+            app.show_info("整形するテキストがありません".to_string());
+            return;
+        }
+        app.skill_refining = true;
+        app.skill_refine_spinner = 0;
+        let content = app.skill_content_input.clone();
+        let skill_name = app.skill_name_input.clone();
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let prompt = format!(
+                "以下のテキストを Claude Code の skill ファイル（SKILL.md）として適切なフォーマットに整形してください。\n\
+                スキル名: /{}\n\n\
+                整形ルール:\n\
+                - Markdown形式で構造化する\n\
+                - 説明、動作手順、注意事項などのセクションを適切に追加する\n\
+                - 元のテキストの意図を保持する\n\
+                - 整形結果のみを出力し、説明や前置きは不要\n\n\
+                ---\n{}", skill_name, content
+            );
+            let result = tokio::process::Command::new("claude")
+                .args(["-p", &prompt])
+                .output()
+                .await;
+            match result {
+                Ok(output) if output.status.success() => {
+                    let text = String::from_utf8_lossy(&output.stdout).to_string();
+                    let _ = tx.send(event::AppEvent::SkillRefineResult(Ok(text)));
+                }
+                Ok(output) => {
+                    let err = String::from_utf8_lossy(&output.stderr).to_string();
+                    let _ = tx.send(event::AppEvent::SkillRefineResult(Err(err)));
+                }
+                Err(e) => {
+                    let _ = tx.send(event::AppEvent::SkillRefineResult(Err(e.to_string())));
+                }
+            }
+        });
+        return;
+    }
+
+    // Enter: 修飾キーなしで保存、それ以外（Shift等）は改行
+    if key.code == KeyCode::Enter {
+        if key.modifiers == KeyModifiers::NONE {
+            save_skill_content(app);
+        } else {
+            app.skill_content_input.insert(app.skill_content_cursor, '\n');
+            app.skill_content_cursor += 1;
+        }
+        return;
+    }
+
+    // Ctrl/Super/Meta 付きはスキップ（Shiftは通す）
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META) {
+        return;
+    }
+
+    let s = &mut app.skill_content_input;
+    let cur = &mut app.skill_content_cursor;
+
+    match key.code {
+        KeyCode::Esc => {
+            app.show_skill_edit_popup = false;
+            s.clear();
+            *cur = 0;
+            app.skill_name_input.clear();
+        }
+        KeyCode::Backspace => {
+            if *cur > 0 {
+                // 前の文字境界を探す
+                let prev = s[..*cur].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                s.drain(prev..*cur);
+                *cur = prev;
+            }
+        }
+        KeyCode::Delete => {
+            if *cur < s.len() {
+                let next = s[*cur..].char_indices().nth(1).map(|(i, _)| *cur + i).unwrap_or(s.len());
+                s.drain(*cur..next);
+            }
+        }
+        KeyCode::Left => {
+            if *cur > 0 {
+                *cur = s[..*cur].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+            }
+        }
+        KeyCode::Right => {
+            if *cur < s.len() {
+                *cur = s[*cur..].char_indices().nth(1).map(|(i, _)| *cur + i).unwrap_or(s.len());
+            }
+        }
+        KeyCode::Home => {
+            // 行頭へ
+            let line_start = s[..*cur].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            *cur = line_start;
+        }
+        KeyCode::End => {
+            // 行末へ
+            let line_end = s[*cur..].find('\n').map(|i| *cur + i).unwrap_or(s.len());
+            *cur = line_end;
+        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_control() => {
+            // Shift+Enter が制御文字として来た場合 → 改行
+            s.insert(*cur, '\n');
+            *cur += 1;
+        }
+        KeyCode::Char(c) => {
+            s.insert(*cur, c);
+            *cur += c.len_utf8();
+        }
+        _ => {}
+    }
+}
+
+/// スキル一覧ポップアップのキー処理
+fn handle_skill_list_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Esc => {
+            app.show_skill_list = false;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.skill_list_items.is_empty() && app.skill_list_cursor < app.skill_list_items.len() - 1 {
+                app.skill_list_cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.skill_list_cursor = app.skill_list_cursor.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            // 既存スキルを編集
+            if let Some((name, content)) = app.skill_list_items.get(app.skill_list_cursor) {
+                app.skill_name_input = name.clone();
+                app.skill_content_input = content.clone();
+                app.skill_content_cursor = content.len();
+                app.show_skill_list = false;
+                app.show_skill_edit_popup = true;
+            }
+        }
+        KeyCode::Char('n') => {
+            // 新規作成 → スキル名入力へ
+            app.show_skill_list = false;
+            app.skill_name_input.clear();
+            app.show_skill_name_popup = true;
+        }
+        KeyCode::Char('d') => {
+            // スキル削除
+            if let Some((name, _)) = app.skill_list_items.get(app.skill_list_cursor) {
+                if let Some(project_name) = app.skill_project_name.as_deref() {
+                    let path = config::project_skills_dir(project_name).join(name);
+                    let _ = std::fs::remove_dir_all(&path);
+                    // worktreeのシンボリックリンクも削除
+                    for project in &app.projects {
+                        if project.name == project_name {
+                            for wt in &project.worktrees {
+                                let link = wt.path.join(".claude").join("skills").join(name);
+                                if link.is_symlink() {
+                                    let _ = std::fs::remove_file(&link);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    app.skill_list_items.remove(app.skill_list_cursor);
+                    if app.skill_list_cursor >= app.skill_list_items.len() && app.skill_list_cursor > 0 {
+                        app.skill_list_cursor -= 1;
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2465,8 +2807,9 @@ fn handle_archive_confirm_key(
                 let wt_path = app.projects[pi].worktrees[wi].path.clone();
                 let wt_id = (pi, wi);
 
-                // siki.json の archive スクリプトがあれば実行
-                if let Some(siki_json) = config::load_siki_json(&project_path) {
+                // archive スクリプトがあれば実行（siki.json 優先、なければ project.json）
+                let project_name = &app.projects[pi].name;
+                if let Some(siki_json) = config::load_effective_siki_json(&project_path, project_name) {
                     if let Some(ref archive_script) = siki_json.scripts.archive {
                         run_siki_script(
                             app, terminals, event_tx, shell,
@@ -2588,6 +2931,7 @@ fn resize_terminals(
             }
         }
     }
+
 }
 
 /// Claude Code を中央パネルで起動する
@@ -2636,10 +2980,11 @@ fn launch_claude_with_args(
     args: &[&str],
 ) {
     let project_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+    let project_name = app.projects[wt_id.0].name.clone();
 
     // worktree に siki 用 hook を注入
     let sock = config::sock_path();
-    if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock) {
+    if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock, &project_name) {
         app.show_error(format!("hook 注入に失敗: {}", e));
     }
     let claude_idx = app
@@ -2860,7 +3205,7 @@ fn handle_right_panel_key(
                         if let Some(wt) = app.worktree_by_id(wt_id) {
                             if wt.right_panel_mode == app::RightPanelMode::Diff {
                                 let wt_path = wt.path.clone();
-                                let base = resolve_base_branch(&app.projects[wt_id.0].path);
+                                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                 diff_view.load(&wt_path, &base);
                             }
                         }
@@ -2890,9 +3235,9 @@ fn handle_right_panel_key(
     }
 }
 
-/// プロジェクトパスから base_branch を解決する
-fn resolve_base_branch(project_path: &std::path::Path) -> String {
-    config::load_siki_json(project_path)
+/// プロジェクトパスとプロジェクト名から base_branch を解決する
+fn resolve_base_branch(project_path: &std::path::Path, project_name: &str) -> String {
+    config::load_effective_siki_json(project_path, project_name)
         .and_then(|sj| sj.base_branch)
         .or_else(|| {
             config::load_config(&config::default_config_path())

@@ -214,6 +214,12 @@ pub struct ProjectMeta {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// プロジェクト個別のスクリプト設定（siki.json が無い場合に使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scripts: Option<SikiScripts>,
+    /// プロジェクト個別のベースブランチ（siki.json が無い場合に使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// プロジェクトの project.json パスを返す
@@ -223,11 +229,13 @@ pub fn project_meta_path(project_name: &str) -> PathBuf {
 
 /// project.json を保存する
 pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
-    // 既存の display_name を保持する
-    let existing_display_name = load_project_meta(project_name).and_then(|m| m.display_name);
+    // 既存のフィールドを保持する
+    let existing = load_project_meta(project_name);
     let meta = ProjectMeta {
         path: source_path.to_string_lossy().to_string(),
-        display_name: existing_display_name,
+        display_name: existing.as_ref().and_then(|m| m.display_name.clone()),
+        scripts: existing.as_ref().and_then(|m| m.scripts.clone()),
+        base_branch: existing.as_ref().and_then(|m| m.base_branch.clone()),
     };
     let dir = workspaces_dir().join(project_name);
     std::fs::create_dir_all(&dir)
@@ -390,6 +398,11 @@ pub fn discover_projects() -> Vec<ProjectConfig> {
                     None => continue,
                 };
 
+                // .git が存在しないディレクトリは worktree ではない（skills 等をスキップ）
+                if !sub_path.join(".git").exists() {
+                    continue;
+                }
+
                 // git ブランチ名を取得
                 let branch = std::process::Command::new("git")
                     .args(["-C", &sub_path.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"])
@@ -464,10 +477,13 @@ pub struct SikiJson {
 }
 
 /// siki.json の scripts セクション
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SikiScripts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<String>,
 }
 
@@ -510,6 +526,28 @@ pub fn load_siki_json(project_path: &Path) -> Option<SikiJson> {
     let path = project_path.join("siki.json");
     let content = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// siki.json を優先し、無ければ project.json のスクリプト設定にフォールバック
+pub fn load_effective_siki_json(project_path: &Path, project_name: &str) -> Option<SikiJson> {
+    // 1. siki.json があればそちらを使用
+    if let Some(sj) = load_siki_json(project_path) {
+        return Some(sj);
+    }
+    // 2. project.json のスクリプト設定にフォールバック
+    let meta = load_project_meta(project_name)?;
+    if meta.scripts.is_none() && meta.base_branch.is_none() {
+        return None;
+    }
+    Some(SikiJson {
+        scripts: meta.scripts.unwrap_or_default(),
+        base_branch: meta.base_branch,
+    })
+}
+
+/// プロジェクト固有の Claude Code skills ディレクトリパスを返す
+pub fn project_skills_dir(project_name: &str) -> PathBuf {
+    workspaces_dir().join(project_name).join("skills")
 }
 
 /// Unix ソケットのパスを返す: ~/.siki/sock
@@ -846,6 +884,8 @@ worktrees = [
         let meta = ProjectMeta {
             path: "/tmp/my-project".to_string(),
             display_name: None,
+            scripts: None,
+            base_branch: None,
         };
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let meta_path = dir.path().join("project.json");

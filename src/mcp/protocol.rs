@@ -162,6 +162,30 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["target"]
             }),
         },
+        ToolDefinition {
+            name: "save_skill".to_string(),
+            description: "Save a Claude Code skill file to the project's skills directory (~/.siki/workspaces/<project>/skills/<name>.md). The skill will be automatically symlinked to all worktrees.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project_name": { "type": "string", "description": "Project name in siki" },
+                    "skill_name": { "type": "string", "description": "Skill name (alphanumeric, hyphens, underscores only)" },
+                    "content": { "type": "string", "description": "Full content of the skill .md file" }
+                },
+                "required": ["project_name", "skill_name", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_skills".to_string(),
+            description: "List existing project-specific skills in ~/.siki/workspaces/<project>/skills/. Returns skill names and their content.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project_name": { "type": "string", "description": "Project name in siki" }
+                },
+                "required": ["project_name"]
+            }),
+        },
     ]
 }
 
@@ -196,7 +220,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
     }
 
     #[test]
