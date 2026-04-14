@@ -926,6 +926,33 @@ async fn handle_event(
                                             }
                                         }
                                     }
+                                } else if mode == app::RightPanelMode::Context {
+                                    // Context モード: クリックでコンテキストファイルを選択・開く
+                                    // ボーダー (1行上 + 1行タブバー) を考慮
+                                    let content_top = layout.right_top.y + 1 + 1; // タブバー + ボーダー上
+                                    if mouse.row >= content_top {
+                                        let clicked_row = (mouse.row - content_top) as usize;
+                                        // ファイルパスを先に取得してからカーソル更新
+                                        let file_path = app.selected_worktree()
+                                            .and_then(|wt| {
+                                                if clicked_row < wt.context_items.len() {
+                                                    app.selected_worktree.map(|wt_id| {
+                                                        let project_name = &app.projects[wt_id.0].name;
+                                                        let worktree_name = &app.projects[wt_id.0].worktrees[wt_id.1].name;
+                                                        let ctx_dir = config::worktree_contexts_dir(project_name, worktree_name);
+                                                        ctx_dir.join(format!("{}.md", wt.context_items[clicked_row].0))
+                                                    })
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                        if let Some(path) = file_path {
+                                            if let Some(wt) = app.selected_worktree_mut() {
+                                                wt.context_cursor = clicked_row;
+                                            }
+                                            ui::main_panel::open_file_tab(app, path);
+                                        }
+                                    }
                                 } else if mode == app::RightPanelMode::Diff {
                                     // Changes モード: タブバー (1行) を除いた領域を上下50%で分割
                                     let content_area = ratatui::prelude::Rect {
@@ -1153,6 +1180,17 @@ async fn handle_event(
                                             diff_view.scroll_up();
                                         } else {
                                             diff_view.scroll_down();
+                                        }
+                                    }
+                                    app::RightPanelMode::Context => {
+                                        if let Some(wt) = app.selected_worktree_mut() {
+                                            if !wt.context_items.is_empty() {
+                                                if is_up {
+                                                    wt.context_cursor = wt.context_cursor.saturating_sub(1);
+                                                } else {
+                                                    wt.context_cursor = (wt.context_cursor + 1).min(wt.context_items.len() - 1);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1729,6 +1767,8 @@ fn finalize_add_worktree(
         claude_scroll_offsets: HashMap::new(),
         pr_title: None,
         claude_session_id: None,
+        context_items: Vec::new(),
+        context_cursor: 0,
     });
 
     // PR 情報を非同期取得
@@ -2071,27 +2111,44 @@ fn handle_right_panel_tab_click(
     let Some(wt_id) = app.selected_worktree else {
         return;
     };
-    // ratatui 0.30 Tabs: "Tree|Changes" (パディングなし)
-    // "Tree" = 4文字, "|" = 1文字, "Changes" = 7文字
+    // ratatui 0.30 Tabs: "Tree|Changes|Context" (パディングなし)
+    // "Tree" = 4文字, "|" = 1文字, "Changes" = 7文字, "|" = 1文字, "Context" = 7文字
     let tab_x = click_x.saturating_sub(right_top_area.x);
     let new_mode = if tab_x < 4 {
         app::RightPanelMode::Tree
-    } else if tab_x >= 5 {
-        app::RightPanelMode::Diff
-    } else {
+    } else if tab_x == 4 || tab_x == 12 {
         // divider 上のクリックは無視
         return;
+    } else if tab_x >= 5 && tab_x < 12 {
+        app::RightPanelMode::Diff
+    } else {
+        app::RightPanelMode::Context
     };
+    let current_mode = app.worktree_by_id(wt_id).map(|wt| wt.right_panel_mode);
+    if current_mode == Some(new_mode) {
+        return;
+    }
+    // モード切替
     if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-        if wt.right_panel_mode != new_mode {
-            wt.right_panel_mode = new_mode;
-            // Diff モードに切り替えた時は最新の diff を取得
-            if new_mode == app::RightPanelMode::Diff {
-                let wt_path = wt.path.clone();
-                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
-                diff_view.load(&wt_path, &base);
-                local_changes.load(&wt_path);
-            }
+        wt.right_panel_mode = new_mode;
+    }
+    // Diff モードに切り替えた時は最新の diff を取得
+    if new_mode == app::RightPanelMode::Diff {
+        if let Some(wt) = app.worktree_by_id(wt_id) {
+            let wt_path = wt.path.clone();
+            let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+            diff_view.load(&wt_path, &base);
+            local_changes.load(&wt_path);
+        }
+    }
+    // Context モードに切り替えた時はコンテキスト一覧を読み込む
+    if new_mode == app::RightPanelMode::Context {
+        let project_name = app.projects[wt_id.0].name.clone();
+        let worktree_name = app.worktree_by_id(wt_id).map(|wt| wt.name.clone()).unwrap_or_default();
+        let items = config::load_contexts(&project_name, &worktree_name);
+        if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+            wt.context_items = items;
+            wt.context_cursor = 0;
         }
     }
 }
@@ -4300,17 +4357,7 @@ fn handle_right_panel_key(
                 }
                 KeyCode::Char('t') => {
                     ui::right_panel::toggle_mode(app);
-                    // Diff モードに切り替えた時は最新の diff を取得
-                    if let Some(wt_id) = app.selected_worktree {
-                        if let Some(wt) = app.worktree_by_id(wt_id) {
-                            if wt.right_panel_mode == app::RightPanelMode::Diff {
-                                let wt_path = wt.path.clone();
-                                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
-                                diff_view.load(&wt_path, &base);
-                                local_changes.load(&wt_path);
-                            }
-                        }
-                    }
+                    load_right_panel_data_if_needed(app, diff_view, local_changes);
                 }
                 _ => {}
             }
@@ -4381,6 +4428,7 @@ fn handle_right_panel_key(
                 }
                 KeyCode::Char('t') => {
                     ui::right_panel::toggle_mode(app);
+                    load_right_panel_data_if_needed(app, diff_view, local_changes);
                 }
                 KeyCode::Tab => {
                     // Tab で上下パネル切替
@@ -4389,6 +4437,76 @@ fn handle_right_panel_key(
                             app::DiffFocus::PrDiff => app::DiffFocus::LocalChanges,
                             app::DiffFocus::LocalChanges => app::DiffFocus::PrDiff,
                         };
+                    }
+                }
+                _ => {}
+            }
+        }
+        app::RightPanelMode::Context => {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(wt) = app.selected_worktree_mut() {
+                        if !wt.context_items.is_empty() {
+                            wt.context_cursor = (wt.context_cursor + 1).min(wt.context_items.len() - 1);
+                        }
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(wt) = app.selected_worktree_mut() {
+                        wt.context_cursor = wt.context_cursor.saturating_sub(1);
+                    }
+                }
+                KeyCode::Enter => {
+                    // 選択中のコンテキストファイルを中央パネルに開く
+                    let file_path = app.selected_worktree().and_then(|wt| {
+                        let cursor = wt.context_cursor;
+                        if cursor < wt.context_items.len() {
+                            app.selected_worktree.map(|wt_id| {
+                                let project_name = &app.projects[wt_id.0].name;
+                                let worktree_name = &app.projects[wt_id.0].worktrees[wt_id.1].name;
+                                let ctx_dir = config::worktree_contexts_dir(project_name, worktree_name);
+                                ctx_dir.join(format!("{}.md", wt.context_items[cursor].0))
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(path) = file_path {
+                        ui::main_panel::open_file_tab(app, path);
+                    }
+                }
+                KeyCode::Char('t') => {
+                    ui::right_panel::toggle_mode(app);
+                    load_right_panel_data_if_needed(app, diff_view, local_changes);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 右パネルモード切替時にデータをロードする
+fn load_right_panel_data_if_needed(
+    app: &mut app::App,
+    diff_view: &mut DiffView,
+    local_changes: &mut ui::diff_view::LocalChangesView,
+) {
+    if let Some(wt_id) = app.selected_worktree {
+        if let Some(wt) = app.worktree_by_id(wt_id) {
+            match wt.right_panel_mode {
+                app::RightPanelMode::Diff => {
+                    let wt_path = wt.path.clone();
+                    let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                    diff_view.load(&wt_path, &base);
+                    local_changes.load(&wt_path);
+                }
+                app::RightPanelMode::Context => {
+                    let project_name = app.projects[wt_id.0].name.clone();
+                    let worktree_name = wt.name.clone();
+                    let items = config::load_contexts(&project_name, &worktree_name);
+                    if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                        wt.context_items = items;
+                        wt.context_cursor = 0;
                     }
                 }
                 _ => {}
