@@ -527,6 +527,46 @@ pub fn detect_project_from_cwd(projects: &[ProjectConfig], cwd: &std::path::Path
     None
 }
 
+/// cwd から (project_name, worktree_name) を推定する
+/// ~/.siki/workspaces/<project>/<worktree>/ 配下にいるか、
+/// またはプロジェクトの worktree パスに一致するかで判定
+pub fn detect_project_worktree_from_cwd(cwd: &std::path::Path) -> Option<(String, String)> {
+    let ws = workspaces_dir();
+    // ~/.siki/workspaces/<project>/<worktree>/... のパターン
+    if let Ok(rel) = cwd.strip_prefix(&ws) {
+        let components: Vec<_> = rel.components().collect();
+        if components.len() >= 2 {
+            let project = components[0].as_os_str().to_string_lossy().to_string();
+            let worktree = components[1].as_os_str().to_string_lossy().to_string();
+            // "contexts" や "skills" ディレクトリではないことを確認
+            if worktree != "contexts" && worktree != "skills" {
+                return Some((project, worktree));
+            }
+        }
+    }
+    // プロジェクト設定からの検出（worktreeのパスを workspaces_dir から構築）
+    let projects = discover_projects();
+    for project in &projects {
+        for wt in &project.worktrees {
+            let wt_path = ws.join(&project.name).join(&wt.name);
+            if cwd.starts_with(&wt_path) {
+                return Some((project.name.clone(), wt.name.clone()));
+            }
+        }
+        // プロジェクトのソースディレクトリ直下の場合（mainブランチ等）
+        let source = std::path::Path::new(&project.path);
+        if cwd.starts_with(source) {
+            // ソースディレクトリにいる場合、worktree名はディレクトリ名
+            let dir_name = source
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&project.name);
+            return Some((project.name.clone(), dir_name.to_string()));
+        }
+    }
+    None
+}
+
 /// プロジェクトルートの siki.json を表す構造体
 #[derive(Debug, Deserialize, Default)]
 pub struct SikiJson {
@@ -609,6 +649,37 @@ pub fn load_effective_siki_json(project_path: &Path, project_name: &str) -> Opti
 /// プロジェクト固有の Claude Code skills ディレクトリパスを返す
 pub fn project_skills_dir(project_name: &str) -> PathBuf {
     workspaces_dir().join(project_name).join("skills")
+}
+
+/// worktree 固有のコンテキストディレクトリパスを返す
+/// ~/.siki/workspaces/<project>/contexts/<worktree>/ に保存（worktree内に作らない）
+pub fn worktree_contexts_dir(project_name: &str, worktree_name: &str) -> PathBuf {
+    workspaces_dir()
+        .join(project_name)
+        .join("contexts")
+        .join(worktree_name)
+}
+
+/// worktree のコンテキスト一覧を読み込む (名前, 内容) のペア
+pub fn load_contexts(project_name: &str, worktree_name: &str) -> Vec<(String, String)> {
+    let dir = worktree_contexts_dir(project_name, worktree_name);
+    let mut items = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                items.push((name, content));
+            }
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
 }
 
 /// Unix ソケットのパスを返す: ~/.siki/sock

@@ -67,7 +67,34 @@ fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
         let _ = db::mark_messages_read(conn, &msg_ids);
     }
 
-    Ok(json!({ "sessions": items, "pending_messages": messages }))
+    // cwd から自分の worktree のコンテキストを読み込む
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let worktree_contexts = if let Some((proj, wt)) =
+        crate::config::detect_project_worktree_from_cwd(&cwd)
+    {
+        let contexts = crate::config::load_contexts(&proj, &wt);
+        if contexts.is_empty() {
+            None
+        } else {
+            let items: Vec<Value> = contexts
+                .iter()
+                .map(|(name, content)| json!({ "name": name, "content": content }))
+                .collect();
+            Some(json!({
+                "project": proj,
+                "worktree": wt,
+                "contexts": items
+            }))
+        }
+    } else {
+        None
+    };
+
+    let mut result = json!({ "sessions": items, "pending_messages": messages });
+    if let Some(ctx) = worktree_contexts {
+        result["worktree_contexts"] = ctx;
+    }
+    Ok(result)
 }
 
 fn send_message(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {

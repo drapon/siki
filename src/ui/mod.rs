@@ -168,6 +168,26 @@ pub fn render(
         render_skill_list_popup(frame, app);
     }
 
+    // コンテキスト一覧ポップアップ
+    if app.show_context_list {
+        render_context_list_popup(frame, app);
+    }
+
+    // コンテキスト名入力ポップアップ
+    if app.show_context_name_popup {
+        render_context_name_popup(frame, app);
+    }
+
+    // コンテキスト編集ポップアップ
+    if app.show_context_edit_popup {
+        render_context_edit_popup(frame, app);
+    }
+
+    // コンテキスト URL 入力ポップアップ
+    if app.show_context_url_popup {
+        render_context_url_popup(frame, app);
+    }
+
     // シンボリックリンク設定ポップアップ
     if app.show_symlink_settings {
         render_symlink_settings_popup(frame, app);
@@ -233,6 +253,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  S          : siki.json 作成",
         "  r          : run スクリプト実行",
         "  K          : スキル管理",
+        "  C          : コンテキスト管理",
         "  L          : シンボリックリンク設定",
         "  d          : worktree アーカイブ / プロジェクト除外",
         "",
@@ -875,6 +896,261 @@ fn render_skill_list_popup(frame: &mut Frame, app: &App) {
     }
 }
 
+fn render_context_list_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(80, 80, frame.area());
+
+    let wt = app.context_worktree_name.as_deref().unwrap_or("?");
+    let title = format!("Contexts: {}", wt);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(" n: テキスト追加  u: URL追加  Enter: 編集  d: 削除  Esc: 閉じる ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.context_list_items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("\n  コンテキストがありません\n\n  n: テキスト追加  u: URL追加")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    // 左: コンテキスト名リスト (幅24), 右: 内容プレビュー
+    let chunks = Layout::horizontal([Constraint::Length(24), Constraint::Min(0)]).split(inner);
+
+    let list_items: Vec<ratatui::widgets::ListItem> = app
+        .context_list_items
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            let style = if i == app.context_list_cursor {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ratatui::widgets::ListItem::new(format!("  {}", name)).style(style)
+        })
+        .collect();
+    let list = ratatui::widgets::List::new(list_items);
+    frame.render_widget(list, chunks[0]);
+
+    if let Some((_, content)) = app.context_list_items.get(app.context_list_cursor) {
+        let preview = Paragraph::new(content.as_str())
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::default().fg(Color::Gray));
+        frame.render_widget(preview, chunks[1]);
+    }
+}
+
+fn render_context_name_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 20, frame.area());
+    let mode_label = match app.context_add_mode {
+        crate::app::ContextAddMode::Text => "テキスト",
+        crate::app::ContextAddMode::Url => "URL",
+    };
+    let wt = app.context_worktree_name.as_deref().unwrap_or("?");
+    let title = format!("Context 追加 ({}): {}", mode_label, wt);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Green));
+
+    let text = format!(
+        "\n  コンテキスト名: {}_\n\n  Enter: 作成  Esc: キャンセル",
+        app.context_name_input,
+    );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_context_edit_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(80, 80, frame.area());
+    let name = &app.context_name_input;
+    let total_lines = app.context_content_input.lines().count() + 1;
+    let title = format!(
+        "Context: {} (Enter: 保存  Shift+Enter: 改行  Ctrl+R: Claude整形  PgUp/PgDn: スクロール)",
+        name
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Green));
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let inner_height = block.inner(area).height as usize;
+
+    let s = &app.context_content_input;
+    let cur = app.context_content_cursor;
+
+    let (before_str, cursor_str, after_str) = if cur >= s.len() {
+        (s.as_str(), " ", "")
+    } else {
+        let ch_len = s[cur..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        (&s[..cur], &s[cur..cur + ch_len], &s[cur + ch_len..])
+    };
+
+    let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+    let sel_style = Style::default().bg(Color::Blue).fg(Color::White);
+
+    // 選択範囲の正規化
+    let selection = app.context_edit_selection.and_then(|(a, b)| {
+        if a == b { None } else { Some((a.min(b), a.max(b))) }
+    });
+
+    let mut lines: Vec<Line> = Vec::new();
+    let cursor_line_idx;
+
+    if let Some((sel_start, sel_end)) = selection {
+        // 選択範囲ありの場合: 行ごとに通常/選択/カーソルを描画
+        let mut byte_pos = 0;
+        let text_lines: Vec<&str> = s.split('\n').collect();
+        cursor_line_idx = s[..cur].matches('\n').count();
+
+        for (line_idx, line_text) in text_lines.iter().enumerate() {
+            let line_start = byte_pos;
+            let line_end = byte_pos + line_text.len();
+
+            // この行と選択範囲の交差を算出
+            let sel_s = sel_start.max(line_start).min(line_end);
+            let sel_e = sel_end.max(line_start).min(line_end);
+
+            if sel_s >= sel_e {
+                // 選択がこの行にかからない
+                if line_idx == cursor_line_idx && cur >= line_start && cur <= line_end {
+                    // カーソル行
+                    let c_off = cur - line_start;
+                    if c_off >= line_text.len() {
+                        lines.push(Line::from(vec![
+                            Span::raw(*line_text),
+                            Span::styled(" ", cursor_style),
+                        ]));
+                    } else {
+                        let ch_len = line_text[c_off..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                        lines.push(Line::from(vec![
+                            Span::raw(&line_text[..c_off]),
+                            Span::styled(&line_text[c_off..c_off + ch_len], cursor_style),
+                            Span::raw(&line_text[c_off + ch_len..]),
+                        ]));
+                    }
+                } else {
+                    lines.push(Line::from(*line_text));
+                }
+            } else {
+                // 選択がこの行にかかる
+                let before = &line_text[..sel_s - line_start];
+                let selected = &line_text[sel_s - line_start..sel_e - line_start];
+                let after = &line_text[sel_e - line_start..];
+                lines.push(Line::from(vec![
+                    Span::raw(before),
+                    Span::styled(selected, sel_style),
+                    Span::raw(after),
+                ]));
+            }
+
+            byte_pos = line_end + 1; // +1 for '\n'
+        }
+    } else {
+        // 選択なし: カーソルのみ表示
+        let before_lines: Vec<&str> = before_str.split('\n').collect();
+        let after_lines: Vec<&str> = after_str.split('\n').collect();
+        cursor_line_idx = before_lines.len() - 1;
+
+        for line_str in &before_lines[..cursor_line_idx] {
+            lines.push(Line::from(*line_str));
+        }
+
+        let cursor_line_before = before_lines[cursor_line_idx];
+        if cursor_str == "\n" {
+            lines.push(Line::from(vec![
+                Span::raw(cursor_line_before),
+                Span::styled(" ", cursor_style),
+            ]));
+            for line_str in &after_lines {
+                lines.push(Line::from(*line_str));
+            }
+        } else {
+            let cursor_line_after = after_lines.first().copied().unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::raw(cursor_line_before),
+                Span::styled(cursor_str, cursor_style),
+                Span::raw(cursor_line_after),
+            ]));
+            for line_str in after_lines.iter().skip(1) {
+                lines.push(Line::from(*line_str));
+            }
+        }
+    }
+
+    // スクロールオフセットを適用
+    let scroll = app.context_edit_scroll.min(total_lines.saturating_sub(inner_height));
+
+    // フッター: 行数情報
+    let bottom_info = format!(" {}/{} lines  Esc: キャンセル ", cursor_line_idx + 1, total_lines);
+
+    if app.context_refining {
+        let spinner_chars = ['|', '/', '-', '\\'];
+        let spinner = spinner_chars[app.context_refine_spinner % spinner_chars.len()];
+        let block = block
+            .title_bottom(format!(" {} Claude で整形中... ", spinner));
+
+        let text = ratatui::text::Text::from(lines)
+            .style(Style::default().fg(Color::DarkGray));
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .scroll((scroll as u16, 0));
+        frame.render_widget(paragraph, area);
+    } else {
+        let block = block.title_bottom(bottom_info);
+        let text = ratatui::text::Text::from(lines);
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .scroll((scroll as u16, 0));
+        frame.render_widget(paragraph, area);
+    }
+}
+
+fn render_context_url_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(60, 20, frame.area());
+    let name = &app.context_name_input;
+    let title = format!("URL 入力: {}", name);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Green));
+
+    if app.context_url_fetching {
+        let spinner_chars = ['|', '/', '-', '\\'];
+        let spinner = spinner_chars[app.context_url_spinner % spinner_chars.len()];
+        let text = format!("\n  {} URL からコンテンツを取得中...", spinner);
+        let block = block.title_bottom(" 取得・要約中 ");
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(ratatui::widgets::Clear, area);
+        frame.render_widget(paragraph, area);
+    } else {
+        let text = format!(
+            "\n  URL: {}_\n\n  Enter: 取得  Esc: キャンセル",
+            app.context_url_input,
+        );
+        let paragraph = Paragraph::new(text).block(block);
+        frame.render_widget(ratatui::widgets::Clear, area);
+        frame.render_widget(paragraph, area);
+    }
+}
+
 fn render_symlink_settings_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 60, frame.area());
 
@@ -943,7 +1219,7 @@ fn render_symlink_settings_popup(frame: &mut Frame, app: &App) {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::vertical([
         Constraint::Percentage((100 - percent_y) / 2),
         Constraint::Percentage(percent_y),

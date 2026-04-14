@@ -61,6 +61,10 @@ pub enum AppEvent {
     },
     /// スキル整形完了（claude -c の結果）
     SkillRefineResult(Result<String, String>),
+    /// コンテキスト整形完了（claude -p の結果）
+    ContextRefineResult(Result<String, String>),
+    /// URL からのコンテキスト取得完了（title, content）
+    ContextUrlFetchResult(Result<(String, String), String>),
     /// ペースト入力（ブラケットペーストモード）
     Paste(String),
 }
@@ -105,6 +109,7 @@ impl EventHandler {
                             match mouse.kind {
                                 MouseEventKind::Down(_)
                                 | MouseEventKind::Drag(MouseButton::Left)
+                                | MouseEventKind::Moved
                                 | MouseEventKind::Up(MouseButton::Left)
                                 | MouseEventKind::ScrollUp
                                 | MouseEventKind::ScrollDown => {

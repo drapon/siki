@@ -69,7 +69,7 @@ fn handle_request(
                     "name": "siki",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "You are connected to siki, a multi-session orchestrator.\n\nOn every new conversation:\n1. Call `list_sessions` silently.\n2. If active sessions exist in the same worktree, ask:\n   'Active session(s) found. [1] Start new  [2] Reference existing'\n   Default is 1. If user picks 2, list the active sessions with their summaries and let user choose which to `get_context` from.\n3. Call `set_summary` with a short task description once work begins."
+                "instructions": "You are connected to siki, a multi-session orchestrator.\n\nOn every new conversation:\n1. Call `list_sessions` silently.\n2. If active sessions exist in the same worktree, ask:\n   'Active session(s) found. [1] Start new  [2] Reference existing'\n   Default is 1. If user picks 2, list the active sessions with their summaries and let user choose which to `get_context` from.\n3. Call `set_summary` with a short task description once work begins.\n\nThe `list_sessions` response may include `worktree_contexts` — these are user-defined context documents for this worktree. Load them silently as background context."
             }),
         ),
 

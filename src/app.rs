@@ -170,6 +170,13 @@ pub struct StatusMessage {
     pub level: StatusLevel,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContextAddMode {
+    #[default]
+    Text,
+    Url,
+}
+
 /// Worktree 追加時のブランチ作成モード
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddWorktreeMode {
@@ -309,6 +316,46 @@ pub struct App {
     pub symlink_input_mode: bool,
     /// シンボリックリンク手動入力バッファ
     pub symlink_input: String,
+    /// コンテキスト一覧ポップアップ表示フラグ
+    pub show_context_list: bool,
+    /// コンテキスト一覧データ (name, content)
+    pub context_list_items: Vec<(String, String)>,
+    /// コンテキスト一覧カーソル位置
+    pub context_list_cursor: usize,
+    /// コンテキスト対象のプロジェクト名
+    pub context_project_name: Option<String>,
+    /// コンテキスト対象の worktree 名
+    pub context_worktree_name: Option<String>,
+    /// コンテキスト名入力ポップアップ
+    pub show_context_name_popup: bool,
+    /// コンテキスト名入力バッファ
+    pub context_name_input: String,
+    /// コンテキスト追加モード (Text or Url)
+    pub context_add_mode: ContextAddMode,
+    /// コンテキスト編集ポップアップ表示フラグ
+    pub show_context_edit_popup: bool,
+    /// コンテキスト内容入力バッファ
+    pub context_content_input: String,
+    /// コンテキスト内容入力のカーソル位置（バイトオフセット）
+    pub context_content_cursor: usize,
+    /// コンテキスト編集のスクロールオフセット（行数）
+    pub context_edit_scroll: usize,
+    /// コンテキスト編集の選択範囲 (anchor, cursor) バイトオフセット
+    pub context_edit_selection: Option<(usize, usize)>,
+    /// コンテキスト編集でマウスボタンが押されている状態
+    pub context_edit_dragging: bool,
+    /// コンテキスト内容を Claude で整形中
+    pub context_refining: bool,
+    /// コンテキスト整形中のスピナーカウンタ
+    pub context_refine_spinner: usize,
+    /// コンテキスト URL 入力ポップアップ
+    pub show_context_url_popup: bool,
+    /// コンテキスト URL 入力バッファ
+    pub context_url_input: String,
+    /// URL からコンテンツ取得中
+    pub context_url_fetching: bool,
+    /// URL 取得中のスピナーカウンタ
+    pub context_url_spinner: usize,
     /// セッション選択ポップアップ（新規 Claude タブ起動時）
     pub show_session_choice: bool,
     /// セッション選択対象の worktree ID
@@ -397,6 +444,26 @@ impl App {
             symlink_cursor: 0,
             symlink_input_mode: false,
             symlink_input: String::new(),
+            show_context_list: false,
+            context_list_items: Vec::new(),
+            context_list_cursor: 0,
+            context_project_name: None,
+            context_worktree_name: None,
+            show_context_name_popup: false,
+            context_name_input: String::new(),
+            context_add_mode: ContextAddMode::default(),
+            show_context_edit_popup: false,
+            context_content_input: String::new(),
+            context_content_cursor: 0,
+            context_edit_scroll: 0,
+            context_edit_selection: None,
+            context_edit_dragging: false,
+            context_refining: false,
+            context_refine_spinner: 0,
+            show_context_url_popup: false,
+            context_url_input: String::new(),
+            context_url_fetching: false,
+            context_url_spinner: 0,
             show_session_choice: false,
             session_choice_wt_id: None,
             show_rename_project_popup: false,

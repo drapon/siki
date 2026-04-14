@@ -341,6 +341,30 @@ async fn handle_event(
                 return;
             }
 
+            // コンテキスト URL 入力ポップアップ表示中
+            if app.show_context_url_popup {
+                handle_context_url_popup_key(app, key, event_tx);
+                return;
+            }
+
+            // コンテキスト編集ポップアップ表示中
+            if app.show_context_edit_popup {
+                handle_context_edit_popup_key(app, key, event_tx);
+                return;
+            }
+
+            // コンテキスト名入力ポップアップ表示中
+            if app.show_context_name_popup {
+                handle_context_name_popup_key(app, key);
+                return;
+            }
+
+            // コンテキスト一覧ポップアップ表示中
+            if app.show_context_list {
+                handle_context_list_key(app, key);
+                return;
+            }
+
             // スキル内容入力ポップアップ表示中
             if app.show_skill_edit_popup {
                 handle_skill_edit_popup_key(app, key, event_tx);
@@ -656,8 +680,100 @@ async fn handle_event(
                 }
                 return;
             }
+            // コンテキスト編集ポップアップ表示中はクリック+ドラッグ+スクロール処理
+            if app.show_context_edit_popup {
+                // スクロール上限を算出して常にclamp
+                let total_lines = app.context_content_input.split('\n').count();
+                let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+                let term_area = ratatui::prelude::Rect::new(0, 0, tw, th);
+                let popup = ui::centered_rect(80, 80, term_area);
+                let inner_h = popup.height.saturating_sub(2) as usize;
+                let max_scroll = total_lines.saturating_sub(inner_h);
+                app.context_edit_scroll = app.context_edit_scroll.min(max_scroll);
+
+                let inner_x = popup.x + 1;
+                let inner_y = popup.y + 1;
+                let inner_w = popup.width.saturating_sub(2) as u16;
+
+                // マウス座標 → テキストバイトオフセット変換
+                let mouse_to_offset = |mx: u16, my: u16, s: &str, scroll: usize| -> Option<usize> {
+                    if mx < inner_x || mx >= inner_x + inner_w
+                        || my < inner_y || my >= inner_y + inner_h as u16
+                    {
+                        return None;
+                    }
+                    let click_col = (mx - inner_x) as usize;
+                    let click_row = (my - inner_y) as usize + scroll;
+                    let line_count = s.split('\n').count();
+                    if click_row >= line_count {
+                        return Some(s.len());
+                    }
+                    let mut byte_offset = 0;
+                    for (line_idx, line) in s.split('\n').enumerate() {
+                        if line_idx == click_row {
+                            let col = click_col.min(line.chars().count());
+                            let col_bytes: usize = line.chars().take(col).map(|c| c.len_utf8()).sum();
+                            return Some(byte_offset + col_bytes);
+                        }
+                        byte_offset += line.len() + 1;
+                    }
+                    Some(s.len())
+                };
+
+                match mouse.kind {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        if let Some(offset) = mouse_to_offset(
+                            mouse.column, mouse.row,
+                            &app.context_content_input, app.context_edit_scroll,
+                        ) {
+                            app.context_content_cursor = offset;
+                            app.context_edit_selection = Some((offset, offset));
+                            app.context_edit_dragging = true;
+                        }
+                    }
+                    // Drag または Moved（ドラッグ中）で選択範囲を拡張
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                    | MouseEventKind::Moved
+                        if app.context_edit_dragging =>
+                    {
+                        if let Some(offset) = mouse_to_offset(
+                            mouse.column, mouse.row,
+                            &app.context_content_input, app.context_edit_scroll,
+                        ) {
+                            app.context_content_cursor = offset;
+                            if let Some((anchor, _)) = app.context_edit_selection {
+                                app.context_edit_selection = Some((anchor, offset));
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                        app.context_edit_dragging = false;
+                        if let Some((a, b)) = app.context_edit_selection {
+                            if a == b {
+                                app.context_edit_selection = None;
+                            } else {
+                                // 選択完了時に自動コピー
+                                let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                                let selected = &app.context_content_input[start..end];
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    let _ = clipboard.set_text(selected);
+                                    app.show_info("コピーしました".to_string());
+                                }
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.context_edit_scroll = (app.context_edit_scroll + 3).min(max_scroll);
+                    }
+                    MouseEventKind::ScrollUp => {
+                        app.context_edit_scroll = app.context_edit_scroll.saturating_sub(3);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings || app.show_context_list || app.show_context_name_popup || app.show_context_url_popup {
                 return;
             }
             match mouse.kind {
@@ -1123,6 +1239,31 @@ async fn handle_event(
                 app.skill_content_cursor += text.len();
                 return;
             }
+            // コンテキスト編集ポップアップ表示中
+            if app.show_context_edit_popup {
+                // 選択範囲があれば削除してからペースト
+                if let Some((a, b)) = app.context_edit_selection.take() {
+                    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                    app.context_content_input.drain(start..end);
+                    app.context_content_cursor = start;
+                }
+                app.context_content_input.insert_str(app.context_content_cursor, &text);
+                app.context_content_cursor += text.len();
+                return;
+            }
+            // コンテキスト URL 入力ポップアップ表示中
+            if app.show_context_url_popup {
+                app.context_url_input.push_str(&text);
+                return;
+            }
+            // コンテキスト名入力ポップアップ表示中
+            if app.show_context_name_popup {
+                let filtered: String = text.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                app.context_name_input.push_str(&filtered);
+                return;
+            }
             // メッセージポップアップ: 入力欄に追加
             if app.show_message_popup {
                 app.popup_input.push_str(&text);
@@ -1174,6 +1315,46 @@ async fn handle_event(
                 }
             }
         }
+        AppEvent::ContextRefineResult(result) => {
+            app.context_refining = false;
+            match result {
+                Ok(text) => {
+                    app.context_content_input = text.trim().to_string();
+                    app.context_content_cursor = app.context_content_input.len();
+                }
+                Err(e) => {
+                    app.show_error(format!("Claude 整形エラー: {}", e));
+                }
+            }
+        }
+        AppEvent::ContextUrlFetchResult(result) => {
+            app.context_url_fetching = false;
+            match result {
+                Ok((title, content)) => {
+                    // URL ポップアップを閉じて編集ポップアップを開く
+                    app.show_context_url_popup = false;
+                    if app.context_name_input.is_empty() {
+                        // タイトルからファイル名を生成
+                        let name = title
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == ' ')
+                            .collect::<String>()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join("-")
+                            .to_ascii_lowercase();
+                        let name = if name.is_empty() { "url-context".to_string() } else { name };
+                        app.context_name_input = name[..name.len().min(50)].to_string();
+                    }
+                    app.context_content_input = content;
+                    app.context_content_cursor = app.context_content_input.len();
+                    app.show_context_edit_popup = true;
+                }
+                Err(e) => {
+                    app.show_error(format!("URL 取得エラー: {}", e));
+                }
+            }
+        }
         AppEvent::Tick => {
             app.clear_expired_status();
             if app.show_siki_json_init_terminal {
@@ -1181,6 +1362,12 @@ async fn handle_event(
             }
             if app.skill_refining {
                 app.skill_refine_spinner = app.skill_refine_spinner.wrapping_add(1);
+            }
+            if app.context_refining {
+                app.context_refine_spinner = app.context_refine_spinner.wrapping_add(1);
+            }
+            if app.context_url_fetching {
+                app.context_url_spinner = app.context_url_spinner.wrapping_add(1);
             }
             // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
             if let Some(registry) = session_registry {
@@ -2139,6 +2326,19 @@ fn handle_left_panel_key(
                 app.show_skill_list = true;
             }
         }
+        KeyCode::Char('C') => {
+            // コンテキスト管理ポップアップを開く（worktree 行のみ）
+            if let Some(wt_id) = left_panel.select_worktree(&entries) {
+                let project_name = &app.projects[wt_id.0].name;
+                let worktree_name = &app.projects[wt_id.0].worktrees[wt_id.1].name;
+                let items = config::load_contexts(project_name, worktree_name);
+                app.context_project_name = Some(project_name.clone());
+                app.context_worktree_name = Some(worktree_name.clone());
+                app.context_list_items = items;
+                app.context_list_cursor = 0;
+                app.show_context_list = true;
+            }
+        }
         KeyCode::Char('L') => {
             // シンボリックリンク設定ポップアップを開く
             let project_index = match left_panel.current_entry(&entries) {
@@ -2789,6 +2989,688 @@ fn handle_skill_list_key(
         }
         _ => {}
     }
+}
+
+/// コンテキスト一覧ポップアップのキー処理
+fn handle_context_list_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Esc => {
+            app.show_context_list = false;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.context_list_items.is_empty()
+                && app.context_list_cursor < app.context_list_items.len() - 1
+            {
+                app.context_list_cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.context_list_cursor = app.context_list_cursor.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            // 既存コンテキストを編集
+            if let Some((name, content)) = app.context_list_items.get(app.context_list_cursor) {
+                app.context_name_input = name.clone();
+                app.context_content_input = content.clone();
+                app.context_content_cursor = content.len();
+                app.show_context_list = false;
+                app.show_context_edit_popup = true;
+            }
+        }
+        KeyCode::Char('n') => {
+            // テキスト入力で新規作成 → 名前入力へ
+            app.context_add_mode = app::ContextAddMode::Text;
+            app.show_context_list = false;
+            app.context_name_input.clear();
+            app.show_context_name_popup = true;
+        }
+        KeyCode::Char('u') => {
+            // URL 入力で新規作成 → 名前入力へ
+            app.context_add_mode = app::ContextAddMode::Url;
+            app.show_context_list = false;
+            app.context_name_input.clear();
+            app.show_context_name_popup = true;
+        }
+        KeyCode::Char('d') => {
+            // コンテキスト削除
+            if let Some((name, _)) = app.context_list_items.get(app.context_list_cursor) {
+                if let (Some(pn), Some(wn)) = (
+                    app.context_project_name.as_deref(),
+                    app.context_worktree_name.as_deref(),
+                ) {
+                    let path = config::worktree_contexts_dir(pn, wn).join(format!("{}.md", name));
+                    let _ = std::fs::remove_file(&path);
+                    app.context_list_items.remove(app.context_list_cursor);
+                    if app.context_list_cursor >= app.context_list_items.len()
+                        && app.context_list_cursor > 0
+                    {
+                        app.context_list_cursor -= 1;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// コンテキスト名入力ポップアップのキー処理
+fn handle_context_name_popup_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Esc => {
+            app.show_context_name_popup = false;
+            app.context_name_input.clear();
+        }
+        KeyCode::Enter => {
+            let name = app.context_name_input.trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            app.show_context_name_popup = false;
+            match app.context_add_mode {
+                app::ContextAddMode::Text => {
+                    // 既存コンテキストがあれば読み込む
+                    if let (Some(pn), Some(wn)) = (
+                        app.context_project_name.as_deref(),
+                        app.context_worktree_name.as_deref(),
+                    ) {
+                        let path =
+                            config::worktree_contexts_dir(pn, wn).join(format!("{}.md", name));
+                        app.context_content_input =
+                            std::fs::read_to_string(&path).unwrap_or_default();
+                    }
+                    app.context_content_cursor = app.context_content_input.len();
+                    app.show_context_edit_popup = true;
+                }
+                app::ContextAddMode::Url => {
+                    // URL 入力ポップアップへ
+                    app.context_url_input.clear();
+                    app.show_context_url_popup = true;
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            app.context_name_input.pop();
+        }
+        KeyCode::Char(c) => {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                app.context_name_input.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// コンテキスト内容の保存処理
+fn save_context_content(app: &mut app::App) {
+    let name = app.context_name_input.trim().to_string();
+    if let (Some(pn), Some(wn)) = (
+        app.context_project_name.as_deref(),
+        app.context_worktree_name.as_deref(),
+    ) {
+        let dir = config::worktree_contexts_dir(pn, wn);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("{}.md", name)), &app.context_content_input);
+        app.show_info(format!("コンテキスト '{}' を保存しました", name));
+    }
+    app.show_context_edit_popup = false;
+    app.context_content_input.clear();
+    app.context_content_cursor = 0;
+    app.context_edit_scroll = 0;
+    app.context_name_input.clear();
+}
+
+/// コンテキスト編集ポップアップのキー処理
+fn handle_context_edit_popup_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if app.context_refining {
+        return;
+    }
+
+    // Shift+Enter → Ctrl+J として来る → 改行
+    if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.context_content_input
+            .insert(app.context_content_cursor, '\n');
+        app.context_content_cursor += 1;
+        return;
+    }
+
+    // Ctrl+S で保存
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        save_context_content(app);
+        return;
+    }
+
+    // Ctrl+R で Claude 整形
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app.context_content_input.trim().is_empty() {
+            app.show_info("整形するテキストがありません".to_string());
+            return;
+        }
+        app.context_refining = true;
+        app.context_refine_spinner = 0;
+        let content = app.context_content_input.clone();
+        let context_name = app.context_name_input.clone();
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let prompt = format!(
+                "以下のテキストを Claude Code の worktree コンテキストとして適切なフォーマットに整形してください。\n\
+                コンテキスト名: {}\n\n\
+                整形ルール:\n\
+                - Markdown形式で構造化する\n\
+                - 目的、概要、重要なポイントなどのセクションを適切に追加する\n\
+                - 元のテキストの意図と情報を保持する\n\
+                - 整形結果のみを出力し、説明や前置きは不要\n\n\
+                ---\n{}",
+                context_name, content
+            );
+            let result = tokio::process::Command::new("claude")
+                .args(["-p", &prompt, "--tools", ""])
+                .output()
+                .await;
+            match result {
+                Ok(output) if output.status.success() => {
+                    let text = String::from_utf8_lossy(&output.stdout).to_string();
+                    let _ = tx.send(event::AppEvent::ContextRefineResult(Ok(text)));
+                }
+                Ok(output) => {
+                    let err = String::from_utf8_lossy(&output.stderr).to_string();
+                    let _ = tx.send(event::AppEvent::ContextRefineResult(Err(err)));
+                }
+                Err(e) => {
+                    let _ = tx.send(event::AppEvent::ContextRefineResult(Err(e.to_string())));
+                }
+            }
+        });
+        return;
+    }
+
+    // Ctrl+A: 全選択
+    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.context_edit_selection = Some((0, app.context_content_input.len()));
+        app.context_content_cursor = app.context_content_input.len();
+        return;
+    }
+
+    // Ctrl+C / y: 選択範囲をコピー
+    // macOS のターミナルによっては Ctrl+C が '\x03' として来る場合がある
+    {
+        let is_copy = (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || key.code == KeyCode::Char('\x03')
+            || (key.code == KeyCode::Char('y') && app.context_edit_selection.map(|(a, b)| a != b).unwrap_or(false));
+        if is_copy {
+            if let Some((a, b)) = app.context_edit_selection {
+                let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                let selected = &app.context_content_input[start..end];
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(selected);
+                    app.show_info("コピーしました".to_string());
+                }
+            }
+            return;
+        }
+    }
+
+    // Ctrl+X: 選択範囲をカット
+    {
+        let is_cut = (key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || key.code == KeyCode::Char('\x18');
+        if is_cut {
+            if let Some((a, b)) = app.context_edit_selection.take() {
+                let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                let selected = app.context_content_input[start..end].to_string();
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(&selected);
+                }
+                app.context_content_input.drain(start..end);
+                app.context_content_cursor = start;
+                app.show_info("カットしました".to_string());
+            }
+            return;
+        }
+    }
+
+    // 選択範囲がある状態で文字入力・Backspace・Delete → 選択範囲を削除
+    let has_selection = app
+        .context_edit_selection
+        .map(|(a, b)| a != b)
+        .unwrap_or(false);
+    let is_text_modifying = matches!(
+        key.code,
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter
+    );
+    if has_selection && is_text_modifying {
+        let (a, b) = app.context_edit_selection.take().unwrap();
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        app.context_content_input.drain(start..end);
+        app.context_content_cursor = start;
+        // Backspace/Delete は削除のみで終了、文字入力/Enter は続行
+        if matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
+            return;
+        }
+    } else {
+        // テキスト変更キーで選択解除
+        if is_text_modifying {
+            app.context_edit_selection = None;
+        }
+    }
+
+    // Enter: 修飾キーなしで保存、それ以外（Shift等）は改行
+    if key.code == KeyCode::Enter {
+        if key.modifiers == KeyModifiers::NONE {
+            save_context_content(app);
+        } else {
+            app.context_content_input
+                .insert(app.context_content_cursor, '\n');
+            app.context_content_cursor += 1;
+        }
+        return;
+    }
+
+    // Ctrl/Super/Meta 付きはスキップ（Shiftは通す）
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META)
+    {
+        return;
+    }
+
+    // PageUp/PageDown でスクロール
+    if key.code == KeyCode::PageUp {
+        app.context_edit_scroll = app.context_edit_scroll.saturating_sub(10);
+        return;
+    }
+    if key.code == KeyCode::PageDown {
+        app.context_edit_scroll += 10;
+        return;
+    }
+
+    let s = &mut app.context_content_input;
+    let cur = &mut app.context_content_cursor;
+
+    // 移動キーで選択解除
+    if matches!(
+        key.code,
+        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+    ) {
+        app.context_edit_selection = None;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.show_context_edit_popup = false;
+            s.clear();
+            *cur = 0;
+            app.context_edit_scroll = 0;
+            app.context_edit_selection = None;
+            app.context_name_input.clear();
+        }
+        KeyCode::Backspace => {
+            if *cur > 0 {
+                let prev = s[..*cur]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                s.drain(prev..*cur);
+                *cur = prev;
+            }
+        }
+        KeyCode::Delete => {
+            if *cur < s.len() {
+                let next = s[*cur..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| *cur + i)
+                    .unwrap_or(s.len());
+                s.drain(*cur..next);
+            }
+        }
+        KeyCode::Up => {
+            // カーソルを前の行へ移動
+            let before = &s[..*cur];
+            let cur_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            if cur_line_start > 0 {
+                let col = *cur - cur_line_start;
+                let prev_line_start = before[..cur_line_start - 1]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let prev_line_len = cur_line_start - 1 - prev_line_start;
+                *cur = prev_line_start + col.min(prev_line_len);
+            }
+        }
+        KeyCode::Down => {
+            // カーソルを次の行へ移動
+            let before = &s[..*cur];
+            let cur_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let col = *cur - cur_line_start;
+            if let Some(next_nl) = s[*cur..].find('\n') {
+                let next_line_start = *cur + next_nl + 1;
+                let next_line_end = s[next_line_start..]
+                    .find('\n')
+                    .map(|i| next_line_start + i)
+                    .unwrap_or(s.len());
+                let next_line_len = next_line_end - next_line_start;
+                *cur = next_line_start + col.min(next_line_len);
+            }
+        }
+        KeyCode::Left => {
+            if *cur > 0 {
+                *cur = s[..*cur]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+            }
+        }
+        KeyCode::Right => {
+            if *cur < s.len() {
+                *cur = s[*cur..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| *cur + i)
+                    .unwrap_or(s.len());
+            }
+        }
+        KeyCode::Home => {
+            let line_start = s[..*cur].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            *cur = line_start;
+        }
+        KeyCode::End => {
+            let line_end = s[*cur..].find('\n').map(|i| *cur + i).unwrap_or(s.len());
+            *cur = line_end;
+        }
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_control() =>
+        {
+            s.insert(*cur, '\n');
+            *cur += 1;
+        }
+        KeyCode::Char(c) => {
+            s.insert(*cur, c);
+            *cur += c.len_utf8();
+        }
+        _ => {}
+    }
+
+    // カーソル行がスクロール範囲内に収まるよう自動追従
+    let cursor_line = app.context_content_input[..app.context_content_cursor]
+        .matches('\n')
+        .count();
+    // 表示領域の高さは実行時にしか分からないので、おおよそ 30 行と仮定
+    // （正確な値は render 時に算出されるが、追従には十分）
+    let visible_height = 30_usize;
+    if cursor_line < app.context_edit_scroll {
+        app.context_edit_scroll = cursor_line;
+    } else if cursor_line >= app.context_edit_scroll + visible_height {
+        app.context_edit_scroll = cursor_line - visible_height + 1;
+    }
+}
+
+/// コンテキスト URL 入力ポップアップのキー処理
+fn handle_context_url_popup_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+) {
+    use crossterm::event::KeyCode;
+
+    if app.context_url_fetching {
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.show_context_url_popup = false;
+            app.context_url_input.clear();
+        }
+        KeyCode::Enter => {
+            let url = app.context_url_input.trim().to_string();
+            if url.is_empty() {
+                return;
+            }
+            app.context_url_fetching = true;
+            app.context_url_spinner = 0;
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                // curl でコンテンツ取得（サイズ上限 1MB、タイムアウト 30秒）
+                let curl_result = tokio::process::Command::new("curl")
+                    .args(["-sL", "--max-filesize", "1048576", "--max-time", "30", &url])
+                    .output()
+                    .await;
+
+                let html = match curl_result {
+                    Ok(output) if output.status.success() => {
+                        String::from_utf8_lossy(&output.stdout).to_string()
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(event::AppEvent::ContextUrlFetchResult(Err(
+                            "URL の取得に失敗しました".to_string(),
+                        )));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(event::AppEvent::ContextUrlFetchResult(Err(
+                            format!("curl エラー: {}", e),
+                        )));
+                        return;
+                    }
+                };
+
+                // HTML タグを除去してプレーンテキストを抽出
+                let plain = strip_html_tags(&html);
+
+                // 先頭 30000 文字に切り詰め（タグ除去済みなので多く取れる）
+                let truncated = if plain.len() > 30000 {
+                    &plain[..30000]
+                } else {
+                    &plain
+                };
+
+                let stdin_content = format!(
+                    "以下のWebページのテキスト内容を要約し、Claude Codeのworktreeコンテキストとして使えるMarkdown形式にまとめてください。\n\
+                    URL: {}\n\n\
+                    ルール:\n\
+                    - 主要なポイント、技術的な詳細、重要な情報を構造化する\n\
+                    - 要約結果のみを出力し、説明や前置きは不要\n\n\
+                    ---\n{}", url, truncated
+                );
+
+                // stdin 経由で渡し、タイムアウト付きで実行
+                use tokio::io::AsyncWriteExt;
+                let mut child = match tokio::process::Command::new("claude")
+                    .args(["-p", "-", "--tools", ""])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(event::AppEvent::ContextUrlFetchResult(Err(
+                            format!("claude 起動エラー: {}", e),
+                        )));
+                        return;
+                    }
+                };
+
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(stdin_content.as_bytes()).await;
+                    drop(stdin);
+                }
+
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    child.wait_with_output(),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok(output)) if output.status.success() => {
+                        let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let title = url
+                            .split('/')
+                            .filter(|s| !s.is_empty())
+                            .last()
+                            .unwrap_or("context")
+                            .to_string();
+                        let _ = tx.send(event::AppEvent::ContextUrlFetchResult(Ok((
+                            title, content,
+                        ))));
+                    }
+                    Ok(Ok(output)) => {
+                        let err = String::from_utf8_lossy(&output.stderr).to_string();
+                        let _ = tx.send(event::AppEvent::ContextUrlFetchResult(Err(err)));
+                    }
+                    Ok(Err(e)) => {
+                        let _ = tx.send(event::AppEvent::ContextUrlFetchResult(Err(
+                            format!("claude エラー: {}", e),
+                        )));
+                    }
+                    Err(_) => {
+                        let _ = tx.send(event::AppEvent::ContextUrlFetchResult(Err(
+                            "タイムアウト: Claude の処理が120秒を超えました".to_string(),
+                        )));
+                    }
+                }
+            });
+        }
+        KeyCode::Backspace => {
+            app.context_url_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.context_url_input.push(c);
+        }
+        _ => {}
+    }
+}
+
+/// HTML タグを除去してプレーンテキストを抽出する
+fn strip_html_tags(html: &str) -> String {
+    let mut result = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut last_was_whitespace = false;
+
+    let lower = html.to_lowercase();
+    let chars: Vec<char> = html.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if !in_tag && i + 7 <= len {
+            let slice: String = lower_chars[i..i + 7].iter().collect();
+            if slice == "<script" {
+                in_script = true;
+            } else if slice == "<style " || (i + 6 <= len && lower_chars[i..i + 6].iter().collect::<String>() == "<style") {
+                in_style = true;
+            }
+        }
+
+        if chars[i] == '<' {
+            // </script> or </style> の検出
+            if in_script && i + 9 <= len {
+                let slice: String = lower_chars[i..i + 9].iter().collect();
+                if slice == "</script>" {
+                    in_script = false;
+                    i += 9;
+                    continue;
+                }
+            }
+            if in_style && i + 8 <= len {
+                let slice: String = lower_chars[i..i + 8].iter().collect();
+                if slice == "</style>" {
+                    in_style = false;
+                    i += 8;
+                    continue;
+                }
+            }
+            in_tag = true;
+            i += 1;
+            continue;
+        }
+
+        if chars[i] == '>' {
+            in_tag = false;
+            i += 1;
+            continue;
+        }
+
+        if in_tag || in_script || in_style {
+            i += 1;
+            continue;
+        }
+
+        // HTML エンティティのデコード
+        if chars[i] == '&' && i + 1 < len {
+            let rest: String = chars[i..len.min(i + 10)].iter().collect();
+            if let Some(semi) = rest.find(';') {
+                let entity = &rest[..semi + 1];
+                let decoded = match entity {
+                    "&amp;" => "&",
+                    "&lt;" => "<",
+                    "&gt;" => ">",
+                    "&quot;" => "\"",
+                    "&apos;" => "'",
+                    "&nbsp;" => " ",
+                    _ => "",
+                };
+                if !decoded.is_empty() {
+                    result.push_str(decoded);
+                    last_was_whitespace = decoded == " ";
+                    i += semi + 1;
+                    continue;
+                }
+            }
+        }
+
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            if !last_was_whitespace && !result.is_empty() {
+                result.push(' ');
+                last_was_whitespace = true;
+            }
+        } else {
+            result.push(ch);
+            last_was_whitespace = false;
+        }
+
+        i += 1;
+    }
+
+    // 連続する空行を削除
+    let mut cleaned = String::new();
+    let mut blank_count = 0;
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blank_count += 1;
+            if blank_count <= 1 {
+                cleaned.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            cleaned.push_str(trimmed);
+            cleaned.push('\n');
+        }
+    }
+
+    cleaned.trim().to_string()
 }
 
 /// Grep ポップアップのキー処理
