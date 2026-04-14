@@ -547,55 +547,6 @@ impl App {
         }
     }
 
-    /// grep 検索を実行する
-    pub fn run_grep(&mut self) {
-        self.grep_results.clear();
-        self.grep_cursor = 0;
-
-        if self.grep_input.is_empty() {
-            return;
-        }
-
-        let wt_path = match self.selected_worktree() {
-            Some(wt) => wt.path.clone(),
-            None => return,
-        };
-
-        let output = std::process::Command::new("grep")
-            .args([
-                "-rn",
-                "--binary-files=without-match",
-                "-I",
-                &self.grep_input,
-                ".",
-            ])
-            .current_dir(&wt_path)
-            .output();
-
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines().take(200) {
-                // 形式: ./path/to/file:123:line content
-                let parts: Vec<&str> = line.splitn(3, ':').collect();
-                if parts.len() >= 3 {
-                    let file_path = parts[0];
-                    if let Ok(line_number) = parts[1].parse::<usize>() {
-                        let full_path = if file_path.starts_with("./") {
-                            wt_path.join(&file_path[2..])
-                        } else {
-                            wt_path.join(file_path)
-                        };
-                        self.grep_results.push(GrepResult {
-                            path: full_path,
-                            line_number,
-                            line_content: parts[2].to_string(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
     /// WorktreeId で worktree を取得する
     pub fn worktree_by_id(&self, id: WorktreeId) -> Option<&Worktree> {
         let (pi, wi) = id;

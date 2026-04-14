@@ -67,6 +67,8 @@ pub enum AppEvent {
     ContextUrlFetchResult(Result<(String, String), String>),
     /// ペースト入力（ブラケットペーストモード）
     Paste(String),
+    /// Grep 検索結果
+    GrepResults(Vec<crate::app::GrepResult>),
 }
 
 /// Claude Code ストリームイベント型
