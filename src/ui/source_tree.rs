@@ -9,6 +9,7 @@ pub struct TreeEntry {
     pub name: String,
     pub depth: usize,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub expanded: bool,
 }
 
@@ -56,20 +57,21 @@ impl SourceTree {
 
     /// ディレクトリを再帰的に走査
     fn scan_dir(&mut self, dir: &Path, depth: usize) {
-        let mut children: Vec<(bool, String, PathBuf)> = Vec::new();
+        let mut children: Vec<(bool, bool, String, PathBuf)> = Vec::new();
 
         if let Ok(read_dir) = std::fs::read_dir(dir) {
             for entry in read_dir.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
 
-                // 隠しファイル・ディレクトリをスキップ
-                if name.starts_with('.') {
+                // .git ディレクトリのみスキップ
+                if name == ".git" {
                     continue;
                 }
 
                 let is_dir = path.is_dir();
-                children.push((is_dir, name, path));
+                let is_symlink = path.is_symlink();
+                children.push((is_dir, is_symlink, name, path));
             }
         }
 
@@ -78,16 +80,17 @@ impl SourceTree {
             match (a.0, b.0) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
+                _ => a.2.to_lowercase().cmp(&b.2.to_lowercase()),
             }
         });
 
-        for (is_dir, name, path) in children {
+        for (is_dir, is_symlink, name, path) in children {
             self.entries.push(TreeEntry {
                 path: path.clone(),
                 name,
                 depth,
                 is_dir,
+                is_symlink,
                 expanded: false,
             });
         }
@@ -271,17 +274,18 @@ impl SourceTree {
 
     /// ディレクトリの子エントリを走査して返す
     fn scan_children(dir: &Path, depth: usize) -> Vec<TreeEntry> {
-        let mut children: Vec<(bool, String, PathBuf)> = Vec::new();
+        let mut children: Vec<(bool, bool, String, PathBuf)> = Vec::new();
 
         if let Ok(read_dir) = std::fs::read_dir(dir) {
             for entry in read_dir.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
+                if name == ".git" {
                     continue;
                 }
                 let is_dir = path.is_dir();
-                children.push((is_dir, name, path));
+                let is_symlink = path.is_symlink();
+                children.push((is_dir, is_symlink, name, path));
             }
         }
 
@@ -289,17 +293,18 @@ impl SourceTree {
             match (a.0, b.0) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
+                _ => a.2.to_lowercase().cmp(&b.2.to_lowercase()),
             }
         });
 
         children
             .into_iter()
-            .map(|(is_dir, name, path)| TreeEntry {
+            .map(|(is_dir, is_symlink, name, path)| TreeEntry {
                 path,
                 name,
                 depth,
                 is_dir,
+                is_symlink,
                 expanded: false,
             })
             .collect()
@@ -405,7 +410,8 @@ impl SourceTree {
                     } else {
                         Style::default()
                     };
-                    ListItem::new(format!("{}{}{}", indent, icon, entry.name)).style(style)
+                    let suffix = if entry.is_symlink { " →" } else { "" };
+                    ListItem::new(format!("{}{}{}{}", indent, icon, entry.name, suffix)).style(style)
                 })
                 .collect();
 
@@ -446,7 +452,8 @@ impl SourceTree {
                         Style::default()
                     };
 
-                    ListItem::new(format!("{}{}{}", indent, icon, entry.name)).style(style)
+                    let suffix = if entry.is_symlink { " →" } else { "" };
+                    ListItem::new(format!("{}{}{}{}", indent, icon, entry.name, suffix)).style(style)
                 })
                 .collect();
 
@@ -511,16 +518,22 @@ mod tests {
     }
 
     #[test]
-    fn test_load_skips_hidden() {
+    fn test_load_skips_git_only() {
         let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join(".hidden"), "secret").unwrap();
+        fs::write(dir.path().join(".conductor"), "config").unwrap();
         fs::write(dir.path().join("visible.txt"), "hello").unwrap();
 
         let mut tree = SourceTree::new();
         tree.load(dir.path());
 
-        assert_eq!(tree.entries.len(), 1);
-        assert_eq!(tree.entries[0].name, "visible.txt");
+        let names: Vec<&str> = tree.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&".git"));
+        assert!(names.contains(&".hidden"));
+        assert!(names.contains(&".conductor"));
+        assert!(names.contains(&"visible.txt"));
+        assert_eq!(tree.entries.len(), 3);
     }
 
     #[test]
@@ -687,10 +700,10 @@ mod tests {
     fn create_search_tree() -> SourceTree {
         let mut tree = SourceTree::new();
         tree.entries = vec![
-            TreeEntry { path: "src".into(), name: "src".to_string(), depth: 0, is_dir: true, expanded: false },
-            TreeEntry { path: "Cargo.toml".into(), name: "Cargo.toml".to_string(), depth: 0, is_dir: false, expanded: false },
-            TreeEntry { path: "README.md".into(), name: "README.md".to_string(), depth: 0, is_dir: false, expanded: false },
-            TreeEntry { path: "cargo.lock".into(), name: "cargo.lock".to_string(), depth: 0, is_dir: false, expanded: false },
+            TreeEntry { path: "src".into(), name: "src".to_string(), depth: 0, is_dir: true, is_symlink: false, expanded: false },
+            TreeEntry { path: "Cargo.toml".into(), name: "Cargo.toml".to_string(), depth: 0, is_dir: false, is_symlink: false, expanded: false },
+            TreeEntry { path: "README.md".into(), name: "README.md".to_string(), depth: 0, is_dir: false, is_symlink: false, expanded: false },
+            TreeEntry { path: "cargo.lock".into(), name: "cargo.lock".to_string(), depth: 0, is_dir: false, is_symlink: false, expanded: false },
         ];
         tree
     }
@@ -827,6 +840,33 @@ mod tests {
         assert_eq!(tree.cursor_index, 1);
         tree.prev_match();
         assert_eq!(tree.cursor_index, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_detection() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("real_file.txt");
+        fs::write(&target, "content").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link_file.txt")).unwrap();
+
+        let real_dir = dir.path().join("real_dir");
+        fs::create_dir(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, dir.path().join("link_dir")).unwrap();
+
+        let mut tree = SourceTree::new();
+        tree.load(dir.path());
+
+        let link_file = tree.entries.iter().find(|e| e.name == "link_file.txt").unwrap();
+        assert!(link_file.is_symlink);
+        assert!(!link_file.is_dir);
+
+        let real = tree.entries.iter().find(|e| e.name == "real_file.txt").unwrap();
+        assert!(!real.is_symlink);
+
+        let link_dir = tree.entries.iter().find(|e| e.name == "link_dir").unwrap();
+        assert!(link_dir.is_symlink);
+        assert!(link_dir.is_dir);
     }
 
     #[test]
