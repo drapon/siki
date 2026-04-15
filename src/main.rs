@@ -460,7 +460,7 @@ async fn handle_event(
                 return;
             }
             if app.show_archive_confirm {
-                handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, key);
+                handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, left_panel, key);
                 return;
             }
             if app.show_remove_project_confirm {
@@ -4041,6 +4041,7 @@ fn handle_archive_confirm_key(
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     shell: &str,
+    left_panel: &mut LeftPanel,
     key: crossterm::event::KeyEvent,
 ) {
     use crossterm::event::KeyCode;
@@ -4102,6 +4103,14 @@ fn handle_archive_confirm_key(
                             }
                         }
 
+                        // 同一プロジェクト内の削除位置より後の worktree のインデックスを再調整
+                        reindex_worktree_maps(sessions, terminals, claude_terms, pi, wi);
+
+                        // left_panel のカーソル位置を調整
+                        let entries = LeftPanel::build_entries(&app.projects);
+                        left_panel.clamp_cursor(entries.len());
+                        left_panel.scroll_offset = 0;
+
                         app.show_info(format!("worktree を削除しました: {}", wt_name));
                     }
                     Err(e) => {
@@ -4118,6 +4127,52 @@ fn handle_archive_confirm_key(
             app.archive_target = None;
         }
         _ => {}
+    }
+}
+
+/// worktree 削除後、同一プロジェクト内で削除位置より後のインデックスを持つ
+/// sessions / terminals / claude_terms のキーを 1 つ前にずらす
+fn reindex_worktree_maps(
+    sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    project_index: usize,
+    removed_worktree_index: usize,
+) {
+    // sessions: HashMap<(pi, wi), _>
+    let keys: Vec<_> = sessions
+        .keys()
+        .filter(|(pi, wi)| *pi == project_index && *wi > removed_worktree_index)
+        .cloned()
+        .collect();
+    for (pi, wi) in keys {
+        if let Some(val) = sessions.remove(&(pi, wi)) {
+            sessions.insert((pi, wi - 1), val);
+        }
+    }
+
+    // terminals: HashMap<((pi, wi), tab), _>
+    let keys: Vec<_> = terminals
+        .keys()
+        .filter(|((pi, wi), _)| *pi == project_index && *wi > removed_worktree_index)
+        .cloned()
+        .collect();
+    for ((pi, wi), tab) in keys {
+        if let Some(val) = terminals.remove(&((pi, wi), tab)) {
+            terminals.insert(((pi, wi - 1), tab), val);
+        }
+    }
+
+    // claude_terms: HashMap<((pi, wi), tab), _>
+    let keys: Vec<_> = claude_terms
+        .keys()
+        .filter(|((pi, wi), _)| *pi == project_index && *wi > removed_worktree_index)
+        .cloned()
+        .collect();
+    for ((pi, wi), tab) in keys {
+        if let Some(val) = claude_terms.remove(&((pi, wi), tab)) {
+            claude_terms.insert(((pi, wi - 1), tab), val);
+        }
     }
 }
 
