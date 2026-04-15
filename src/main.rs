@@ -1446,9 +1446,9 @@ async fn handle_event(
             if app.context_url_fetching {
                 app.context_url_spinner = app.context_url_spinner.wrapping_add(1);
             }
-            // 点滅タイマー: 500ms周期（Tick 100ms × 5回）
+            // 点滅タイマー: 800ms周期（Tick 100ms × 8回）
             app.blink_counter = app.blink_counter.wrapping_add(1);
-            if app.blink_counter >= 5 {
+            if app.blink_counter >= 8 {
                 app.blink_counter = 0;
                 app.blink_phase = !app.blink_phase;
             }
