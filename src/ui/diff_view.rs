@@ -489,9 +489,36 @@ fn get_local_diff(worktree_path: &Path) -> String {
 }
 
 /// リモートに push 済みのファイル一覧を取得する
-/// base_branch...@{upstream} の diff --name-only で判定
+/// 現在のブランチに対応するリモートブランチ (origin/<branch>) を使って判定する。
+/// @{upstream} はベースブランチを指す場合があり正しく動かないため。
 fn get_pushed_files(worktree_path: &Path, base_branch: &str) -> HashSet<String> {
-    let merge_base_arg = format!("{}...@{{upstream}}", base_branch);
+    // 現在のブランチ名を取得
+    let branch_output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(worktree_path)
+        .output();
+
+    let branch_name = match branch_output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => return HashSet::new(),
+    };
+
+    // origin/<branch> が存在するか確認
+    let remote_ref = format!("origin/{}", branch_name);
+    let verify = Command::new("git")
+        .args(["rev-parse", "--verify", &remote_ref])
+        .current_dir(worktree_path)
+        .output();
+
+    match verify {
+        Ok(output) if output.status.success() => {}
+        _ => return HashSet::new(), // リモートブランチが無い = まだ push されていない
+    }
+
+    // base_branch...origin/<branch> でリモートに push 済みのファイルを取得
+    let merge_base_arg = format!("{}...{}", base_branch, remote_ref);
     let output = Command::new("git")
         .args(["diff", "--name-only", &merge_base_arg])
         .current_dir(worktree_path)
