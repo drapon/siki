@@ -69,6 +69,8 @@ pub enum AppEvent {
     Paste(String),
     /// Grep 検索結果
     GrepResults(Vec<crate::app::GrepResult>),
+    /// Changes の再読み込み要求（broker 経由の refresh イベント）
+    RefreshChanges,
 }
 
 /// Claude Code ストリームイベント型

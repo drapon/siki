@@ -1,5 +1,6 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -11,6 +12,26 @@ pub struct DiffFile {
     pub additions: usize,
     pub deletions: usize,
     pub diff_content: String,
+    /// true ならリモートに push 済み
+    pub pushed: bool,
+}
+
+const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub const REFRESH_SPINNER_TICKS: u8 = 5;
+
+/// タイトルにスピナーを付与した Line を生成する
+fn title_with_spinner<'a>(title: Option<&str>, spinner_tick: u8) -> Option<Line<'a>> {
+    title.map(|t| {
+        if spinner_tick > 0 {
+            let ch = SPINNER_CHARS[(REFRESH_SPINNER_TICKS - spinner_tick) as usize % SPINNER_CHARS.len()];
+            Line::from(vec![
+                Span::raw(format!("{} ", t)),
+                Span::styled(format!("{}", ch), Style::default().fg(Color::Cyan)),
+            ])
+        } else {
+            Line::from(t.to_string())
+        }
+    })
 }
 
 /// Git diff の状態（ファイルベース）
@@ -19,6 +40,8 @@ pub struct DiffView {
     pub files: Vec<DiffFile>,
     pub selected_file: usize,
     pub diff_scroll_offset: usize,
+    /// リフレッシュスピナーの残り tick 数（0 = 非表示）
+    pub refresh_spinner: u8,
 }
 
 impl DiffView {
@@ -27,6 +50,7 @@ impl DiffView {
             files: Vec::new(),
             selected_file: 0,
             diff_scroll_offset: 0,
+            refresh_spinner: 0,
         }
     }
 
@@ -37,6 +61,12 @@ impl DiffView {
         self.diff_scroll_offset = 0;
         let raw = get_git_diff(worktree_path, base_branch);
         self.files = parse_diff(&raw);
+
+        // push 済みファイルにフラグを設定
+        let pushed_set = get_pushed_files(worktree_path, base_branch);
+        for file in &mut self.files {
+            file.pushed = pushed_set.contains(&file.path);
+        }
     }
 
     /// ファイル選択を下へ
@@ -99,7 +129,7 @@ impl DiffView {
             let mut block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style);
-            if let Some(t) = title {
+            if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
                 block = block.title(t);
             }
             frame.render_widget(
@@ -118,7 +148,7 @@ impl DiffView {
         let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style);
-        if let Some(t) = title {
+        if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
             block = block.title(t);
         }
 
@@ -145,13 +175,21 @@ impl DiffView {
                     Style::default()
                 };
 
+                let (push_indicator, push_color) = if file.pushed {
+                    ("↑", Color::DarkGray)
+                } else {
+                    ("●", Color::Magenta)
+                };
+
                 let mut spans = vec![
-                    Span::styled(format!(" {} ", file.status), status_style.patch(base_style)),
+                    Span::styled(format!("{} ", push_indicator), Style::default().fg(push_color).patch(base_style)),
+                    Span::styled(format!("{} ", file.status), status_style.patch(base_style)),
                     Span::styled(&file.path, Style::default().fg(Color::White).patch(base_style)),
                 ];
 
                 // 右端に stat を表示するためスペースで埋める
-                let used = 3 + file.path.len() + stat.len();
+                // インジケータ(1) + スペース(1) + ステータス(1) + スペース(1) + パス + stat
+                let used = 4 + file.path.len() + stat.len();
                 let padding = (inner.width as usize).saturating_sub(used);
                 spans.push(Span::styled(" ".repeat(padding), base_style));
 
@@ -196,6 +234,8 @@ impl DiffView {
 pub struct LocalChangesView {
     pub files: Vec<DiffFile>,
     pub selected_file: usize,
+    /// リフレッシュスピナーの残り tick 数（0 = 非表示）
+    pub refresh_spinner: u8,
 }
 
 impl LocalChangesView {
@@ -203,6 +243,7 @@ impl LocalChangesView {
         Self {
             files: Vec::new(),
             selected_file: 0,
+            refresh_spinner: 0,
         }
     }
 
@@ -247,7 +288,7 @@ impl LocalChangesView {
             let mut block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style);
-            if let Some(t) = title {
+            if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
                 block = block.title(t);
             }
             frame.render_widget(
@@ -262,7 +303,7 @@ impl LocalChangesView {
         let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style);
-        if let Some(t) = title {
+        if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
             block = block.title(t);
         }
         let inner = block.inner(area);
@@ -364,6 +405,7 @@ fn parse_diff(raw: &str) -> Vec<DiffFile> {
                     additions,
                     deletions,
                     diff_content: current_content,
+                    pushed: false,
                 });
                 current_content = String::new();
             }
@@ -387,6 +429,7 @@ fn parse_diff(raw: &str) -> Vec<DiffFile> {
             additions,
             deletions,
             diff_content: current_content,
+            pushed: false,
         });
     }
 
@@ -442,6 +485,24 @@ fn get_local_diff(worktree_path: &Path) -> String {
             String::from_utf8_lossy(&output.stdout).to_string()
         }
         _ => String::new(),
+    }
+}
+
+/// リモートに push 済みのファイル一覧を取得する
+/// base_branch...@{upstream} の diff --name-only で判定
+fn get_pushed_files(worktree_path: &Path, base_branch: &str) -> HashSet<String> {
+    let merge_base_arg = format!("{}...@{{upstream}}", base_branch);
+    let output = Command::new("git")
+        .args(["diff", "--name-only", &merge_base_arg])
+        .current_dir(worktree_path)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.lines().map(|s| s.to_string()).collect()
+        }
+        _ => HashSet::new(),
     }
 }
 
@@ -608,6 +669,7 @@ new file mode 100644
                 additions: 1,
                 deletions: 0,
                 diff_content: "+line".into(),
+                pushed: false,
             },
             DiffFile {
                 path: "b.rs".into(),
@@ -615,6 +677,7 @@ new file mode 100644
                 additions: 0,
                 deletions: 1,
                 diff_content: "-line".into(),
+                pushed: false,
             },
         ];
         assert_eq!(view.selected_file, 0);
@@ -637,6 +700,7 @@ new file mode 100644
             additions: 0,
             deletions: 0,
             diff_content: "line1\nline2\nline3".into(),
+            pushed: false,
         }];
         assert_eq!(view.diff_scroll_offset, 0);
         view.scroll_down();
@@ -659,6 +723,7 @@ new file mode 100644
                 additions: 0,
                 deletions: 0,
                 diff_content: "line1\nline2".into(),
+                pushed: false,
             },
             DiffFile {
                 path: "b.rs".into(),
@@ -666,6 +731,7 @@ new file mode 100644
                 additions: 0,
                 deletions: 0,
                 diff_content: "line1".into(),
+                pushed: false,
             },
         ];
         view.scroll_down();

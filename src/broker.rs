@@ -62,6 +62,13 @@ impl Broker {
                         // 1接続 = 1行のJSONメッセージ
                         if let Ok(Some(line)) = lines.next_line().await {
                             if let Ok(hook_event) = serde_json::from_str::<HookEvent>(&line) {
+                                // Refresh イベントはセッション状態を変更せず、
+                                // Changes の再読み込みだけを通知する
+                                if matches!(hook_event, HookEvent::Refresh { .. }) {
+                                    let _ = event_tx.send(AppEvent::RefreshChanges);
+                                    return;
+                                }
+
                                 let session_id = hook_event.session_id().to_string();
 
                                 // SQLite にも書き込む
@@ -117,6 +124,7 @@ impl Broker {
             HookEvent::Dead { session_id } => {
                 let _ = db::update_session_state(&conn, session_id, "dead");
             }
+            HookEvent::Refresh { .. } => {}
         }
     }
 }
@@ -216,6 +224,37 @@ mod tests {
             }
             _ => panic!("expected SessionUpdate with Working state"),
         }
+
+        broker_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_broker_handles_refresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("test3.sock");
+        let registry = Arc::new(Mutex::new(SessionRegistry::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let broker = Broker::new(&sock_path, Arc::clone(&registry), test_db(), event_tx).unwrap();
+        let broker_handle = tokio::spawn(broker.run());
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // refresh イベントを送信
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (_, mut writer) = tokio::io::split(stream);
+        use tokio::io::AsyncWriteExt;
+        let msg = r#"{"event":"refresh","session_id":"sess-r"}"#;
+        writer.write_all(msg.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(event, AppEvent::RefreshChanges));
 
         broker_handle.abort();
     }
