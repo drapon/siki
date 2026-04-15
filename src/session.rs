@@ -204,15 +204,31 @@ impl SessionRegistry {
     /// Done 遷移の遅延時間（Working/Waiting を最低限表示するため）
     const DONE_HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
+    /// アクティブ状態（Working/Waiting）のスタル判定タイムアウト
+    ///
+    /// Working/Waiting 中は PreToolUse/PostToolUse で数秒おきに Refresh が来る。
+    /// この時間を超えて Refresh が途絶えた場合、セッションは異常終了したと判断し
+    /// Done に遷移させる（Esc や切断で SessionEnd hook が発火しないケースの対策）。
+    const ACTIVE_STALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// 期限切れセッションをクリーンアップする
     ///
+    /// - Working/Waiting で last_seen から 30秒経過 → Done に遷移（スタル検知）
     /// - idle_pending_since から 3秒経過 → Done に遷移
     /// - `expire_timeout`（5分）を超えたセッションをレジストリから削除
     pub fn cleanup_expired_sessions(&mut self, expire_timeout: std::time::Duration) {
         let now = Instant::now();
 
-        // Done 遅延の解消: 3秒経過したら実際に Done に遷移
         for session in self.sessions.values_mut() {
+            // アクティブ状態のスタル検知: 30秒 Refresh が来なければ Done に遷移
+            if matches!(session.state, SessionState::Working | SessionState::Waiting)
+                && session.idle_pending_since.is_none()
+                && now.duration_since(session.last_seen) >= Self::ACTIVE_STALE_TIMEOUT
+            {
+                session.state = SessionState::Done;
+            }
+
+            // Done 遅延の解消: 3秒経過したら実際に Done に遷移
             if let Some(pending_since) = session.idle_pending_since {
                 if now.duration_since(pending_since) >= Self::DONE_HOLD_DURATION {
                     session.state = SessionState::Done;
@@ -476,5 +492,64 @@ mod tests {
         // 即座にはクリーンアップされない
         reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
         assert!(reg.get("s1").is_some());
+    }
+
+    #[test]
+    fn test_cleanup_stale_working_session() {
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.update_state("s1", SessionState::Working);
+
+        // last_seen を 31秒前に巻き戻す
+        reg.sessions.get_mut("s1").unwrap().last_seen =
+            Instant::now() - std::time::Duration::from_secs(31);
+
+        reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
+        // Working → Done に遷移しているはず
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Done);
+    }
+
+    #[test]
+    fn test_cleanup_stale_waiting_session() {
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.update_state("s1", SessionState::Waiting);
+
+        reg.sessions.get_mut("s1").unwrap().last_seen =
+            Instant::now() - std::time::Duration::from_secs(31);
+
+        reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Done);
+    }
+
+    #[test]
+    fn test_cleanup_active_session_not_stale_within_timeout() {
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.update_state("s1", SessionState::Working);
+
+        // last_seen を 10秒前に巻き戻す（30秒以内なのでスタルにならない）
+        reg.sessions.get_mut("s1").unwrap().last_seen =
+            Instant::now() - std::time::Duration::from_secs(10);
+
+        reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Working);
+    }
+
+    #[test]
+    fn test_stale_session_recovers_on_new_event() {
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.update_state("s1", SessionState::Working);
+
+        // スタルにする
+        reg.sessions.get_mut("s1").unwrap().last_seen =
+            Instant::now() - std::time::Duration::from_secs(31);
+        reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Done);
+
+        // 再開: Working イベントが来たら復帰する
+        reg.handle_event(HookEvent::Working { session_id: "s1".into() });
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Working);
     }
 }
