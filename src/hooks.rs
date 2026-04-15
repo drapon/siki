@@ -37,7 +37,10 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_n
         "echo '{{\"event\":\"waiting\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
     ), true);
 
-    // PostToolUse では idle にしない — Stop まで working を維持する
+    // PostToolUse で Changes の再読み込みをトリガーする
+    inject_hook(hooks, "PostToolUse", &format!(
+        "echo '{{\"event\":\"refresh\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
+    ), true);
 
     inject_hook(hooks, "Stop", &format!(
         "echo '{{\"event\":\"idle\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
@@ -362,6 +365,7 @@ mod tests {
         assert!(settings["hooks"]["SessionStart"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["PermissionRequest"].as_array().unwrap().len() > 0);
+        assert!(settings["hooks"]["PostToolUse"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["Stop"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["SessionEnd"].as_array().unwrap().len() > 0);
     }

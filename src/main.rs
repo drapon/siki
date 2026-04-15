@@ -1213,6 +1213,17 @@ async fn handle_event(
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
+        AppEvent::RefreshChanges => {
+            // Claude Code の hook 経由で Changes を再読み込み
+            if let Some(wt_id) = app.selected_worktree {
+                if let Some(wt) = app.worktree_by_id(wt_id) {
+                    let wt_path = wt.path.clone();
+                    let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                    diff_view.load(&wt_path, &base);
+                    local_changes.load(&wt_path);
+                }
+            }
+        }
         AppEvent::SessionContext { worktree_id, summary } => {
             app.show_info("Launching Claude with context...".to_string());
             let prompt = if summary.is_empty() {

@@ -88,6 +88,9 @@ pub enum HookEvent {
     Dead {
         session_id: String,
     },
+    Refresh {
+        session_id: String,
+    },
 }
 
 impl HookEvent {
@@ -97,7 +100,8 @@ impl HookEvent {
             | Self::Working { session_id }
             | Self::Waiting { session_id }
             | Self::Idle { session_id }
-            | Self::Dead { session_id } => session_id,
+            | Self::Dead { session_id }
+            | Self::Refresh { session_id } => session_id,
         }
     }
 }
@@ -276,6 +280,7 @@ impl SessionRegistry {
                     false
                 }
             }
+            HookEvent::Refresh { .. } => false,
         }
     }
 }
@@ -409,8 +414,26 @@ mod tests {
             HookEvent::Waiting { session_id: "c".into() },
             HookEvent::Idle { session_id: "d".into() },
             HookEvent::Dead { session_id: "e".into() },
+            HookEvent::Refresh { session_id: "f".into() },
         ];
         let ids: Vec<&str> = events.iter().map(|e| e.session_id()).collect();
-        assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(ids, vec!["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn test_hook_event_deserialize_refresh() {
+        let json = r#"{"event":"refresh","session_id":"abc"}"#;
+        let ev: HookEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(ev, HookEvent::Refresh { .. }));
+        assert_eq!(ev.session_id(), "abc");
+    }
+
+    #[test]
+    fn test_handle_event_refresh_returns_false() {
+        let mut reg = SessionRegistry::new();
+        let changed = reg.handle_event(HookEvent::Refresh {
+            session_id: "test".into(),
+        });
+        assert!(!changed);
     }
 }
