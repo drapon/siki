@@ -4091,6 +4091,9 @@ fn handle_archive_confirm_key(
                 // git worktree を削除
                 match git::WorktreeManager::remove_worktree(&project_path, &wt_path) {
                     Ok(()) => {
+                        // project.json から worktree メタデータを削除
+                        let _ = config::save_worktree_display_name(&app.projects[pi].name, &wt_name, None);
+
                         // メモリから worktree を削除
                         app.projects[pi].worktrees.remove(wi);
 
