@@ -194,10 +194,13 @@ impl SessionRegistry {
     }
 
     /// worktreeの集約状態（最も優先度の高い状態）を返す
+    ///
+    /// Idle セッションはバッジ表示対象外のため除外する。
     pub fn aggregate_state(&self, project: &str, worktree: &str) -> Option<SessionState> {
         self.by_worktree(project, worktree)
             .iter()
             .map(|s| s.state)
+            .filter(|s| *s != SessionState::Idle)
             .max_by_key(|s| s.priority())
     }
 
@@ -242,13 +245,20 @@ impl SessionRegistry {
             .retain(|_, session| now.duration_since(session.last_seen) <= expire_timeout);
     }
 
-    /// 指定 worktree の Done セッションを削除する（既読クリア）
+    /// 指定 worktree の Done セッションを Idle にリセットする（既読クリア）
+    ///
+    /// セッションを削除するとメタデータ（cwd, project_name, worktree_name）が失われ、
+    /// 同じセッションが再度 Working になった際に自動登録で "unknown" に紐づいてしまう。
+    /// 状態のみリセットすることでメタデータを保持する。
     pub fn clear_done_sessions(&mut self, project: &str, worktree: &str) {
-        self.sessions.retain(|_, s| {
-            !(s.project_name == project
-                && s.worktree_name == worktree
-                && s.state == SessionState::Done)
-        });
+        for session in self.sessions.values_mut() {
+            if session.project_name == project
+                && session.worktree_name == worktree
+                && session.state == SessionState::Done
+            {
+                session.state = SessionState::Idle;
+            }
+        }
     }
 
     /// HookEvent を処理してレジストリを更新する。変更があれば true を返す。
@@ -586,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_done_sessions_removes_only_done() {
+    fn test_clear_done_sessions_resets_only_done_to_idle() {
         let mut reg = SessionRegistry::new();
         insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Done);
         insert_session(&mut reg, "s2", "proj", "wt1", SessionState::Working);
@@ -594,12 +604,25 @@ mod tests {
 
         reg.clear_done_sessions("proj", "wt1");
 
-        // s1 (Done, wt1) は削除される
-        assert!(reg.get("s1").is_none());
-        // s2 (Working, wt1) は残る
+        // s1 (Done, wt1) は Idle にリセットされる
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Idle);
+        // s2 (Working, wt1) は変わらない
         assert_eq!(reg.get("s2").unwrap().state, SessionState::Working);
-        // s3 (Done, wt2) は別 worktree なので残る
+        // s3 (Done, wt2) は別 worktree なので変わらない
         assert_eq!(reg.get("s3").unwrap().state, SessionState::Done);
+    }
+
+    #[test]
+    fn test_aggregate_state_excludes_idle() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Idle);
+
+        // Idle のみの場合は None
+        assert!(reg.aggregate_state("proj", "wt1").is_none());
+
+        // Working を追加すると Working が返る
+        insert_session(&mut reg, "s2", "proj", "wt1", SessionState::Working);
+        assert_eq!(reg.aggregate_state("proj", "wt1").unwrap(), SessionState::Working);
     }
 
     #[test]
