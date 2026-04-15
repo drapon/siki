@@ -242,6 +242,15 @@ impl SessionRegistry {
             .retain(|_, session| now.duration_since(session.last_seen) <= expire_timeout);
     }
 
+    /// 指定 worktree の Done セッションを削除する（既読クリア）
+    pub fn clear_done_sessions(&mut self, project: &str, worktree: &str) {
+        self.sessions.retain(|_, s| {
+            !(s.project_name == project
+                && s.worktree_name == worktree
+                && s.state == SessionState::Done)
+        });
+    }
+
     /// HookEvent を処理してレジストリを更新する。変更があれば true を返す。
     pub fn handle_event(&mut self, event: HookEvent) -> bool {
         match event {
@@ -551,5 +560,58 @@ mod tests {
         // 再開: Working イベントが来たら復帰する
         reg.handle_event(HookEvent::Working { session_id: "s1".into() });
         assert_eq!(reg.get("s1").unwrap().state, SessionState::Working);
+    }
+
+    /// テスト用: 指定 project/worktree のセッションを直接挿入する
+    fn insert_session(
+        reg: &mut SessionRegistry,
+        id: &str,
+        project: &str,
+        worktree: &str,
+        state: SessionState,
+    ) {
+        reg.sessions.insert(
+            id.to_string(),
+            Session {
+                session_id: id.to_string(),
+                worktree_name: worktree.to_string(),
+                project_name: project.to_string(),
+                cwd: String::new(),
+                role: "default".to_string(),
+                state,
+                last_seen: Instant::now(),
+                idle_pending_since: None,
+            },
+        );
+    }
+
+    #[test]
+    fn test_clear_done_sessions_removes_only_done() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Done);
+        insert_session(&mut reg, "s2", "proj", "wt1", SessionState::Working);
+        insert_session(&mut reg, "s3", "proj", "wt2", SessionState::Done);
+
+        reg.clear_done_sessions("proj", "wt1");
+
+        // s1 (Done, wt1) は削除される
+        assert!(reg.get("s1").is_none());
+        // s2 (Working, wt1) は残る
+        assert_eq!(reg.get("s2").unwrap().state, SessionState::Working);
+        // s3 (Done, wt2) は別 worktree なので残る
+        assert_eq!(reg.get("s3").unwrap().state, SessionState::Done);
+    }
+
+    #[test]
+    fn test_clear_done_sessions_no_done() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Working);
+        insert_session(&mut reg, "s2", "proj", "wt1", SessionState::Idle);
+
+        reg.clear_done_sessions("proj", "wt1");
+
+        // 何も削除されない
+        assert!(reg.get("s1").is_some());
+        assert!(reg.get("s2").is_some());
     }
 }

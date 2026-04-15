@@ -535,7 +535,7 @@ async fn handle_event(
                     // パネル固有のキー処理
                     match app.focused_panel {
                         app::Panel::Left => {
-                            handle_left_panel_key(app, left_panel, source_tree, diff_view, local_changes, terminals, claude_terms, event_tx, shell, key);
+                            handle_left_panel_key(app, left_panel, source_tree, diff_view, local_changes, terminals, claude_terms, event_tx, shell, key, session_registry);
                         }
                         app::Panel::Main => {
                             // Claude タブは上で早期 return 済みなのでここは非 Claude タブのみ
@@ -1022,6 +1022,8 @@ async fn handle_event(
                                             let wt_id = (*project_index, *worktree_index);
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
+                                            // Done バッジをクリア（既読）
+                                            clear_done_badges(session_registry, app, wt_id);
                                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                                             let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                             source_tree.load(&wt_path);
@@ -2265,6 +2267,7 @@ fn handle_left_panel_key(
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     shell: &str,
     key: crossterm::event::KeyEvent,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2511,6 +2514,8 @@ fn handle_left_panel_key(
             if let Some(wt_id) = left_panel.select_worktree(&entries) {
                 app.selected_worktree = Some(wt_id);
                 app.focused_panel = app::Panel::Main;
+                // Done バッジをクリア（既読）
+                clear_done_badges(session_registry, app, wt_id);
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                 let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
@@ -4263,6 +4268,21 @@ fn has_active_sessions(
     reg.by_worktree(project, &wt.name)
         .iter()
         .any(|s| matches!(s.state, session::SessionState::Working | session::SessionState::Waiting))
+}
+
+/// worktree 選択時に Done セッションをクリアする（既読）
+fn clear_done_badges(
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
+    app: &app::App,
+    wt_id: app::WorktreeId,
+) {
+    let Some(wt) = app.worktree_by_id(wt_id) else {
+        return;
+    };
+    let project = &app.projects[wt_id.0].name;
+    if let Some(mut reg) = session_registry.as_ref().and_then(|r| r.lock().ok()) {
+        reg.clear_done_sessions(project, &wt.name);
+    }
 }
 
 fn launch_claude(
