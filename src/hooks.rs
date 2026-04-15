@@ -22,32 +22,33 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_n
 
     let sock = sock_path.to_string_lossy();
 
-    // SIKI_SID: CLAUDE_SESSION_ID があればそれを使い、なければ PID ベースの ID を生成
-    let sid_expr = "${CLAUDE_SESSION_ID:-siki-$$}";
+    // stdin の JSON から session_id を抽出する共通スクリプト
+    // Claude Code はすべての hook に {"session_id": "...", ...} を stdin で渡す
+    let read_sid = r#"SID=$(head -1 | sed -n 's/.*"session_id" *: *"\([^"]*\)".*/\1/p'); [ -z "$SID" ] && SID="siki-$$""#;
 
     inject_hook(hooks, "SessionStart", &format!(
-        "echo '{{\"event\":\"register\",\"session_id\":\"'\"{sid_expr}\"'\",\"cwd\":\"'\"$PWD\"'\",\"role\":\"'\"${{SIKI_ROLE:-default}}\"'\"}}' | nc -U {sock}"
+        r#"{read_sid}; echo '{{"event":"register","session_id":"'"$SID"'","cwd":"'"$PWD"'","role":"'"${{SIKI_ROLE:-default}}"'"}}' | nc -U {sock}"#
     ), false);
 
     inject_hook(hooks, "PreToolUse", &format!(
-        "echo '{{\"event\":\"working\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
+        r#"{read_sid}; echo '{{"event":"working","session_id":"'"$SID"'"}}' | nc -U {sock}"#
     ), true);
 
     inject_hook(hooks, "PermissionRequest", &format!(
-        "echo '{{\"event\":\"waiting\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
+        r#"{read_sid}; echo '{{"event":"waiting","session_id":"'"$SID"'"}}' | nc -U {sock}"#
     ), true);
 
     // PostToolUse で Changes の再読み込みをトリガーする
     inject_hook(hooks, "PostToolUse", &format!(
-        "echo '{{\"event\":\"refresh\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
+        r#"{read_sid}; echo '{{"event":"refresh","session_id":"'"$SID"'"}}' | nc -U {sock}"#
     ), true);
 
     inject_hook(hooks, "Stop", &format!(
-        "echo '{{\"event\":\"idle\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
+        r#"{read_sid}; echo '{{"event":"idle","session_id":"'"$SID"'"}}' | nc -U {sock}"#
     ), true);
 
     inject_hook(hooks, "SessionEnd", &format!(
-        "echo '{{\"event\":\"dead\",\"session_id\":\"'\"{sid_expr}\"'\"}}' | nc -U {sock}"
+        r#"{read_sid}; echo '{{"event":"dead","session_id":"'"$SID"'"}}' | nc -U {sock}"#
     ), true);
 
     // worktree ルートに .mcp.json を作成して siki MCP サーバーを登録
@@ -253,9 +254,9 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
         None => return,
     };
 
-    // 既に siki の hook が含まれているか確認（nc -U と siki/sock を含むもの）
-    let already_exists = arr.iter().any(|entry| {
-        entry
+    // 既存の siki hook を削除して最新版に置き換える（nc -U と .siki を含むもの）
+    arr.retain(|entry| {
+        !entry
             .get("hooks")
             .and_then(|h| h.as_array())
             .map(|hooks| {
@@ -267,10 +268,6 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
             })
             .unwrap_or(false)
     });
-
-    if already_exists {
-        return;
-    }
 
     let mut hook_entry = json!({
         "type": "command",
@@ -318,17 +315,18 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_hook_no_duplicate() {
+    fn test_inject_hook_replaces_existing_siki_hook() {
         let mut hooks = json!({
             "PreToolUse": [{
-                "hooks": [{"type": "command", "command": "echo test | nc -U /home/.siki/sock"}]
+                "hooks": [{"type": "command", "command": "echo old | nc -U /home/.siki/sock"}]
             }]
         });
         inject_hook(&mut hooks, "PreToolUse", "echo new | nc -U /home/.siki/sock", true);
 
         let arr = hooks["PreToolUse"].as_array().unwrap();
-        // 既に siki の hook があるので追加されない
+        // 古い siki hook が削除されて新しいものに置き換えられる
         assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hooks"][0]["command"], "echo new | nc -U /home/.siki/sock");
     }
 
     #[test]

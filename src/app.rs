@@ -19,14 +19,6 @@ pub enum Panel {
     Terminal,
 }
 
-/// Worktree のステータス
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorktreeStatus {
-    Idle,
-    Running,
-    Done,
-}
-
 /// 右パネル上部のモード
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightPanelMode {
@@ -214,7 +206,6 @@ pub struct Worktree {
     pub display_name: Option<String>,
     pub branch: String,
     pub path: PathBuf,
-    pub status: WorktreeStatus,
     pub chat_history: Vec<ChatMessage>,
     pub open_files: Vec<OpenFile>,
     pub active_tab: usize,
@@ -386,6 +377,10 @@ pub struct App {
     /// grep 結果ビューのスクロールオフセット
     pub grep_view_scroll: usize,
     pub running: bool,
+    /// 点滅タイマーカウンタ（Tick毎にインクリメント、5回で1周期）
+    pub blink_counter: u8,
+    /// 点滅フェーズ（true: 表示、false: 非表示）
+    pub blink_phase: bool,
 }
 
 impl App {
@@ -483,6 +478,8 @@ impl App {
             grep_view_cursor: 0,
             grep_view_scroll: 0,
             running: true,
+            blink_counter: 0,
+            blink_phase: true,
         }
     }
 
@@ -628,17 +625,12 @@ impl App {
     }
 
     /// Claude Code の応答完了を処理する
-    pub fn handle_claude_complete(&mut self, worktree_id: WorktreeId) {
-        if let Some(wt) = self.worktree_by_id_mut(worktree_id) {
-            wt.status = WorktreeStatus::Idle;
-        }
+    pub fn handle_claude_complete(&mut self, _worktree_id: WorktreeId) {
+        // セッション状態は SessionRegistry 側で管理されるため、ここでは何もしない
     }
 
     /// Claude Code のエラーを処理する
-    pub fn handle_claude_error(&mut self, worktree_id: WorktreeId, error: &str) {
-        if let Some(wt) = self.worktree_by_id_mut(worktree_id) {
-            wt.status = WorktreeStatus::Idle;
-        }
+    pub fn handle_claude_error(&mut self, _worktree_id: WorktreeId, error: &str) {
         self.show_error(format!("Claude Code エラー: {}", error));
     }
 }
@@ -656,7 +648,6 @@ impl Project {
                 display_name,
                 branch: wc.branch.clone(),
                 path: config::worktree_path(&pc.name, &wc.name),
-                status: WorktreeStatus::Idle,
                 chat_history: Vec::new(),
                 open_files: Vec::new(),
                 active_tab: 0,
@@ -683,16 +674,6 @@ impl Project {
     }
 }
 
-impl WorktreeStatus {
-    /// ステータスアイコンを返す
-    pub fn icon(&self) -> &'static str {
-        match self {
-            WorktreeStatus::Running => "●",
-            WorktreeStatus::Idle => "○",
-            WorktreeStatus::Done => "✓",
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -770,7 +751,6 @@ mod tests {
         let app = App::new(&config);
 
         let wt = &app.projects[0].worktrees[0];
-        assert_eq!(wt.status, WorktreeStatus::Idle);
         assert!(wt.chat_history.is_empty());
         assert!(wt.open_files.is_empty());
         assert_eq!(wt.active_tab, 0);
@@ -844,10 +824,10 @@ mod tests {
 
         app.selected_worktree = Some((1, 0));
         let wt = app.selected_worktree_mut().unwrap();
-        wt.status = WorktreeStatus::Running;
+        wt.branch = "modified-branch".to_string();
 
         let wt = app.selected_worktree().unwrap();
-        assert_eq!(wt.status, WorktreeStatus::Running);
+        assert_eq!(wt.branch, "modified-branch");
     }
 
     #[test]
@@ -879,13 +859,6 @@ mod tests {
         let msg = app.status_message.as_ref().unwrap();
         assert_eq!(msg.text, "情報メッセージ");
         assert_eq!(msg.level, StatusLevel::Info);
-    }
-
-    #[test]
-    fn test_worktree_status_icon() {
-        assert_eq!(WorktreeStatus::Running.icon(), "●");
-        assert_eq!(WorktreeStatus::Idle.icon(), "○");
-        assert_eq!(WorktreeStatus::Done.icon(), "✓");
     }
 
     #[test]
@@ -922,12 +895,9 @@ mod tests {
         let mut app = App::new(&config);
 
         let wt = app.worktree_by_id_mut((0, 1)).unwrap();
-        wt.status = WorktreeStatus::Running;
+        wt.branch = "modified".to_string();
 
-        assert_eq!(
-            app.worktree_by_id((0, 1)).unwrap().status,
-            WorktreeStatus::Running
-        );
+        assert_eq!(app.worktree_by_id((0, 1)).unwrap().branch, "modified");
     }
 
     #[test]
@@ -1067,15 +1037,8 @@ mod tests {
         let config = sample_config();
         let mut app = App::new(&config);
 
-        // ステータスを Running にしておく
-        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Running;
-
+        // パニックしないことを確認
         app.handle_claude_complete((0, 0));
-
-        assert_eq!(
-            app.worktree_by_id((0, 0)).unwrap().status,
-            WorktreeStatus::Idle
-        );
     }
 
     #[test]
@@ -1092,14 +1055,8 @@ mod tests {
         let config = sample_config();
         let mut app = App::new(&config);
 
-        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Running;
-
         app.handle_claude_error((0, 0), "API rate limit");
 
-        assert_eq!(
-            app.worktree_by_id((0, 0)).unwrap().status,
-            WorktreeStatus::Idle
-        );
         let msg = app.status_message.as_ref().unwrap();
         assert_eq!(msg.level, StatusLevel::Error);
         assert!(msg.text.contains("API rate limit"));
