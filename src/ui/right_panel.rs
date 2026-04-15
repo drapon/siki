@@ -1,6 +1,6 @@
 use crate::app::{App, DiffFocus, RightPanelMode};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 
 use super::diff_view::{DiffView, LocalChangesView};
 use super::source_tree::SourceTree;
@@ -27,8 +27,9 @@ pub fn render_top(
             let active = match wt.right_panel_mode {
                 RightPanelMode::Tree => 0,
                 RightPanelMode::Diff => 1,
+                RightPanelMode::Context => 2,
             };
-            let tabs = Tabs::new(vec!["Tree", "Changes"])
+            let tabs = Tabs::new(vec!["Tree", "Changes", "Context"])
                 .select(active)
                 .highlight_style(
                     Style::default()
@@ -62,6 +63,9 @@ pub fn render_top(
                     diff_view.render(frame, diff_chunks[0], pr_focused, Some("PR Changes"));
                     local_changes.render(frame, diff_chunks[1], local_focused, Some("Local"));
                 }
+                RightPanelMode::Context => {
+                    render_context_list(frame, chunks[1], &wt.context_items, wt.context_cursor, focused);
+                }
             }
         }
         None => {
@@ -83,14 +87,61 @@ pub fn render_top(
     }
 }
 
-/// Tree/Diff モードを切り替える
+/// Tree/Diff/Context モードを切り替える
 pub fn toggle_mode(app: &mut App) {
     if let Some(wt) = app.selected_worktree_mut() {
         wt.right_panel_mode = match wt.right_panel_mode {
             RightPanelMode::Tree => RightPanelMode::Diff,
-            RightPanelMode::Diff => RightPanelMode::Tree,
+            RightPanelMode::Diff => RightPanelMode::Context,
+            RightPanelMode::Context => RightPanelMode::Tree,
         };
     }
+}
+
+/// Context 一覧を描画する
+fn render_context_list(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[(String, String)],
+    cursor: usize,
+    focused: bool,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Context")
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("(no contexts)")
+                .block(block)
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            let style = if i == cursor {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(format!("  {}", name)).style(style)
+        })
+        .collect();
+
+    let list = List::new(list_items).block(block);
+    frame.render_widget(list, area);
 }
 
 #[cfg(test)]
@@ -132,6 +183,12 @@ mod tests {
         assert_eq!(
             app.selected_worktree().unwrap().right_panel_mode,
             RightPanelMode::Diff
+        );
+
+        toggle_mode(&mut app);
+        assert_eq!(
+            app.selected_worktree().unwrap().right_panel_mode,
+            RightPanelMode::Context
         );
 
         toggle_mode(&mut app);

@@ -32,6 +32,7 @@ pub enum WorktreeStatus {
 pub enum RightPanelMode {
     Tree,
     Diff,
+    Context,
 }
 
 /// Changes モード内の上下パネルフォーカス
@@ -230,6 +231,10 @@ pub struct Worktree {
     pub pr_title: Option<String>,
     /// Claude Code のセッション ID（`-r` による再開用）
     pub claude_session_id: Option<String>,
+    /// Context タブ用: コンテキスト一覧 (name, content)
+    pub context_items: Vec<(String, String)>,
+    /// Context タブ用: カーソル位置
+    pub context_cursor: usize,
 }
 
 /// プロジェクトの状態
@@ -663,6 +668,8 @@ impl Project {
                 claude_scroll_offsets: HashMap::new(),
                 pr_title: None,
                 claude_session_id: None,
+                context_items: Vec::new(),
+                context_cursor: 0,
             }})
             .collect();
 
