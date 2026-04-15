@@ -66,6 +66,7 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_n
 
     // siki が生成したファイルを git 追跡から除外
     exclude_from_git(worktree_path, ".mcp.json");
+    exclude_from_git(worktree_path, ".claude/settings.json");
     exclude_from_git(worktree_path, ".claude/rules/siki.md");
     exclude_from_git(worktree_path, ".claude/siki-handoff.md");
 
