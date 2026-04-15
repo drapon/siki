@@ -3057,6 +3057,8 @@ fn handle_context_list_key(
     match key.code {
         KeyCode::Esc => {
             app.show_context_list = false;
+            // 右パネルの Context タブを同期
+            sync_right_panel_context_items(app);
         }
         KeyCode::Char('j') | KeyCode::Down => {
             if !app.context_list_items.is_empty()
@@ -3107,6 +3109,8 @@ fn handle_context_list_key(
                     {
                         app.context_list_cursor -= 1;
                     }
+                    // 右パネルの Context タブを同期
+                    sync_right_panel_context_items(app);
                 }
             }
         }
@@ -3182,6 +3186,8 @@ fn save_context_content(app: &mut app::App) {
     app.context_content_cursor = 0;
     app.context_edit_scroll = 0;
     app.context_name_input.clear();
+    // 右パネルの Context タブを同期
+    sync_right_panel_context_items(app);
 }
 
 /// コンテキスト編集ポップアップのキー処理
@@ -4510,6 +4516,21 @@ fn load_right_panel_data_if_needed(
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+}
+
+/// 右パネル Context タブの context_items をディスクから再読み込みする
+fn sync_right_panel_context_items(app: &mut app::App) {
+    if let Some(wt_id) = app.selected_worktree {
+        let project_name = app.projects[wt_id.0].name.clone();
+        let worktree_name = app.projects[wt_id.0].worktrees[wt_id.1].name.clone();
+        let items = config::load_contexts(&project_name, &worktree_name);
+        if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+            wt.context_items = items;
+            if wt.context_cursor >= wt.context_items.len() && wt.context_cursor > 0 {
+                wt.context_cursor = wt.context_items.len() - 1;
             }
         }
     }
