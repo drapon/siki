@@ -161,14 +161,14 @@ impl DiffView {
                 };
 
                 let mut spans = vec![
-                    Span::styled(push_indicator, Style::default().fg(push_color).patch(base_style)),
+                    Span::styled(format!("{} ", push_indicator), Style::default().fg(push_color).patch(base_style)),
                     Span::styled(format!("{} ", file.status), status_style.patch(base_style)),
                     Span::styled(&file.path, Style::default().fg(Color::White).patch(base_style)),
                 ];
 
                 // 右端に stat を表示するためスペースで埋める
-                // インジケータ(1) + ステータス(1) + スペース(1) + パス + stat
-                let used = 3 + file.path.len() + stat.len();
+                // インジケータ(1) + スペース(1) + ステータス(1) + スペース(1) + パス + stat
+                let used = 4 + file.path.len() + stat.len();
                 let padding = (inner.width as usize).saturating_sub(used);
                 spans.push(Span::styled(" ".repeat(padding), base_style));
 
