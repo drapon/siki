@@ -1225,6 +1225,8 @@ async fn handle_event(
                     let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                     diff_view.load(&wt_path, &base);
                     local_changes.load(&wt_path);
+                    diff_view.refresh_spinner = ui::diff_view::REFRESH_SPINNER_TICKS;
+                    local_changes.refresh_spinner = ui::diff_view::REFRESH_SPINNER_TICKS;
                 }
             }
         }
@@ -1388,6 +1390,12 @@ async fn handle_event(
         }
         AppEvent::Tick => {
             app.clear_expired_status();
+            if diff_view.refresh_spinner > 0 {
+                diff_view.refresh_spinner -= 1;
+            }
+            if local_changes.refresh_spinner > 0 {
+                local_changes.refresh_spinner -= 1;
+            }
             if app.show_siki_json_init_terminal {
                 app.siki_json_init_spinner = app.siki_json_init_spinner.wrapping_add(1);
             }
@@ -4463,6 +4471,8 @@ fn handle_right_panel_key(
                             let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                             diff_view.load(&wt_path, &base);
                             local_changes.load(&wt_path);
+                            diff_view.refresh_spinner = ui::diff_view::REFRESH_SPINNER_TICKS;
+                            local_changes.refresh_spinner = ui::diff_view::REFRESH_SPINNER_TICKS;
                         }
                     }
                 }

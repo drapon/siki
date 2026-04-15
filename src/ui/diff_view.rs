@@ -16,12 +16,32 @@ pub struct DiffFile {
     pub pushed: bool,
 }
 
+const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub const REFRESH_SPINNER_TICKS: u8 = 5;
+
+/// タイトルにスピナーを付与した Line を生成する
+fn title_with_spinner<'a>(title: Option<&str>, spinner_tick: u8) -> Option<Line<'a>> {
+    title.map(|t| {
+        if spinner_tick > 0 {
+            let ch = SPINNER_CHARS[(REFRESH_SPINNER_TICKS - spinner_tick) as usize % SPINNER_CHARS.len()];
+            Line::from(vec![
+                Span::raw(format!("{} ", t)),
+                Span::styled(format!("{}", ch), Style::default().fg(Color::Cyan)),
+            ])
+        } else {
+            Line::from(t.to_string())
+        }
+    })
+}
+
 /// Git diff の状態（ファイルベース）
 #[derive(Debug)]
 pub struct DiffView {
     pub files: Vec<DiffFile>,
     pub selected_file: usize,
     pub diff_scroll_offset: usize,
+    /// リフレッシュスピナーの残り tick 数（0 = 非表示）
+    pub refresh_spinner: u8,
 }
 
 impl DiffView {
@@ -30,6 +50,7 @@ impl DiffView {
             files: Vec::new(),
             selected_file: 0,
             diff_scroll_offset: 0,
+            refresh_spinner: 0,
         }
     }
 
@@ -108,7 +129,7 @@ impl DiffView {
             let mut block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style);
-            if let Some(t) = title {
+            if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
                 block = block.title(t);
             }
             frame.render_widget(
@@ -127,7 +148,7 @@ impl DiffView {
         let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style);
-        if let Some(t) = title {
+        if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
             block = block.title(t);
         }
 
@@ -213,6 +234,8 @@ impl DiffView {
 pub struct LocalChangesView {
     pub files: Vec<DiffFile>,
     pub selected_file: usize,
+    /// リフレッシュスピナーの残り tick 数（0 = 非表示）
+    pub refresh_spinner: u8,
 }
 
 impl LocalChangesView {
@@ -220,6 +243,7 @@ impl LocalChangesView {
         Self {
             files: Vec::new(),
             selected_file: 0,
+            refresh_spinner: 0,
         }
     }
 
@@ -264,7 +288,7 @@ impl LocalChangesView {
             let mut block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style);
-            if let Some(t) = title {
+            if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
                 block = block.title(t);
             }
             frame.render_widget(
@@ -279,7 +303,7 @@ impl LocalChangesView {
         let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style);
-        if let Some(t) = title {
+        if let Some(t) = title_with_spinner(title, self.refresh_spinner) {
             block = block.title(t);
         }
         let inner = block.inner(area);
