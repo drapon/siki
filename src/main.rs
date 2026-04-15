@@ -456,7 +456,7 @@ async fn handle_event(
                 return;
             }
             if app.show_grep_popup {
-                handle_grep_popup_key(app, key);
+                handle_grep_popup_key(app, event_tx, key);
                 return;
             }
             if app.show_archive_confirm {
@@ -1391,6 +1391,22 @@ async fn handle_event(
                 Err(e) => {
                     app.show_error(format!("URL 取得エラー: {}", e));
                 }
+            }
+        }
+        AppEvent::GrepResults(results) => {
+            if results.is_empty() {
+                app.show_info("No results found".to_string());
+            } else {
+                app.grep_results = results;
+                app.show_grep_results_view = true;
+                app.grep_view_cursor = 0;
+                app.grep_view_scroll = 0;
+                app.focused_panel = app::Panel::Main;
+                if let Some(wt) = app.selected_worktree_mut() {
+                    wt.active_tab = wt.claude_tabs;
+                }
+                app.status_message = None;
+                app.status_set_at = None;
             }
         }
         AppEvent::Tick => {
@@ -3841,7 +3857,11 @@ fn adjust_grep_scroll(app: &mut app::App) {
 }
 
 /// Grep ポップアップのキー処理
-fn handle_grep_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
+fn handle_grep_popup_key(
+    app: &mut app::App,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    key: crossterm::event::KeyEvent,
+) {
     use crossterm::event::KeyCode;
 
     match key.code {
@@ -3849,19 +3869,60 @@ fn handle_grep_popup_key(app: &mut app::App, key: crossterm::event::KeyEvent) {
             app.show_grep_popup = false;
         }
         KeyCode::Enter => {
-            // 検索を実行して結果を中央ペインに表示
-            app.run_grep();
-            if !app.grep_results.is_empty() {
-                app.show_grep_popup = false;
-                app.show_grep_results_view = true;
-                app.grep_view_cursor = 0;
-                app.grep_view_scroll = 0;
-                app.focused_panel = app::Panel::Main;
-                // Search タブに切り替え（claude_tabs の直後）
-                if let Some(wt) = app.selected_worktree_mut() {
-                    wt.active_tab = wt.claude_tabs;
-                }
+            if app.grep_input.is_empty() {
+                return;
             }
+            let wt_path = match app.selected_worktree() {
+                Some(wt) => wt.path.clone(),
+                None => return,
+            };
+            let query = app.grep_input.clone();
+            let tx = event_tx.clone();
+
+            // ポップアップを閉じて検索中であることを示す
+            app.show_grep_popup = false;
+            app.grep_results.clear();
+            app.grep_cursor = 0;
+            app.show_info("Searching...".to_string());
+
+            // 非同期で grep を実行
+            tokio::spawn(async move {
+                let output = tokio::process::Command::new("grep")
+                    .args([
+                        "-rn",
+                        "--binary-files=without-match",
+                        "-I",
+                        &query,
+                        ".",
+                    ])
+                    .current_dir(&wt_path)
+                    .output()
+                    .await;
+
+                let mut results = Vec::new();
+                if let Ok(output) = output {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines().take(200) {
+                        let parts: Vec<&str> = line.splitn(3, ':').collect();
+                        if parts.len() >= 3 {
+                            let file_path = parts[0];
+                            if let Ok(line_number) = parts[1].parse::<usize>() {
+                                let full_path = if file_path.starts_with("./") {
+                                    wt_path.join(&file_path[2..])
+                                } else {
+                                    wt_path.join(file_path)
+                                };
+                                results.push(app::GrepResult {
+                                    path: full_path,
+                                    line_number,
+                                    line_content: parts[2].to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(event::AppEvent::GrepResults(results));
+            });
         }
         KeyCode::Backspace => {
             app.grep_input.pop();
