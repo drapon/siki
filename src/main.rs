@@ -928,18 +928,22 @@ async fn handle_event(
                                     }
                                 } else if mode == app::RightPanelMode::Diff {
                                     // Changes モード: タブバー (1行) を除いた領域を上下50%で分割
+                                    // 描画側と同じ Layout を使って正確な分割位置を得る
                                     let content_area = ratatui::prelude::Rect {
                                         x: layout.right_top.x,
                                         y: layout.right_top.y + 1,
                                         width: layout.right_top.width,
                                         height: layout.right_top.height.saturating_sub(1),
                                     };
-                                    let half = content_area.height / 2;
-                                    let pr_area_end = content_area.y + half;
+                                    let diff_chunks = ratatui::prelude::Layout::vertical([
+                                        ratatui::prelude::Constraint::Percentage(50),
+                                        ratatui::prelude::Constraint::Percentage(50),
+                                    ])
+                                    .split(content_area);
 
-                                    if mouse.row < pr_area_end {
+                                    if mouse.row < diff_chunks[1].y {
                                         // PR Changes 領域クリック → カーソル移動＋diffタブを開く
-                                        let inner_top = content_area.y + 1;
+                                        let inner_top = diff_chunks[0].y + 1; // Block ボーダー分をスキップ
                                         if mouse.row >= inner_top {
                                             let clicked_row = (mouse.row - inner_top) as usize;
                                             if clicked_row < diff_view.files.len() {
@@ -957,7 +961,7 @@ async fn handle_event(
                                         }
                                     } else {
                                         // Local Changes 領域クリック → カーソル移動＋diffタブを開く
-                                        let local_top = pr_area_end + 1;
+                                        let local_top = diff_chunks[1].y + 1; // Block ボーダー分をスキップ
                                         if mouse.row >= local_top {
                                             let clicked_row = (mouse.row - local_top) as usize;
                                             if clicked_row < local_changes.files.len() {
@@ -4449,6 +4453,17 @@ fn handle_right_panel_key(
                     if let (Some(path), Some(content)) = (path, content) {
                         ui::main_panel::open_diff_tab(app, &path, content);
                         app.focused_panel = app::Panel::Main;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    // Changes を手動リフレッシュ
+                    if let Some(wt_id) = app.selected_worktree {
+                        if let Some(wt) = app.worktree_by_id(wt_id) {
+                            let wt_path = wt.path.clone();
+                            let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                            diff_view.load(&wt_path, &base);
+                            local_changes.load(&wt_path);
+                        }
                     }
                 }
                 KeyCode::Char('t') => {
