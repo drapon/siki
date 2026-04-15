@@ -59,8 +59,8 @@ pub fn render_top(
                     let pr_focused = focused && wt.diff_focus == DiffFocus::PrDiff;
                     let local_focused = focused && wt.diff_focus == DiffFocus::LocalChanges;
 
-                    diff_view.render(frame, diff_chunks[0], pr_focused, Some("PR Changes"));
-                    local_changes.render(frame, diff_chunks[1], local_focused, Some("Local"));
+                    diff_view.render(frame, diff_chunks[0], pr_focused, Some("PR Changes (●local ↑pushed)"));
+                    local_changes.render(frame, diff_chunks[1], local_focused, Some("Uncommitted"));
                 }
             }
         }
