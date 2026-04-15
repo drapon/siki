@@ -62,13 +62,7 @@ impl Broker {
                         // 1接続 = 1行のJSONメッセージ
                         if let Ok(Some(line)) = lines.next_line().await {
                             if let Ok(hook_event) = serde_json::from_str::<HookEvent>(&line) {
-                                // Refresh イベントはセッション状態を変更せず、
-                                // Changes の再読み込みだけを通知する
-                                if matches!(hook_event, HookEvent::Refresh { .. }) {
-                                    let _ = event_tx.send(AppEvent::RefreshChanges);
-                                    return;
-                                }
-
+                                let is_refresh = matches!(hook_event, HookEvent::Refresh { .. });
                                 let session_id = hook_event.session_id().to_string();
 
                                 // SQLite にも書き込む
@@ -78,6 +72,13 @@ impl Broker {
                                     let mut reg = registry.lock().unwrap();
                                     reg.handle_event(hook_event)
                                 };
+
+                                // Refresh イベントは Changes の再読み込みを通知
+                                if is_refresh {
+                                    let _ = event_tx.send(AppEvent::RefreshChanges);
+                                    return;
+                                }
+
                                 if changed {
                                     let state = {
                                         let reg = registry.lock().unwrap();

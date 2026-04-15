@@ -1446,13 +1446,16 @@ async fn handle_event(
             if app.context_url_fetching {
                 app.context_url_spinner = app.context_url_spinner.wrapping_add(1);
             }
-            // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
+            // 点滅タイマー: 500ms周期（Tick 100ms × 5回）
+            app.blink_counter = app.blink_counter.wrapping_add(1);
+            if app.blink_counter >= 5 {
+                app.blink_counter = 0;
+                app.blink_phase = !app.blink_phase;
+            }
+            // 期限切れセッションのクリーンアップ（5分）
             if let Some(registry) = session_registry {
                 let mut reg = registry.lock().unwrap();
-                reg.expire_stale_sessions(
-                    std::time::Duration::from_secs(15),
-                    std::time::Duration::from_secs(30),
-                );
+                reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
             }
         }
     }
@@ -1794,7 +1797,6 @@ fn finalize_add_worktree(
         display_name: None,
         branch: branch.to_string(),
         path: wt_path.clone(),
-        status: app::WorktreeStatus::Idle,
         chat_history: Vec::new(),
         open_files: Vec::new(),
         active_tab: 0,
@@ -1857,8 +1859,6 @@ async fn send_to_claude(
         // 既存セッションにメッセージ送信
         if let Err(e) = session.send_message(message).await {
             app.show_error(format!("メッセージ送信失敗: {}", e));
-        } else if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-            wt.status = app::WorktreeStatus::Running;
         }
     } else {
         // 新規セッションを起動（前回の session_id があれば再開を試行）
@@ -1884,8 +1884,6 @@ async fn send_to_claude(
             Ok(mut session) => {
                 if let Err(e) = session.send_message(message).await {
                     app.show_error(format!("メッセージ送信失敗: {}", e));
-                } else if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    wt.status = app::WorktreeStatus::Running;
                 }
                 sessions.insert(wt_id, session);
             }
@@ -4264,7 +4262,7 @@ fn has_active_sessions(
     let project = &app.projects[wt_id.0].name;
     reg.by_worktree(project, &wt.name)
         .iter()
-        .any(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
+        .any(|s| matches!(s.state, session::SessionState::Working | session::SessionState::Waiting))
 }
 
 fn launch_claude(
@@ -5442,8 +5440,6 @@ mod tests {
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
-
         handle_event(
             &mut app,
             &mut left_panel,
@@ -5465,10 +5461,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            app.worktree_by_id((0, 0)).unwrap().status,
-            app::WorktreeStatus::Idle
-        );
+        // パニックしないことを確認（状態管理は SessionRegistry 側）
     }
 
     #[tokio::test]
@@ -5484,8 +5477,6 @@ mod tests {
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-
-        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
 
         handle_event(
             &mut app,
@@ -5509,10 +5500,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            app.worktree_by_id((0, 0)).unwrap().status,
-            app::WorktreeStatus::Idle
-        );
         let msg = app.status_message.as_ref().unwrap();
         assert_eq!(msg.level, app::StatusLevel::Error);
         assert!(msg.text.contains("test error"));
@@ -6162,7 +6149,6 @@ mod tests {
         let new_wt = app.projects[0].worktrees.last().unwrap();
         assert_eq!(new_wt.name, "tokyo");
         assert_eq!(new_wt.branch, "feature/auth");
-        assert_eq!(new_wt.status, app::WorktreeStatus::Idle);
 
         // テスト後に作成された worktree をクリーンアップ
         let wt_path = config::worktree_path("test-project", "tokyo");

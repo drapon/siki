@@ -5,27 +5,24 @@ use std::time::Instant;
 /// セッションの状態
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    /// ツール実行中
+    /// ツール実行中（点滅表示）
     Working,
     /// 許可入力待ち
     Waiting,
-    /// 待機中
+    /// タスク完了
+    Done,
+    /// 待機中（セッション登録直後のデフォルト）
     Idle,
-    /// 放置中（タイムアウト間近）
-    Stale,
-    /// セッション終了
-    Dead,
 }
 
 impl SessionState {
-    /// 状態バッジ文字を返す
-    pub fn badge_char(&self) -> &'static str {
+    /// 点滅フェーズに応じたバッジ文字を返す
+    pub fn badge_char(&self, blink_on: bool) -> &'static str {
         match self {
-            Self::Working => "●",
+            Self::Working => if blink_on { "●" } else { " " },
             Self::Waiting => "●",
+            Self::Done => "●",
             Self::Idle => "○",
-            Self::Stale => "◷",
-            Self::Dead => "✕",
         }
     }
 
@@ -33,22 +30,20 @@ impl SessionState {
     pub fn badge_color(&self) -> ratatui::style::Color {
         use ratatui::style::Color;
         match self {
-            Self::Working => Color::Green,
+            Self::Working => Color::White,
             Self::Waiting => Color::Yellow,
+            Self::Done => Color::Green,
             Self::Idle => Color::DarkGray,
-            Self::Stale => Color::DarkGray,
-            Self::Dead => Color::DarkGray,
         }
     }
 
     /// 集約表示用の優先度（大きいほど優先）
     pub fn priority(&self) -> u8 {
         match self {
-            Self::Waiting => 5,
-            Self::Working => 4,
-            Self::Stale => 3,
-            Self::Idle => 2,
-            Self::Dead => 1,
+            Self::Waiting => 4,
+            Self::Working => 3,
+            Self::Done => 2,
+            Self::Idle => 1,
         }
     }
 }
@@ -118,29 +113,40 @@ impl SessionRegistry {
     }
 
     /// セッションを登録する
+    ///
+    /// 既に同じ session_id が登録されている場合はメタデータのみ更新し、
+    /// 現在の state は保持する（レースコンディション対策）。
     pub fn register(&mut self, session_id: String, cwd: String, role: String) {
         // cwd からプロジェクト名・worktree名を推定
         // パス形式: ~/.siki/workspaces/<project>/<worktree>/...
         let (project_name, worktree_name) = guess_names_from_cwd(&cwd);
 
-        self.sessions.insert(
-            session_id.clone(),
-            Session {
-                session_id,
-                worktree_name,
-                project_name,
-                cwd,
-                role,
-                state: SessionState::Idle,
-                last_seen: Instant::now(),
-                idle_pending_since: None,
-            },
-        );
+        if let Some(existing) = self.sessions.get_mut(&session_id) {
+            existing.worktree_name = worktree_name;
+            existing.project_name = project_name;
+            existing.cwd = cwd;
+            existing.role = role;
+            existing.last_seen = Instant::now();
+        } else {
+            self.sessions.insert(
+                session_id.clone(),
+                Session {
+                    session_id,
+                    worktree_name,
+                    project_name,
+                    cwd,
+                    role,
+                    state: SessionState::Idle,
+                    last_seen: Instant::now(),
+                    idle_pending_since: None,
+                },
+            );
+        }
     }
 
     /// セッション状態を更新する
     ///
-    /// working/waiting → idle の遷移は即座に行わず、idle_pending_since を記録して
+    /// working/waiting → done の遷移は即座に行わず、idle_pending_since を記録して
     /// Tick で一定時間後に遷移させる（バッジが一瞬で消えるのを防ぐ）。
     /// working/waiting への遷移時は pending をキャンセルする。
     pub fn update_state(&mut self, session_id: &str, state: SessionState) {
@@ -148,8 +154,8 @@ impl SessionRegistry {
             session.last_seen = Instant::now();
 
             match state {
-                SessionState::Idle => {
-                    // working/waiting 中なら即座に idle にせず遅延
+                SessionState::Done => {
+                    // working/waiting 中なら即座に done にせず遅延
                     if matches!(session.state, SessionState::Working | SessionState::Waiting) {
                         session.idle_pending_since = Some(Instant::now());
                     } else {
@@ -195,46 +201,29 @@ impl SessionRegistry {
             .max_by_key(|s| s.priority())
     }
 
-    /// idle 遅延の最小表示時間
-    const IDLE_HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
+    /// Done 遷移の遅延時間（Working/Waiting を最低限表示するため）
+    const DONE_HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
-    /// タイムアウトしたセッションを段階的に劣化させる
+    /// 期限切れセッションをクリーンアップする
     ///
-    /// - idle_pending_since から 3秒経過 → Idle に遷移
-    /// - `stale_timeout`（15秒）を超えたら Stale（◷）
-    /// - `dead_timeout`（30秒）を超えたら Dead（✕）
-    pub fn expire_stale_sessions(
-        &mut self,
-        stale_timeout: std::time::Duration,
-        dead_timeout: std::time::Duration,
-    ) {
+    /// - idle_pending_since から 3秒経過 → Done に遷移
+    /// - `expire_timeout`（5分）を超えたセッションをレジストリから削除
+    pub fn cleanup_expired_sessions(&mut self, expire_timeout: std::time::Duration) {
         let now = Instant::now();
+
+        // Done 遅延の解消: 3秒経過したら実際に Done に遷移
         for session in self.sessions.values_mut() {
-            // idle 遅延の解消: 3秒経過したら実際に idle に遷移
             if let Some(pending_since) = session.idle_pending_since {
-                if now.duration_since(pending_since) >= Self::IDLE_HOLD_DURATION {
-                    session.state = SessionState::Idle;
+                if now.duration_since(pending_since) >= Self::DONE_HOLD_DURATION {
+                    session.state = SessionState::Done;
                     session.idle_pending_since = None;
                 }
             }
-
-            let elapsed = now.duration_since(session.last_seen);
-            match session.state {
-                SessionState::Dead => {}
-                SessionState::Stale if elapsed > dead_timeout => {
-                    session.state = SessionState::Dead;
-                }
-                _ if elapsed > dead_timeout => {
-                    session.state = SessionState::Dead;
-                }
-                SessionState::Working | SessionState::Waiting | SessionState::Idle
-                    if elapsed > stale_timeout =>
-                {
-                    session.state = SessionState::Stale;
-                }
-                _ => {}
-            }
         }
+
+        // 一定時間応答なしのセッションを削除
+        self.sessions
+            .retain(|_, session| now.duration_since(session.last_seen) <= expire_timeout);
     }
 
     /// HookEvent を処理してレジストリを更新する。変更があれば true を返す。
@@ -249,38 +238,40 @@ impl SessionRegistry {
                 true
             }
             HookEvent::Working { session_id } => {
-                if self.sessions.contains_key(&session_id) {
-                    self.update_state(&session_id, SessionState::Working);
-                    true
-                } else {
-                    false
+                // 未登録セッションは自動登録（レースコンディション対策）
+                if !self.sessions.contains_key(&session_id) {
+                    self.register(session_id.clone(), String::new(), "default".into());
                 }
+                self.update_state(&session_id, SessionState::Working);
+                true
             }
             HookEvent::Waiting { session_id } => {
-                if self.sessions.contains_key(&session_id) {
-                    self.update_state(&session_id, SessionState::Waiting);
-                    true
-                } else {
-                    false
+                if !self.sessions.contains_key(&session_id) {
+                    self.register(session_id.clone(), String::new(), "default".into());
                 }
+                self.update_state(&session_id, SessionState::Waiting);
+                true
             }
             HookEvent::Idle { session_id } => {
-                if self.sessions.contains_key(&session_id) {
-                    self.update_state(&session_id, SessionState::Idle);
-                    true
-                } else {
-                    false
+                // Stop イベント → Done 状態に遷移（タスク完了を示す）
+                if !self.sessions.contains_key(&session_id) {
+                    self.register(session_id.clone(), String::new(), "default".into());
                 }
+                self.update_state(&session_id, SessionState::Done);
+                true
             }
             HookEvent::Dead { session_id } => {
-                if self.sessions.contains_key(&session_id) {
-                    self.update_state(&session_id, SessionState::Dead);
-                    true
-                } else {
-                    false
-                }
+                // SessionEnd → セッションを削除
+                self.sessions.remove(&session_id);
+                true
             }
-            HookEvent::Refresh { .. } => false,
+            HookEvent::Refresh { session_id } => {
+                // PostToolUse → last_seen を更新（heartbeat）
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.last_seen = Instant::now();
+                }
+                false
+            }
         }
     }
 }
@@ -308,29 +299,28 @@ mod tests {
 
     #[test]
     fn test_session_state_badge_char() {
-        assert_eq!(SessionState::Working.badge_char(), "●");
-        assert_eq!(SessionState::Waiting.badge_char(), "●");
-        assert_eq!(SessionState::Idle.badge_char(), "○");
-        assert_eq!(SessionState::Stale.badge_char(), "◷");
-        assert_eq!(SessionState::Dead.badge_char(), "✕");
+        assert_eq!(SessionState::Working.badge_char(true), "●");
+        assert_eq!(SessionState::Working.badge_char(false), " ");
+        assert_eq!(SessionState::Waiting.badge_char(true), "●");
+        assert_eq!(SessionState::Waiting.badge_char(false), "●");
+        assert_eq!(SessionState::Done.badge_char(true), "●");
+        assert_eq!(SessionState::Idle.badge_char(true), "○");
     }
 
     #[test]
     fn test_session_state_badge_color() {
         use ratatui::style::Color;
-        assert_eq!(SessionState::Working.badge_color(), Color::Green);
+        assert_eq!(SessionState::Working.badge_color(), Color::White);
         assert_eq!(SessionState::Waiting.badge_color(), Color::Yellow);
+        assert_eq!(SessionState::Done.badge_color(), Color::Green);
         assert_eq!(SessionState::Idle.badge_color(), Color::DarkGray);
-        assert_eq!(SessionState::Stale.badge_color(), Color::DarkGray);
-        assert_eq!(SessionState::Dead.badge_color(), Color::DarkGray);
     }
 
     #[test]
     fn test_session_state_priority() {
         assert!(SessionState::Waiting.priority() > SessionState::Working.priority());
-        assert!(SessionState::Working.priority() > SessionState::Stale.priority());
-        assert!(SessionState::Stale.priority() > SessionState::Idle.priority());
-        assert!(SessionState::Idle.priority() > SessionState::Dead.priority());
+        assert!(SessionState::Working.priority() > SessionState::Done.priority());
+        assert!(SessionState::Done.priority() > SessionState::Idle.priority());
     }
 
     #[test]
@@ -340,6 +330,19 @@ mod tests {
         let s = reg.get("sess-1").unwrap();
         assert_eq!(s.role, "frontend");
         assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn test_registry_register_preserves_state() {
+        let mut reg = SessionRegistry::new();
+        reg.register("sess-1".into(), "/tmp".into(), "default".into());
+        reg.update_state("sess-1", SessionState::Working);
+        // 再登録でメタデータは更新されるが state は保持
+        reg.register("sess-1".into(), "/new/path".into(), "frontend".into());
+        let s = reg.get("sess-1").unwrap();
+        assert_eq!(s.state, SessionState::Working);
+        assert_eq!(s.role, "frontend");
+        assert_eq!(s.cwd, "/new/path");
     }
 
     #[test]
@@ -371,12 +374,37 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_handle_event_working_unknown() {
+    fn test_registry_handle_event_working_auto_registers() {
         let mut reg = SessionRegistry::new();
+        // 未登録セッションでも自動登録される
         let changed = reg.handle_event(HookEvent::Working {
             session_id: "unknown".into(),
         });
-        assert!(!changed);
+        assert!(changed);
+        assert_eq!(reg.get("unknown").unwrap().state, SessionState::Working);
+    }
+
+    #[test]
+    fn test_registry_handle_event_idle_becomes_done() {
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.update_state("s1", SessionState::Working);
+        // Idle イベント（Stop hook）は Done に遷移
+        // ただし working→done は遅延されるので idle_pending_since が設定される
+        reg.handle_event(HookEvent::Idle { session_id: "s1".into() });
+        let s = reg.get("s1").unwrap();
+        // 遅延中は Working のまま
+        assert_eq!(s.state, SessionState::Working);
+        assert!(s.idle_pending_since.is_some());
+    }
+
+    #[test]
+    fn test_registry_handle_event_dead_removes_session() {
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.handle_event(HookEvent::Dead { session_id: "s1".into() });
+        // Dead イベント（SessionEnd hook）はセッションを削除
+        assert!(reg.get("s1").is_none());
     }
 
     #[test]
@@ -429,11 +457,24 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_event_refresh_returns_false() {
+    fn test_handle_event_refresh_updates_last_seen() {
         let mut reg = SessionRegistry::new();
+        reg.register("test".into(), "/tmp".into(), "default".into());
+        let before = reg.get("test").unwrap().last_seen;
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let changed = reg.handle_event(HookEvent::Refresh {
             session_id: "test".into(),
         });
-        assert!(!changed);
+        assert!(!changed); // 状態変更なし
+        assert!(reg.get("test").unwrap().last_seen > before); // last_seen は更新
+    }
+
+    #[test]
+    fn test_cleanup_expired_sessions() {
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        // 即座にはクリーンアップされない
+        reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
+        assert!(reg.get("s1").is_some());
     }
 }

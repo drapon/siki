@@ -135,9 +135,9 @@ impl LeftPanel {
                         let session_state = session_registry
                             .and_then(|reg| reg.aggregate_state(project_name, &wt.name));
                         let (icon, icon_color) = if let Some(state) = session_state {
-                            (state.badge_char(), state.badge_color())
+                            (state.badge_char(app.blink_phase), state.badge_color())
                         } else {
-                            (wt.status.icon(), Color::DarkGray)
+                            ("○", Color::DarkGray)
                         };
 
                         let is_selected = app.selected_worktree == Some((*project_index, *worktree_index));
@@ -205,7 +205,7 @@ impl LeftPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Project, Worktree, WorktreeStatus, RightPanelMode, DiffFocus};
+    use crate::app::{Project, Worktree, RightPanelMode, DiffFocus};
     use std::path::PathBuf;
 
     fn sample_projects() -> Vec<Project> {
@@ -221,7 +221,7 @@ mod tests {
                         display_name: None,
                         branch: "feature/auth".to_string(),
                         path: PathBuf::from("/tmp/wt1"),
-                        status: WorktreeStatus::Running,
+
                         chat_history: vec![],
                         open_files: vec![],
                         active_tab: 0,
@@ -241,7 +241,7 @@ mod tests {
                         display_name: None,
                         branch: "fix/bug-123".to_string(),
                         path: PathBuf::from("/tmp/wt2"),
-                        status: WorktreeStatus::Idle,
+
                         chat_history: vec![],
                         open_files: vec![],
                         active_tab: 0,
@@ -268,7 +268,7 @@ mod tests {
                     display_name: None,
                     branch: "refactor/db".to_string(),
                     path: PathBuf::from("/tmp/wt3"),
-                    status: WorktreeStatus::Done,
+
                     chat_history: vec![],
                     open_files: vec![],
                     active_tab: 0,
