@@ -2110,6 +2110,21 @@ fn extract_file_selection(
     // 行番号プレフィックス "1234 " = 5文字分をスキップ
     const LINE_NUM_WIDTH: u16 = 5;
 
+    // 表示列位置からバイトオフセットに変換するヘルパー
+    let col_to_byte = |text: &str, col: usize| -> usize {
+        use unicode_width::UnicodeWidthChar;
+        let mut byte_pos = 0;
+        let mut col_pos = 0;
+        for ch in text.chars() {
+            if col_pos >= col {
+                break;
+            }
+            col_pos += ch.width().unwrap_or(0);
+            byte_pos += ch.len_utf8();
+        }
+        byte_pos
+    };
+
     let mut result = String::new();
     for line_idx in start_line..=end_line {
         let spans = file.highlighted.get(line_idx)?;
@@ -2117,19 +2132,23 @@ fn extract_file_selection(
 
         if start_line == end_line {
             // 単一行選択
-            let s = start.col.saturating_sub(LINE_NUM_WIDTH) as usize;
-            let e = (end.col.saturating_sub(LINE_NUM_WIDTH) as usize + 1).min(line_text.len());
+            let s_col = start.col.saturating_sub(LINE_NUM_WIDTH) as usize;
+            let e_col = end.col.saturating_sub(LINE_NUM_WIDTH) as usize + 1;
+            let s = col_to_byte(&line_text, s_col);
+            let e = col_to_byte(&line_text, e_col).min(line_text.len());
             if s < line_text.len() {
                 result.push_str(&line_text[s..e]);
             }
         } else if line_idx == start_line {
-            let s = start.col.saturating_sub(LINE_NUM_WIDTH) as usize;
+            let s_col = start.col.saturating_sub(LINE_NUM_WIDTH) as usize;
+            let s = col_to_byte(&line_text, s_col);
             if s < line_text.len() {
                 result.push_str(&line_text[s..]);
             }
             result.push('\n');
         } else if line_idx == end_line {
-            let e = (end.col.saturating_sub(LINE_NUM_WIDTH) as usize + 1).min(line_text.len());
+            let e_col = end.col.saturating_sub(LINE_NUM_WIDTH) as usize + 1;
+            let e = col_to_byte(&line_text, e_col).min(line_text.len());
             result.push_str(&line_text[..e]);
         } else {
             result.push_str(&line_text);
@@ -4681,8 +4700,8 @@ fn sync_right_panel_context_items(app: &mut app::App) {
         let items = config::load_contexts(&project_name, &worktree_name);
         if let Some(wt) = app.worktree_by_id_mut(wt_id) {
             wt.context_items = items;
-            if wt.context_cursor >= wt.context_items.len() && wt.context_cursor > 0 {
-                wt.context_cursor = wt.context_items.len() - 1;
+            if wt.context_cursor >= wt.context_items.len() {
+                wt.context_cursor = wt.context_items.len().saturating_sub(1);
             }
         }
     }

@@ -2,6 +2,7 @@ use crate::app::{App, OpenFile};
 use super::grep_view;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+use unicode_width::UnicodeWidthChar;
 
 /// 中央パネルの描画
 pub fn render(
@@ -469,13 +470,15 @@ fn render_file(
 
             if in_selection {
                 let (sr, sc, er, ec) = sel_range.unwrap();
-                // この行での選択開始/終了カラム (テキスト内の文字位置)
+                // この行での選択開始/終了カラム (表示列位置)
                 let sel_start = if i == sr { sc.saturating_sub(LINE_NUM_WIDTH) as usize } else { 0 };
                 let sel_end = if i == er { ec.saturating_sub(LINE_NUM_WIDTH) as usize + 1 } else { usize::MAX };
 
+                // col は表示列幅でトラッキング (バイトオフセットではなく表示幅)
                 let mut col: usize = 0;
                 for (r, g, b, text) in spans {
-                    let span_end = col + text.len();
+                    let span_width: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
+                    let span_end = col + span_width;
                     if span_end <= sel_start || col >= sel_end {
                         // 選択範囲外
                         let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
@@ -485,25 +488,28 @@ fn render_file(
                         line_spans.push(Span::styled(text.clone(), style));
                     } else {
                         // 部分的 or 全体が選択範囲内
-                        let start_in_span = sel_start.saturating_sub(col);
-                        let end_in_span = sel_end.saturating_sub(col).min(text.len());
+                        // カラム位置からバイトオフセットに変換
+                        let start_col_in_span = sel_start.saturating_sub(col);
+                        let end_col_in_span = sel_end.saturating_sub(col).min(span_width);
+                        let start_byte = col_to_byte(text, start_col_in_span);
+                        let end_byte = col_to_byte(text, end_col_in_span);
 
                         // 選択前の部分
-                        if start_in_span > 0 {
+                        if start_byte > 0 {
                             let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
                             if is_cursor_line { style = style.bg(Color::Rgb(40, 40, 50)); }
-                            line_spans.push(Span::styled(text[..start_in_span].to_string(), style));
+                            line_spans.push(Span::styled(text[..start_byte].to_string(), style));
                         }
                         // 選択部分
                         let sel_style = Style::default()
                             .fg(Color::Rgb(*r, *g, *b))
                             .bg(Color::Rgb(60, 60, 100));
-                        line_spans.push(Span::styled(text[start_in_span..end_in_span].to_string(), sel_style));
+                        line_spans.push(Span::styled(text[start_byte..end_byte].to_string(), sel_style));
                         // 選択後の部分
-                        if end_in_span < text.len() {
+                        if end_byte < text.len() {
                             let mut style = Style::default().fg(Color::Rgb(*r, *g, *b));
                             if is_cursor_line { style = style.bg(Color::Rgb(40, 40, 50)); }
-                            line_spans.push(Span::styled(text[end_in_span..].to_string(), style));
+                            line_spans.push(Span::styled(text[end_byte..].to_string(), style));
                         }
                     }
                     col = span_end;
@@ -846,6 +852,20 @@ pub fn click_file_line(app: &mut App, main_area: Rect, click_row: u16) {
     });
 }
 
+
+/// 表示列位置からバイトオフセットに変換する
+fn col_to_byte(text: &str, col: usize) -> usize {
+    let mut byte_pos = 0;
+    let mut col_pos = 0;
+    for ch in text.chars() {
+        if col_pos >= col {
+            break;
+        }
+        col_pos += ch.width().unwrap_or(0);
+        byte_pos += ch.len_utf8();
+    }
+    byte_pos
+}
 
 /// 現在開いているファイルのパス:行番号を返す（1-indexed）
 pub fn current_file_location(app: &App) -> Option<String> {
@@ -1299,5 +1319,33 @@ mod tests {
         let mut app = App::new(&config);
         scroll_down(&mut app);
         scroll_up(&mut app);
+    }
+
+    #[test]
+    fn test_col_to_byte_ascii() {
+        assert_eq!(col_to_byte("hello", 0), 0);
+        assert_eq!(col_to_byte("hello", 3), 3);
+        assert_eq!(col_to_byte("hello", 5), 5);
+        assert_eq!(col_to_byte("hello", 10), 5); // 超過はクランプ
+    }
+
+    #[test]
+    fn test_col_to_byte_multibyte() {
+        // "あいう" = 各3バイト、各表示幅2列
+        let text = "あいう";
+        assert_eq!(col_to_byte(text, 0), 0);  // 先頭
+        assert_eq!(col_to_byte(text, 2), 3);  // "あ"の後 = 3バイト
+        assert_eq!(col_to_byte(text, 4), 6);  // "あい"の後 = 6バイト
+        assert_eq!(col_to_byte(text, 6), 9);  // "あいう"の後 = 9バイト
+    }
+
+    #[test]
+    fn test_col_to_byte_mixed() {
+        // "aあb" = a(1バイト,1列) + あ(3バイト,2列) + b(1バイト,1列)
+        let text = "aあb";
+        assert_eq!(col_to_byte(text, 0), 0);  // 先頭
+        assert_eq!(col_to_byte(text, 1), 1);  // "a"の後
+        assert_eq!(col_to_byte(text, 3), 4);  // "aあ"の後 = 1+3=4バイト
+        assert_eq!(col_to_byte(text, 4), 5);  // "aあb"の後 = 1+3+1=5バイト
     }
 }
