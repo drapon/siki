@@ -1,5 +1,4 @@
 use crate::app::{App, Project, WorktreeId};
-use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
@@ -100,7 +99,7 @@ impl LeftPanel {
         area: Rect,
         app: &App,
         focused: bool,
-        session_registry: Option<&SessionRegistry>,
+        blink_visible: bool,
     ) {
         let entries = Self::build_entries(&app.projects);
 
@@ -127,18 +126,16 @@ impl LeftPanel {
                         worktree_index,
                     } => {
                         let wt = &app.projects[*project_index].worktrees[*worktree_index];
-                        let project_name = &app.projects[*project_index].name;
                         let is_last = *worktree_index
                             == app.projects[*project_index].worktrees.len() - 1;
                         let branch_char = if is_last { "└" } else { "├" };
-                        // セッションレジストリから状態バッジを取得（なければ既存アイコン）
-                        let session_state = session_registry
-                            .and_then(|reg| reg.aggregate_state(project_name, &wt.name));
-                        let (icon, icon_color) = if let Some(state) = session_state {
-                            (state.badge_char(), state.badge_color())
+                        // Working 状態の●は blink_visible で点滅させる
+                        let icon = if wt.status == crate::app::WorktreeStatus::Working && !blink_visible {
+                            " "
                         } else {
-                            (wt.status.icon(), Color::DarkGray)
+                            wt.status.icon()
                         };
+                        let icon_color = wt.status.icon_color();
 
                         let is_selected = app.selected_worktree == Some((*project_index, *worktree_index));
                         let name_fg = if is_selected {
@@ -221,7 +218,7 @@ mod tests {
                         display_name: None,
                         branch: "feature/auth".to_string(),
                         path: PathBuf::from("/tmp/wt1"),
-                        status: WorktreeStatus::Running,
+                        status: WorktreeStatus::Thinking,
                         chat_history: vec![],
                         open_files: vec![],
                         active_tab: 0,

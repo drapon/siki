@@ -18,37 +18,14 @@ pub enum SessionState {
 }
 
 impl SessionState {
-    /// 状態バッジ文字を返す
-    pub fn badge_char(&self) -> &'static str {
+    /// DB 保存用の文字列表現を返す
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Working => "●",
-            Self::Waiting => "●",
-            Self::Idle => "○",
-            Self::Stale => "◷",
-            Self::Dead => "✕",
-        }
-    }
-
-    /// 状態バッジの色を返す
-    pub fn badge_color(&self) -> ratatui::style::Color {
-        use ratatui::style::Color;
-        match self {
-            Self::Working => Color::Green,
-            Self::Waiting => Color::Yellow,
-            Self::Idle => Color::DarkGray,
-            Self::Stale => Color::DarkGray,
-            Self::Dead => Color::DarkGray,
-        }
-    }
-
-    /// 集約表示用の優先度（大きいほど優先）
-    pub fn priority(&self) -> u8 {
-        match self {
-            Self::Waiting => 5,
-            Self::Working => 4,
-            Self::Stale => 3,
-            Self::Idle => 2,
-            Self::Dead => 1,
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::Stale => "stale",
+            Self::Dead => "dead",
         }
     }
 }
@@ -140,32 +117,12 @@ impl SessionRegistry {
 
     /// セッション状態を更新する
     ///
-    /// working/waiting → idle の遷移は即座に行わず、idle_pending_since を記録して
-    /// Tick で一定時間後に遷移させる（バッジが一瞬で消えるのを防ぐ）。
-    /// working/waiting への遷移時は pending をキャンセルする。
+    /// 描画は WorktreeStatus 側で管理するため、遅延なしで即座に遷移する。
     pub fn update_state(&mut self, session_id: &str, state: SessionState) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.last_seen = Instant::now();
-
-            match state {
-                SessionState::Idle => {
-                    // working/waiting 中なら即座に idle にせず遅延
-                    if matches!(session.state, SessionState::Working | SessionState::Waiting) {
-                        session.idle_pending_since = Some(Instant::now());
-                    } else {
-                        session.state = state;
-                    }
-                }
-                SessionState::Working | SessionState::Waiting => {
-                    // アクティブ状態への遷移: pending をキャンセル
-                    session.idle_pending_since = None;
-                    session.state = state;
-                }
-                _ => {
-                    session.idle_pending_since = None;
-                    session.state = state;
-                }
-            }
+            session.idle_pending_since = None;
+            session.state = state;
         }
     }
 
@@ -187,22 +144,11 @@ impl SessionRegistry {
             .collect()
     }
 
-    /// worktreeの集約状態（最も優先度の高い状態）を返す
-    pub fn aggregate_state(&self, project: &str, worktree: &str) -> Option<SessionState> {
-        self.by_worktree(project, worktree)
-            .iter()
-            .map(|s| s.state)
-            .max_by_key(|s| s.priority())
-    }
-
     /// idle 遅延の最小表示時間
-    const IDLE_HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
-
     /// タイムアウトしたセッションを段階的に劣化させる
     ///
-    /// - idle_pending_since から 3秒経過 → Idle に遷移
-    /// - `stale_timeout`（15秒）を超えたら Stale（◷）
-    /// - `dead_timeout`（30秒）を超えたら Dead（✕）
+    /// - `stale_timeout`（15秒）を超えたら Stale
+    /// - `dead_timeout`（30秒）を超えたら Dead
     pub fn expire_stale_sessions(
         &mut self,
         stale_timeout: std::time::Duration,
@@ -210,20 +156,9 @@ impl SessionRegistry {
     ) {
         let now = Instant::now();
         for session in self.sessions.values_mut() {
-            // idle 遅延の解消: 3秒経過したら実際に idle に遷移
-            if let Some(pending_since) = session.idle_pending_since {
-                if now.duration_since(pending_since) >= Self::IDLE_HOLD_DURATION {
-                    session.state = SessionState::Idle;
-                    session.idle_pending_since = None;
-                }
-            }
-
             let elapsed = now.duration_since(session.last_seen);
             match session.state {
                 SessionState::Dead => {}
-                SessionState::Stale if elapsed > dead_timeout => {
-                    session.state = SessionState::Dead;
-                }
                 _ if elapsed > dead_timeout => {
                     session.state = SessionState::Dead;
                 }
@@ -307,30 +242,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_session_state_badge_char() {
-        assert_eq!(SessionState::Working.badge_char(), "●");
-        assert_eq!(SessionState::Waiting.badge_char(), "●");
-        assert_eq!(SessionState::Idle.badge_char(), "○");
-        assert_eq!(SessionState::Stale.badge_char(), "◷");
-        assert_eq!(SessionState::Dead.badge_char(), "✕");
-    }
-
-    #[test]
-    fn test_session_state_badge_color() {
-        use ratatui::style::Color;
-        assert_eq!(SessionState::Working.badge_color(), Color::Green);
-        assert_eq!(SessionState::Waiting.badge_color(), Color::Yellow);
-        assert_eq!(SessionState::Idle.badge_color(), Color::DarkGray);
-        assert_eq!(SessionState::Stale.badge_color(), Color::DarkGray);
-        assert_eq!(SessionState::Dead.badge_color(), Color::DarkGray);
-    }
-
-    #[test]
-    fn test_session_state_priority() {
-        assert!(SessionState::Waiting.priority() > SessionState::Working.priority());
-        assert!(SessionState::Working.priority() > SessionState::Stale.priority());
-        assert!(SessionState::Stale.priority() > SessionState::Idle.priority());
-        assert!(SessionState::Idle.priority() > SessionState::Dead.priority());
+    fn test_session_state_as_str() {
+        assert_eq!(SessionState::Working.as_str(), "working");
+        assert_eq!(SessionState::Waiting.as_str(), "waiting");
+        assert_eq!(SessionState::Idle.as_str(), "idle");
+        assert_eq!(SessionState::Stale.as_str(), "stale");
+        assert_eq!(SessionState::Dead.as_str(), "dead");
     }
 
     #[test]
@@ -377,22 +294,6 @@ mod tests {
             session_id: "unknown".into(),
         });
         assert!(!changed);
-    }
-
-    #[test]
-    fn test_registry_aggregate_state() {
-        let mut reg = SessionRegistry::new();
-        let ws = crate::config::workspaces_dir();
-        let cwd = format!("{}/myproj/osaka", ws.display());
-
-        reg.register("s1".into(), cwd.clone(), "frontend".into());
-        reg.register("s2".into(), cwd, "testing".into());
-        reg.update_state("s1", SessionState::Working);
-        reg.update_state("s2", SessionState::Waiting);
-
-        // Waiting が最優先
-        let agg = reg.aggregate_state("myproj", "osaka").unwrap();
-        assert_eq!(agg, SessionState::Waiting);
     }
 
     #[test]

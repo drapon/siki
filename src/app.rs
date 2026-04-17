@@ -22,8 +22,15 @@ pub enum Panel {
 /// Worktree のステータス
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeStatus {
+    /// 何もしていない
     Idle,
-    Running,
+    /// 思考中（メッセージ送信後〜最初のhookイベントまで）
+    Thinking,
+    /// ツール実行中
+    Working,
+    /// 許可入力待ち
+    Waiting,
+    /// 応答完了（クリックで Idle に戻る）
     Done,
 }
 
@@ -558,6 +565,20 @@ impl App {
         self.projects.get(pi)?.worktrees.get(wi)
     }
 
+    /// プロジェクト名と worktree 名から WorktreeId を検索する
+    pub fn find_worktree_id(&self, project_name: &str, worktree_name: &str) -> Option<WorktreeId> {
+        for (pi, project) in self.projects.iter().enumerate() {
+            if project.name == project_name {
+                for (wi, wt) in project.worktrees.iter().enumerate() {
+                    if wt.name == worktree_name {
+                        return Some((pi, wi));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// WorktreeId で worktree の可変参照を取得する
     pub fn worktree_by_id_mut(&mut self, id: WorktreeId) -> Option<&mut Worktree> {
         let (pi, wi) = id;
@@ -630,7 +651,7 @@ impl App {
     /// Claude Code の応答完了を処理する
     pub fn handle_claude_complete(&mut self, worktree_id: WorktreeId) {
         if let Some(wt) = self.worktree_by_id_mut(worktree_id) {
-            wt.status = WorktreeStatus::Idle;
+            wt.status = WorktreeStatus::Done;
         }
     }
 
@@ -685,11 +706,27 @@ impl Project {
 
 impl WorktreeStatus {
     /// ステータスアイコンを返す
+    ///
+    /// Working の点滅は描画側で `blink_visible` を使って制御する。
     pub fn icon(&self) -> &'static str {
         match self {
-            WorktreeStatus::Running => "●",
-            WorktreeStatus::Idle => "○",
-            WorktreeStatus::Done => "✓",
+            Self::Idle => "○",
+            Self::Thinking => "◷",
+            Self::Working => "●",
+            Self::Waiting => "●",
+            Self::Done => "●",
+        }
+    }
+
+    /// ステータスアイコンの色を返す
+    pub fn icon_color(&self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            Self::Idle => Color::DarkGray,
+            Self::Thinking => Color::DarkGray,
+            Self::Working => Color::White,
+            Self::Waiting => Color::Yellow,
+            Self::Done => Color::Green,
         }
     }
 }
@@ -844,10 +881,10 @@ mod tests {
 
         app.selected_worktree = Some((1, 0));
         let wt = app.selected_worktree_mut().unwrap();
-        wt.status = WorktreeStatus::Running;
+        wt.status = WorktreeStatus::Working;
 
         let wt = app.selected_worktree().unwrap();
-        assert_eq!(wt.status, WorktreeStatus::Running);
+        assert_eq!(wt.status, WorktreeStatus::Working);
     }
 
     #[test]
@@ -883,9 +920,21 @@ mod tests {
 
     #[test]
     fn test_worktree_status_icon() {
-        assert_eq!(WorktreeStatus::Running.icon(), "●");
         assert_eq!(WorktreeStatus::Idle.icon(), "○");
-        assert_eq!(WorktreeStatus::Done.icon(), "✓");
+        assert_eq!(WorktreeStatus::Thinking.icon(), "◷");
+        assert_eq!(WorktreeStatus::Working.icon(), "●");
+        assert_eq!(WorktreeStatus::Waiting.icon(), "●");
+        assert_eq!(WorktreeStatus::Done.icon(), "●");
+    }
+
+    #[test]
+    fn test_worktree_status_icon_color() {
+        use ratatui::style::Color;
+        assert_eq!(WorktreeStatus::Idle.icon_color(), Color::DarkGray);
+        assert_eq!(WorktreeStatus::Thinking.icon_color(), Color::DarkGray);
+        assert_eq!(WorktreeStatus::Working.icon_color(), Color::White);
+        assert_eq!(WorktreeStatus::Waiting.icon_color(), Color::Yellow);
+        assert_eq!(WorktreeStatus::Done.icon_color(), Color::Green);
     }
 
     #[test]
@@ -922,11 +971,11 @@ mod tests {
         let mut app = App::new(&config);
 
         let wt = app.worktree_by_id_mut((0, 1)).unwrap();
-        wt.status = WorktreeStatus::Running;
+        wt.status = WorktreeStatus::Working;
 
         assert_eq!(
             app.worktree_by_id((0, 1)).unwrap().status,
-            WorktreeStatus::Running
+            WorktreeStatus::Working
         );
     }
 
@@ -1067,14 +1116,14 @@ mod tests {
         let config = sample_config();
         let mut app = App::new(&config);
 
-        // ステータスを Running にしておく
-        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Running;
+        // ステータスを Thinking にしておく
+        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Thinking;
 
         app.handle_claude_complete((0, 0));
 
         assert_eq!(
             app.worktree_by_id((0, 0)).unwrap().status,
-            WorktreeStatus::Idle
+            WorktreeStatus::Done
         );
     }
 
@@ -1092,7 +1141,7 @@ mod tests {
         let config = sample_config();
         let mut app = App::new(&config);
 
-        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Running;
+        app.worktree_by_id_mut((0, 0)).unwrap().status = WorktreeStatus::Thinking;
 
         app.handle_claude_error((0, 0), "API rate limit");
 

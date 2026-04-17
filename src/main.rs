@@ -189,8 +189,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    // 点滅アニメーション用カウンター（Tick ごとにインクリメント、100ms間隔）
+    let mut blink_tick: u8 = 0;
+
     // メインイベントループ
     while app.running {
+        // 点滅: 5 tick (500ms) ごとにトグル
+        let blink_visible = (blink_tick / 5) % 2 == 0;
         // 現在のターミナル画面とタブ情報を取得
         let (terminal_screen, terminal_tab_info) = if let Some(wt_id) = app.selected_worktree {
             let active = app
@@ -251,7 +256,6 @@ async fn main() -> Result<()> {
 
         // UI 描画
         tui_terminal.draw(|frame| {
-            let registry = session_registry.lock().unwrap();
             last_layout = Some(ui::render(
                 frame,
                 &mut app,
@@ -263,7 +267,7 @@ async fn main() -> Result<()> {
                 terminal_tab_info.as_ref(),
                 claude_screen,
                 siki_init_screen,
-                Some(&registry),
+                blink_visible,
                 &grep_rows,
             ));
         })?;
@@ -281,6 +285,10 @@ async fn main() -> Result<()> {
 
         // イベント待受と処理
         let ev = events.next().await?;
+        // 点滅カウンターの更新（Tick イベント時のみ）
+        if matches!(ev, event::AppEvent::Tick) {
+            blink_tick = blink_tick.wrapping_add(1);
+        }
         handle_event(
             &mut app,
             &mut left_panel,
@@ -1022,6 +1030,12 @@ async fn handle_event(
                                             let wt_id = (*project_index, *worktree_index);
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
+                                            // Done 状態をクリア（クリックで消える仕様）
+                                            if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                                                if wt.status == app::WorktreeStatus::Done {
+                                                    wt.status = app::WorktreeStatus::Idle;
+                                                }
+                                            }
                                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                                             let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                             source_tree.load(&wt_path);
@@ -1252,8 +1266,43 @@ async fn handle_event(
                 app.add_worktree_branch_cursor = 0;
             }
         }
-        AppEvent::SessionUpdate { .. } => {
-            // セッション状態の変化 — レジストリは broker 側で既に更新済み
+        AppEvent::SessionUpdate { session_id, state } => {
+            // hook イベントの状態変化を WorktreeStatus に反映する
+            let wt_info = session_registry.as_ref().and_then(|reg| {
+                let r = reg.lock().ok()?;
+                let s = r.get(&session_id)?;
+                // project_name + worktree_name → App 上の WorktreeId を探す
+                let project_name = s.project_name.clone();
+                let worktree_name = s.worktree_name.clone();
+                Some((project_name, worktree_name))
+            });
+            if let Some((project_name, worktree_name)) = wt_info {
+                if let Some(wt_id) = app.find_worktree_id(&project_name, &worktree_name) {
+                    if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                        match state {
+                            session::SessionState::Working => {
+                                wt.status = app::WorktreeStatus::Working;
+                            }
+                            session::SessionState::Waiting => {
+                                wt.status = app::WorktreeStatus::Waiting;
+                            }
+                            session::SessionState::Idle => {
+                                // hook の idle は応答完了 → Done
+                                // (Thinking/Working/Waiting からの遷移のみ)
+                                if matches!(
+                                    wt.status,
+                                    app::WorktreeStatus::Thinking
+                                        | app::WorktreeStatus::Working
+                                        | app::WorktreeStatus::Waiting
+                                ) {
+                                    wt.status = app::WorktreeStatus::Done;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
         AppEvent::RefreshChanges => {
             // Claude Code の hook 経由で Changes を再読み込み
@@ -1858,7 +1907,7 @@ async fn send_to_claude(
         if let Err(e) = session.send_message(message).await {
             app.show_error(format!("メッセージ送信失敗: {}", e));
         } else if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-            wt.status = app::WorktreeStatus::Running;
+            wt.status = app::WorktreeStatus::Thinking;
         }
     } else {
         // 新規セッションを起動（前回の session_id があれば再開を試行）
@@ -1885,7 +1934,7 @@ async fn send_to_claude(
                 if let Err(e) = session.send_message(message).await {
                     app.show_error(format!("メッセージ送信失敗: {}", e));
                 } else if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    wt.status = app::WorktreeStatus::Running;
+                    wt.status = app::WorktreeStatus::Thinking;
                 }
                 sessions.insert(wt_id, session);
             }
@@ -2513,6 +2562,12 @@ fn handle_left_panel_key(
             if let Some(wt_id) = left_panel.select_worktree(&entries) {
                 app.selected_worktree = Some(wt_id);
                 app.focused_panel = app::Panel::Main;
+                // Done 状態をクリア（クリックで消える仕様）
+                if let Some(wt) = app.worktree_by_id_mut(wt_id) {
+                    if wt.status == app::WorktreeStatus::Done {
+                        wt.status = app::WorktreeStatus::Idle;
+                    }
+                }
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                 let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
@@ -5439,7 +5494,7 @@ mod tests {
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
+        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Thinking;
 
         handle_event(
             &mut app,
@@ -5464,7 +5519,7 @@ mod tests {
 
         assert_eq!(
             app.worktree_by_id((0, 0)).unwrap().status,
-            app::WorktreeStatus::Idle
+            app::WorktreeStatus::Done
         );
     }
 
@@ -5482,7 +5537,7 @@ mod tests {
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
+        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Thinking;
 
         handle_event(
             &mut app,

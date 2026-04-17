@@ -9,7 +9,6 @@ pub mod syntax;
 
 use crate::app::{App, Panel};
 use crate::selection::SelectionPanel;
-use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -44,13 +43,13 @@ pub fn render(
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
     siki_init_screen: Option<&vt100::Screen>,
-    session_registry: Option<&SessionRegistry>,
+    blink_visible: bool,
     grep_rows: &[grep_view::DisplayRow],
 ) -> layout::AppLayout {
     let areas = layout::compute_layout(frame.area());
 
     // 左パネル
-    left_panel.render(frame, areas.left, app, app.focused_panel == Panel::Left, session_registry);
+    left_panel.render(frame, areas.left, app, app.focused_panel == Panel::Left, blink_visible);
 
     // 中央パネル
     main_panel::render(
