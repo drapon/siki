@@ -46,6 +46,12 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct SikiConfig {
     pub shell: Option<String>,
+    /// デフォルトの LLM CLI コマンド（例: "claude", "aider", "codex"）
+    #[serde(default)]
+    pub llm: Option<String>,
+    /// 利用可能な LLM CLI コマンドの一覧（Ctrl+t ピッカーで表示）
+    #[serde(default)]
+    pub llms: Vec<String>,
     #[serde(default)]
     pub shared_dirs: Vec<String>,
     /// グローバルデフォルトのベースブランチ（例: "origin/main"）
@@ -80,6 +86,8 @@ pub fn load_config(path: &Path) -> Result<Config> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config {
             siki: SikiConfig {
                 shell: None,
+                llm: None,
+                llms: vec![],
                 shared_dirs: vec![],
                 base_branch: None,
             },
@@ -763,6 +771,24 @@ pub fn resolve_shell(config: &Config) -> String {
         .unwrap_or_else(detect_default_shell)
 }
 
+/// 設定からデフォルトの LLM コマンドを取得（未指定時は "claude"）
+pub fn resolve_llm(config: &Config) -> String {
+    config
+        .siki
+        .llm
+        .clone()
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+/// 利用可能な LLM コマンド一覧を取得（未設定時はデフォルト LLM のみ）
+pub fn resolve_llms(config: &Config) -> Vec<String> {
+    if config.siki.llms.is_empty() {
+        vec![resolve_llm(config)]
+    } else {
+        config.siki.llms.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,8 +924,7 @@ worktrees = [
         let config = Config {
             siki: SikiConfig {
                 shell: Some("/usr/local/bin/fish".to_string()),
-                shared_dirs: vec![],
-                base_branch: None,
+                ..Default::default()
             },
             projects: vec![],
         };
@@ -911,8 +936,7 @@ worktrees = [
         let config = Config {
             siki: SikiConfig {
                 shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
+                ..Default::default()
             },
             projects: vec![],
         };
@@ -994,7 +1018,7 @@ worktrees = [
             siki: SikiConfig {
                 shell: Some("/bin/zsh".to_string()),
                 shared_dirs: vec!["node_modules".to_string()],
-                base_branch: None,
+                ..Default::default()
             },
             projects: vec![ProjectConfig {
                 name: "myproject".to_string(),
@@ -1054,11 +1078,7 @@ worktrees = [
     #[test]
     fn test_save_config_invalid_path() {
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![],
         };
         let result = save_config(Path::new("/nonexistent/dir/config.toml"), &config);

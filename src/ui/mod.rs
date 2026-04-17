@@ -139,6 +139,10 @@ pub fn render(
         render_siki_json_confirm_popup(frame);
     }
 
+    if app.show_llm_picker {
+        render_llm_picker_popup(frame, &app.available_llms, app.llm_picker_cursor);
+    }
+
     if app.show_session_choice {
         render_session_choice_popup(frame);
     }
@@ -194,6 +198,41 @@ pub fn render(
     }
 
     areas
+}
+
+fn render_llm_picker_popup(frame: &mut Frame, llms: &[String], cursor: usize) {
+    use ratatui::widgets::{Clear, List, ListItem, ListState};
+
+    let area = frame.area();
+    let item_count = llms.len() as u16;
+    let w = 30.min(area.width);
+    let h = (item_count + 2).min(area.height); // +2 for border
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup_area = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Select LLM")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let items: Vec<ListItem> = llms
+        .iter()
+        .map(|name| ListItem::new(format!(" {}", name)))
+        .collect();
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let mut state = ListState::default().with_selected(Some(cursor));
+    frame.render_stateful_widget(list, popup_area, &mut state);
 }
 
 fn render_session_choice_popup(frame: &mut Frame) {

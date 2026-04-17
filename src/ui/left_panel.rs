@@ -226,6 +226,7 @@ mod tests {
                         open_files: vec![],
                         active_tab: 0,
                         claude_tabs: 0,
+                        claude_tab_llm: Vec::new(),
                         right_panel_mode: RightPanelMode::Tree,
                         diff_focus: DiffFocus::PrDiff,
                         active_terminal: 0,
@@ -246,6 +247,7 @@ mod tests {
                         open_files: vec![],
                         active_tab: 0,
                         claude_tabs: 0,
+                        claude_tab_llm: Vec::new(),
                         right_panel_mode: RightPanelMode::Tree,
                         diff_focus: DiffFocus::PrDiff,
                         active_terminal: 0,
@@ -273,6 +275,7 @@ mod tests {
                     open_files: vec![],
                     active_tab: 0,
                     claude_tabs: 0,
+                    claude_tab_llm: Vec::new(),
                     right_panel_mode: RightPanelMode::Tree,
                     diff_focus: DiffFocus::PrDiff,
                     active_terminal: 0,
@@ -491,11 +494,7 @@ mod tests {
         use crate::config::{Config, SikiConfig, ProjectConfig, WorktreeConfig};
 
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![
                 ProjectConfig {
                     name: "webapp".to_string(),
@@ -528,11 +527,7 @@ mod tests {
         use crate::config::{Config, SikiConfig, ProjectConfig, WorktreeConfig};
 
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![ProjectConfig {
                 name: "webapp".to_string(),
                 path: "/tmp/webapp".to_string(),
