@@ -59,6 +59,11 @@ pub enum AppEvent {
         project_index: usize,
         branches: Vec<String>,
     },
+    /// 全ブランチ一覧取得完了（ベースブランチ選択用）
+    AllBranches {
+        project_index: usize,
+        branches: Vec<String>,
+    },
     /// スキル整形完了（claude -c の結果）
     SkillRefineResult(Result<String, String>),
     /// コンテキスト整形完了（claude -p の結果）

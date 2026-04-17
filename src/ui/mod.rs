@@ -483,8 +483,38 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
             lines.push(format!("  ブランチ: {}_", app.add_worktree_input));
         }
         AddWorktreeMode::FromBase => {
-            lines.push(format!("  ベース: {}", app.add_worktree_base_branch));
+            // 選択中のベースブランチを表示
+            let selected_base = app
+                .add_worktree_all_branches
+                .get(app.add_worktree_base_cursor)
+                .map(|s| s.as_str())
+                .unwrap_or(&app.add_worktree_base_branch);
+            lines.push(format!("  ベース: {}", selected_base));
             lines.push(format!("  ブランチ: {}_", app.add_worktree_input));
+
+            if app.add_worktree_base_loading {
+                lines.push(format!(""));
+                lines.push(format!("  取得中..."));
+            } else if !app.add_worktree_all_branches.is_empty() {
+                lines.push(format!(""));
+
+                let branches = &app.add_worktree_all_branches;
+                let max_display = (area.height as usize).saturating_sub(lines.len() + 4);
+                let start = if app.add_worktree_base_cursor >= max_display {
+                    app.add_worktree_base_cursor - max_display + 1
+                } else {
+                    0
+                };
+
+                for (i, branch) in branches.iter().enumerate().skip(start).take(max_display) {
+                    let marker = if i == app.add_worktree_base_cursor {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!("  {} {}", marker, branch));
+                }
+            }
         }
         AddWorktreeMode::FromRemote => {
             if app.add_worktree_loading {
@@ -527,7 +557,13 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
     }
 
     lines.push(format!(""));
-    lines.push(format!("  Enter: 追加  Tab: モード  Esc: 閉じる"));
+    if app.add_worktree_mode == AddWorktreeMode::FromBase {
+        lines.push(format!(
+            "  Enter: 追加  ↑↓: ベース選択  Tab: モード  Esc: 閉じる"
+        ));
+    } else {
+        lines.push(format!("  Enter: 追加  Tab: モード  Esc: 閉じる"));
+    }
 
     let text = lines.join("\n");
     let paragraph = Paragraph::new(text).block(block);

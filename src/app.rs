@@ -262,6 +262,12 @@ pub struct App {
     pub add_worktree_branch_cursor: usize,
     pub add_worktree_loading: bool,
     pub add_worktree_base_branch: String,
+    /// FromBase モード: ベースブランチ選択用の全ブランチ一覧（ローカル+リモート）
+    pub add_worktree_all_branches: Vec<String>,
+    /// FromBase モード: ベースブランチ一覧のカーソル位置
+    pub add_worktree_base_cursor: usize,
+    /// FromBase モード: ブランチ一覧読み込み中
+    pub add_worktree_base_loading: bool,
     pub show_add_project_popup: bool,
     pub add_project_input: String,
     pub show_grep_popup: bool,
@@ -424,6 +430,9 @@ impl App {
             add_worktree_branch_cursor: 0,
             add_worktree_loading: false,
             add_worktree_base_branch: "origin/main".to_string(),
+            add_worktree_all_branches: Vec::new(),
+            add_worktree_base_cursor: 0,
+            add_worktree_base_loading: false,
             show_add_project_popup: false,
             add_project_input: String::new(),
             show_grep_popup: false,

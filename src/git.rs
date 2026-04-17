@@ -36,6 +36,19 @@ impl WorktreeManager {
                 .with_context(|| format!("ディレクトリの作成に失敗: {}", parent.display()))?;
         }
 
+        // リモート追跡ブランチの場合は事前に fetch して最新化
+        if let Some(sp) = start_point {
+            if sp.contains('/') {
+                // "origin/main" → remote="origin"
+                if let Some(remote) = sp.split('/').next() {
+                    let _ = Command::new("git")
+                        .args(["fetch", remote])
+                        .current_dir(project_path)
+                        .output();
+                }
+            }
+        }
+
         // git worktree add -b <branch> <path> [<start_point>]
         let mut args = vec!["worktree", "add", "-b", branch];
         let wt_path_str = worktree_path.to_string_lossy().to_string();
@@ -103,6 +116,41 @@ impl WorktreeManager {
             .lines()
             .map(|line| line.trim().to_string())
             .filter(|line| !line.is_empty() && !line.contains("HEAD ->"))
+            .collect();
+
+        Ok(branches)
+    }
+
+    /// ローカル+リモートブランチの一覧を取得する（ベースブランチ選択用）
+    pub fn list_all_branches(project_path: &Path) -> Result<Vec<String>> {
+        // fetch して最新状態に同期
+        let _ = Command::new("git")
+            .args(["fetch", "--prune"])
+            .current_dir(project_path)
+            .output();
+
+        let output = Command::new("git")
+            .args(["branch", "-a", "--no-color"])
+            .current_dir(project_path)
+            .output()
+            .context("git branch -a の実行に失敗")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git branch -a に失敗: {}", stderr.trim());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let branches: Vec<String> = stdout
+            .lines()
+            .map(|line| line.trim().trim_start_matches("* ").to_string())
+            .filter(|line| !line.is_empty() && !line.contains("HEAD ->"))
+            .map(|line| {
+                // remotes/origin/xxx → origin/xxx
+                line.strip_prefix("remotes/")
+                    .unwrap_or(&line)
+                    .to_string()
+            })
             .collect();
 
         Ok(branches)
