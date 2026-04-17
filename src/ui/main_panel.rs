@@ -4,6 +4,15 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use unicode_width::UnicodeWidthChar;
 
+/// コマンド名の先頭を大文字にする
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
 /// 中央パネルの描画
 pub fn render(
     frame: &mut Frame,
@@ -15,10 +24,17 @@ pub fn render(
 ) {
     // worktree の情報を先に取得（借用の衝突回避）
     let wt_info = app.selected_worktree().map(|wt| {
-        (wt.active_tab, wt.claude_tabs, wt.open_files.len())
+        let current_llm_name = if wt.active_tab < wt.claude_tabs {
+            wt.claude_tab_llm.get(wt.active_tab)
+                .map(|s| capitalize_first(s))
+                .unwrap_or_else(|| "Claude".to_string())
+        } else {
+            "Claude".to_string()
+        };
+        (wt.active_tab, wt.claude_tabs, wt.open_files.len(), current_llm_name)
     });
 
-    let Some((active_tab, claude_tabs, _open_file_count)) = wt_info else {
+    let Some((active_tab, claude_tabs, _open_file_count, current_llm_name)) = wt_info else {
         app.claude_content_area = None;
         // worktree 未選択時
         let block = panel_block("Main", focused);
@@ -47,7 +63,7 @@ pub fn render(
     // タブバー描画（Search タブを含む）
     let has_search = app.show_grep_results_view;
     if let Some(wt) = app.selected_worktree() {
-        render_tab_bar(frame, chunks[1], wt.active_tab, wt.claude_tabs, &wt.open_files, has_search, focused);
+        render_tab_bar(frame, chunks[1], wt.active_tab, wt.claude_tabs, &wt.claude_tab_llm, &wt.open_files, has_search, focused);
     }
 
     // コンテンツ描画
@@ -63,10 +79,10 @@ pub fn render(
         // Claude タブ
         app.file_content_area = None;
         if let Some(screen) = claude_screen {
-            render_claude_terminal(frame, chunks[2], screen, focused, app);
+            render_claude_terminal(frame, chunks[2], screen, focused, app, &current_llm_name);
         } else {
             app.claude_content_area = None;
-            let block = panel_block("Claude Code", focused);
+            let block = panel_block(&current_llm_name, focused);
             frame.render_widget(
                 Paragraph::new("起動中...")
                     .block(block)
@@ -135,11 +151,12 @@ fn render_tab_bar(
     area: Rect,
     active_tab: usize,
     claude_tabs: usize,
+    claude_tab_llm: &[String],
     open_files: &[OpenFile],
     has_search: bool,
     focused: bool,
 ) {
-    let titles = build_tab_titles(claude_tabs, open_files, has_search);
+    let titles = build_tab_titles(claude_tabs, claude_tab_llm, open_files, has_search);
 
     let tabs = Tabs::new(titles)
         .select(active_tab)
@@ -158,18 +175,19 @@ fn render_tab_bar(
     frame.render_widget(tabs, area);
 }
 
-/// Claude Code ターミナルを描画
+/// LLM ターミナルを描画
 fn render_claude_terminal(
     frame: &mut Frame,
     area: Rect,
     screen: &vt100::Screen,
     focused: bool,
     app: &mut App,
+    llm_name: &str,
 ) {
     let title = if focused {
-        "Claude Code (Ctrl+\\ exit)"
+        format!("{} (Ctrl+\\ exit)", llm_name)
     } else {
-        "Claude Code"
+        llm_name.to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -552,7 +570,7 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
 /// タブバーのクリック位置からタブインデックスを返す
 pub fn tab_index_at(app: &App, area_x: u16, click_x: u16) -> Option<usize> {
     let wt = app.selected_worktree()?;
-    let titles = build_tab_titles(wt.claude_tabs, &wt.open_files, app.show_grep_results_view);
+    let titles = build_tab_titles(wt.claude_tabs, &wt.claude_tab_llm, &wt.open_files, app.show_grep_results_view);
     let rel_x = click_x.saturating_sub(area_x) as usize;
     let mut pos: usize = 0;
     for (i, title) in titles.iter().enumerate() {
@@ -567,13 +585,17 @@ pub fn tab_index_at(app: &App, area_x: u16, click_x: u16) -> Option<usize> {
 }
 
 /// タブタイトル一覧を構築する (render_tab_bar と共通ロジック)
-fn build_tab_titles(claude_tabs: usize, open_files: &[OpenFile], has_search: bool) -> Vec<String> {
+fn build_tab_titles(claude_tabs: usize, claude_tab_llm: &[String], open_files: &[OpenFile], has_search: bool) -> Vec<String> {
     let mut titles: Vec<String> = (0..claude_tabs)
         .map(|i| {
+            let name = claude_tab_llm
+                .get(i)
+                .map(|s| capitalize_first(s))
+                .unwrap_or_else(|| "Claude".to_string());
             if claude_tabs == 1 {
-                "Claude".to_string()
+                name
             } else {
-                format!("Claude {}", i + 1)
+                format!("{} {}", name, i + 1)
             }
         })
         .collect();
@@ -887,11 +909,7 @@ mod tests {
 
     fn app_with_worktree() -> App {
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![ProjectConfig {
                 name: "test".to_string(),
                 path: "/tmp/test".to_string(),
@@ -1295,11 +1313,7 @@ mod tests {
     #[test]
     fn test_next_tab_no_selected_worktree() {
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![],
         };
         let mut app = App::new(&config);
@@ -1309,11 +1323,7 @@ mod tests {
     #[test]
     fn test_scroll_no_selected_worktree() {
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![],
         };
         let mut app = App::new(&config);

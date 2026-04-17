@@ -395,20 +395,53 @@ async fn handle_event(
                 }
                 return;
             }
+            if app.show_llm_picker {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if app.llm_picker_cursor > 0 {
+                            app.llm_picker_cursor -= 1;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if app.llm_picker_cursor + 1 < app.available_llms.len() {
+                            app.llm_picker_cursor += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        app.show_llm_picker = false;
+                        let llm = app.available_llms[app.llm_picker_cursor].clone();
+                        if let Some(wt_id) = app.llm_picker_wt_id.take() {
+                            if llm == "claude" && has_active_sessions(session_registry, app, wt_id) {
+                                app.show_session_choice = true;
+                                app.session_choice_wt_id = Some(wt_id);
+                            } else {
+                                launch_llm(app, claude_terms, event_tx, wt_id, &llm);
+                            }
+                        }
+                    }
+                    KeyCode::Esc => {
+                        app.show_llm_picker = false;
+                        app.llm_picker_wt_id = None;
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if app.show_session_choice {
                 match key.code {
                     KeyCode::Char('1') | KeyCode::Enter | KeyCode::Esc => {
                         // Start new（デフォルト）
                         app.show_session_choice = false;
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
-                            launch_claude(app, claude_terms, event_tx, wt_id);
+                            let llm = app.default_llm.clone();
+                            launch_llm(app, claude_terms, event_tx, wt_id, &llm);
                         }
                     }
                     KeyCode::Char('2') => {
                         // Resume session - インタラクティブ選択で過去セッションから選ぶ
                         app.show_session_choice = false;
                         if let Some(wt_id) = app.session_choice_wt_id.take() {
-                            launch_claude_with_args(app, claude_terms, event_tx, wt_id, &["-r"]);
+                            launch_llm_with_args(app, claude_terms, event_tx, wt_id, "claude", &["-r"]);
                         }
                     }
                     KeyCode::Char('3') => {
@@ -1034,7 +1067,8 @@ async fn handle_event(
                                                 .map(|wt| wt.claude_tabs > 0)
                                                 .unwrap_or(false);
                                             if !has_claude {
-                                                launch_claude(app, claude_terms, event_tx, wt_id);
+                                                let llm = app.default_llm.clone();
+                                                launch_llm(app, claude_terms, event_tx, wt_id, &llm);
                                             }
                                             if !terminals.contains_key(&(wt_id, 0)) {
                                                 spawn_terminal(app, terminals, event_tx, shell, wt_id, 0);
@@ -1280,7 +1314,8 @@ async fn handle_event(
                     summary
                 )
             };
-            launch_claude_with_args(app, claude_terms, event_tx, worktree_id, &[&prompt]);
+            let llm = app.default_llm.clone();
+            launch_llm_with_args(app, claude_terms, event_tx, worktree_id, &llm, &[&prompt]);
         }
         AppEvent::Paste(text) => {
             // siki.json 作成オーバーレイ表示中
@@ -1803,6 +1838,7 @@ fn finalize_add_worktree(
         open_files: Vec::new(),
         active_tab: 0,
         claude_tabs: 0,
+        claude_tab_llm: Vec::new(),
         right_panel_mode: app::RightPanelMode::Tree,
         diff_focus: app::DiffFocus::PrDiff,
         active_terminal: 0,
@@ -2547,7 +2583,8 @@ fn handle_left_panel_key(
                     .map(|wt| wt.claude_tabs > 0)
                     .unwrap_or(false);
                 if !has_claude {
-                    launch_claude(app, claude_terms, event_tx, wt_id);
+                    let llm = app.default_llm.clone();
+                    launch_llm(app, claude_terms, event_tx, wt_id, &llm);
                 }
                 if !terminals.contains_key(&(wt_id, 0)) {
                     spawn_terminal(app, terminals, event_tx, shell, wt_id, 0);
@@ -2620,7 +2657,8 @@ fn handle_main_panel_key(
                     app.show_session_choice = true;
                     app.session_choice_wt_id = Some(wt_id);
                 } else {
-                    launch_claude(app, claude_terms, event_tx, wt_id);
+                    let llm = app.default_llm.clone();
+                    launch_llm(app, claude_terms, event_tx, wt_id, &llm);
                 }
             }
         }
@@ -4304,29 +4342,33 @@ fn clear_done_badges(
     }
 }
 
-fn launch_claude(
+fn launch_llm(
     app: &mut app::App,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     wt_id: app::WorktreeId,
+    llm_command: &str,
 ) {
-    launch_claude_with_args(app, claude_terms, event_tx, wt_id, &[]);
+    launch_llm_with_args(app, claude_terms, event_tx, wt_id, llm_command, &[]);
 }
 
-fn launch_claude_with_args(
+fn launch_llm_with_args(
     app: &mut app::App,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     wt_id: app::WorktreeId,
+    llm_command: &str,
     args: &[&str],
 ) {
     let project_path = app.worktree_by_id(wt_id).unwrap().path.clone();
     let project_name = app.projects[wt_id.0].name.clone();
 
-    // worktree に siki 用 hook を注入
-    let sock = config::sock_path();
-    if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock, &project_name) {
-        app.show_error(format!("hook 注入に失敗: {}", e));
+    // Hook 注入は Claude の場合のみ
+    if llm_command == "claude" {
+        let sock = config::sock_path();
+        if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock, &project_name) {
+            app.show_error(format!("hook 注入に失敗: {}", e));
+        }
     }
     let claude_idx = app
         .worktree_by_id(wt_id)
@@ -4335,7 +4377,7 @@ fn launch_claude_with_args(
     let size = (80, 24);
 
     let result = terminal::TerminalEmulator::with_args(
-        "claude",
+        llm_command,
         args,
         &project_path,
         size,
@@ -4350,10 +4392,11 @@ fn launch_claude_with_args(
             if let Some(wt) = app.worktree_by_id_mut(wt_id) {
                 wt.active_tab = wt.claude_tabs;
                 wt.claude_tabs += 1;
+                wt.claude_tab_llm.push(llm_command.to_string());
             }
         }
         Err(e) => {
-            app.show_error(format!("Claude Code 起動失敗: {}", e));
+            app.show_error(format!("{} 起動失敗: {}", llm_command, e));
         }
     }
 }
@@ -4397,6 +4440,10 @@ fn handle_claude_terminal_key(
         if let Some(wt) = app.worktree_by_id_mut(wt_id) {
             if wt.claude_tabs > 0 {
                 wt.claude_tabs -= 1;
+                // claude_tab_llm からも削除
+                if active_tab < wt.claude_tab_llm.len() {
+                    wt.claude_tab_llm.remove(active_tab);
+                }
                 // 閉じたタブより後ろの Claude ターミナルのキーをシフト
                 for i in active_tab..wt.claude_tabs {
                     if let Some(emu) = claude_terms.remove(&(wt_id, i + 1)) {
@@ -4413,13 +4460,19 @@ fn handle_claude_terminal_key(
         return;
     }
 
-    // Ctrl+t で新しい Claude タブを追加（アクティブセッションチェック付き）
+    // Ctrl+t で新しい LLM タブを追加
     if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if has_active_sessions(session_registry, app, wt_id) {
+        if app.available_llms.len() > 1 {
+            // 複数 LLM が設定されている場合はピッカーを表示
+            app.show_llm_picker = true;
+            app.llm_picker_cursor = 0;
+            app.llm_picker_wt_id = Some(wt_id);
+        } else if has_active_sessions(session_registry, app, wt_id) {
             app.show_session_choice = true;
             app.session_choice_wt_id = Some(wt_id);
         } else {
-            launch_claude(app, claude_terms, event_tx, wt_id);
+            let llm = app.default_llm.clone();
+            launch_llm(app, claude_terms, event_tx, wt_id, &llm);
         }
         return;
     }
@@ -4433,9 +4486,9 @@ fn handle_claude_terminal_key(
         return;
     }
 
-    // Ctrl+r で claude -r（セッション再開）タブを追加
+    // Ctrl+r で claude -r（セッション再開）タブを追加（Claude 専用）
     if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        launch_claude_with_args(app, claude_terms, event_tx, wt_id, &["-r"]);
+        launch_llm_with_args(app, claude_terms, event_tx, wt_id, "claude", &["-r"]);
         return;
     }
 
@@ -4769,8 +4822,7 @@ mod tests {
         Config {
             siki: SikiConfig {
                 shell: Some("/bin/sh".to_string()),
-                shared_dirs: vec![],
-                base_branch: None,
+                ..Default::default()
             },
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
@@ -4788,8 +4840,7 @@ mod tests {
         Config {
             siki: SikiConfig {
                 shell: Some("/bin/sh".to_string()),
-                shared_dirs: vec![],
-                base_branch: None,
+                ..Default::default()
             },
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),
@@ -6134,8 +6185,7 @@ mod tests {
         let config = Config {
             siki: SikiConfig {
                 shell: Some("/bin/sh".to_string()),
-                shared_dirs: vec![],
-                base_branch: None,
+                ..Default::default()
             },
             projects: vec![ProjectConfig {
                 name: "test-project".to_string(),

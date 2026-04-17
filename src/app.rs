@@ -211,6 +211,8 @@ pub struct Worktree {
     pub active_tab: usize,
     /// 起動中の Claude Code タブ数（タブ 0..claude_tabs-1 が Claude）
     pub claude_tabs: usize,
+    /// 各 Claude タブで使用している LLM コマンド名
+    pub claude_tab_llm: Vec<String>,
     pub right_panel_mode: RightPanelMode,
     /// Changes モード内のフォーカス位置
     pub diff_focus: DiffFocus,
@@ -356,6 +358,16 @@ pub struct App {
     pub show_session_choice: bool,
     /// セッション選択対象の worktree ID
     pub session_choice_wt_id: Option<WorktreeId>,
+    /// LLM 選択ピッカー表示フラグ
+    pub show_llm_picker: bool,
+    /// LLM ピッカーのカーソル位置
+    pub llm_picker_cursor: usize,
+    /// LLM ピッカー対象の worktree ID
+    pub llm_picker_wt_id: Option<WorktreeId>,
+    /// 利用可能な LLM コマンド一覧（config から読み込み）
+    pub available_llms: Vec<String>,
+    /// デフォルトの LLM コマンド
+    pub default_llm: String,
     /// プロジェクト表示名変更ポップアップ
     pub show_rename_project_popup: bool,
     pub rename_project_input: String,
@@ -466,6 +478,11 @@ impl App {
             context_url_spinner: 0,
             show_session_choice: false,
             session_choice_wt_id: None,
+            show_llm_picker: false,
+            llm_picker_cursor: 0,
+            llm_picker_wt_id: None,
+            available_llms: config::resolve_llms(config),
+            default_llm: config::resolve_llm(config),
             show_rename_project_popup: false,
             rename_project_input: String::new(),
             rename_project_name: None,
@@ -652,6 +669,7 @@ impl Project {
                 open_files: Vec::new(),
                 active_tab: 0,
                 claude_tabs: 0,
+                claude_tab_llm: Vec::new(),
                 right_panel_mode: RightPanelMode::Tree,
                 diff_focus: DiffFocus::PrDiff,
                 active_terminal: 0,
@@ -685,7 +703,7 @@ mod tests {
             siki: SikiConfig {
                 shell: Some("/bin/zsh".to_string()),
                 shared_dirs: vec!["node_modules".to_string()],
-                base_branch: None,
+                ..Default::default()
             },
             projects: vec![
                 ProjectConfig {
@@ -864,11 +882,7 @@ mod tests {
     #[test]
     fn test_empty_projects_config() {
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![],
         };
         let app = App::new(&config);

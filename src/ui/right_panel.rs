@@ -151,11 +151,7 @@ mod tests {
 
     fn app_with_worktree() -> App {
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![ProjectConfig {
                 name: "test".to_string(),
                 path: "/tmp/test".to_string(),
@@ -201,11 +197,7 @@ mod tests {
     #[test]
     fn test_toggle_mode_no_worktree() {
         let config = Config {
-            siki: SikiConfig {
-                shell: None,
-                shared_dirs: vec![],
-                base_branch: None,
-            },
+            siki: SikiConfig::default(),
             projects: vec![],
         };
         let mut app = App::new(&config);
