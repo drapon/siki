@@ -24,10 +24,17 @@ pub fn render(
 ) {
     // worktree の情報を先に取得（借用の衝突回避）
     let wt_info = app.selected_worktree().map(|wt| {
-        (wt.active_tab, wt.claude_tabs, wt.open_files.len())
+        let current_llm_name = if wt.active_tab < wt.claude_tabs {
+            wt.claude_tab_llm.get(wt.active_tab)
+                .map(|s| capitalize_first(s))
+                .unwrap_or_else(|| "Claude".to_string())
+        } else {
+            "Claude".to_string()
+        };
+        (wt.active_tab, wt.claude_tabs, wt.open_files.len(), current_llm_name)
     });
 
-    let Some((active_tab, claude_tabs, _open_file_count)) = wt_info else {
+    let Some((active_tab, claude_tabs, _open_file_count, current_llm_name)) = wt_info else {
         app.claude_content_area = None;
         // worktree 未選択時
         let block = panel_block("Main", focused);
@@ -72,10 +79,10 @@ pub fn render(
         // Claude タブ
         app.file_content_area = None;
         if let Some(screen) = claude_screen {
-            render_claude_terminal(frame, chunks[2], screen, focused, app);
+            render_claude_terminal(frame, chunks[2], screen, focused, app, &current_llm_name);
         } else {
             app.claude_content_area = None;
-            let block = panel_block("Claude Code", focused);
+            let block = panel_block(&current_llm_name, focused);
             frame.render_widget(
                 Paragraph::new("起動中...")
                     .block(block)
@@ -168,18 +175,19 @@ fn render_tab_bar(
     frame.render_widget(tabs, area);
 }
 
-/// Claude Code ターミナルを描画
+/// LLM ターミナルを描画
 fn render_claude_terminal(
     frame: &mut Frame,
     area: Rect,
     screen: &vt100::Screen,
     focused: bool,
     app: &mut App,
+    llm_name: &str,
 ) {
     let title = if focused {
-        "Claude Code (Ctrl+\\ exit)"
+        format!("{} (Ctrl+\\ exit)", llm_name)
     } else {
-        "Claude Code"
+        llm_name.to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
