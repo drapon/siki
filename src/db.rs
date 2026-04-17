@@ -13,6 +13,8 @@ pub fn init(db_path: &Path) -> Result<Connection> {
 
     // WAL モードを有効化（並行アクセス対応）
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    // 複数プロセスからの同時書き込み時にリトライする（最大5秒）
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
 
     conn.execute_batch(
         "
