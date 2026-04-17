@@ -1254,6 +1254,18 @@ async fn handle_event(
                 app.add_worktree_branch_cursor = 0;
             }
         }
+        AppEvent::AllBranches { project_index, branches } => {
+            if project_index == app.add_worktree_project_index {
+                // デフォルトベースブランチの位置にカーソルを合わせる
+                let default_pos = branches
+                    .iter()
+                    .position(|b| *b == app.add_worktree_base_branch)
+                    .unwrap_or(0);
+                app.add_worktree_all_branches = branches;
+                app.add_worktree_base_loading = false;
+                app.add_worktree_base_cursor = default_pos;
+            }
+        }
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
@@ -1650,6 +1662,28 @@ fn handle_add_worktree_popup_key(
         }
         KeyCode::Tab | KeyCode::BackTab => {
             app.add_worktree_mode = app.add_worktree_mode.next();
+            // FromBase に切り替えたとき、ブランチ一覧が未取得なら非同期取得
+            if app.add_worktree_mode == app::AddWorktreeMode::FromBase
+                && app.add_worktree_all_branches.is_empty()
+                && !app.add_worktree_base_loading
+            {
+                app.add_worktree_base_loading = true;
+                let pi = app.add_worktree_project_index;
+                let project_path = app.projects[pi].path.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let branches = tokio::task::spawn_blocking(move || {
+                        git::WorktreeManager::list_all_branches(&project_path)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let _ = tx.send(event::AppEvent::AllBranches {
+                        project_index: pi,
+                        branches,
+                    });
+                });
+            }
             // FromRemote に切り替えたとき、ブランチ一覧が未取得なら非同期取得
             if app.add_worktree_mode == app::AddWorktreeMode::FromRemote
                 && app.add_worktree_remote_branches.is_empty()
@@ -1675,20 +1709,32 @@ fn handle_add_worktree_popup_key(
         }
         KeyCode::Enter => {
             match app.add_worktree_mode {
-                app::AddWorktreeMode::NewBranch | app::AddWorktreeMode::FromBase => {
+                app::AddWorktreeMode::NewBranch => {
                     let branch = app.add_worktree_input.trim().to_string();
                     if branch.is_empty() {
                         return;
                     }
-                    let start_point = if app.add_worktree_mode == app::AddWorktreeMode::FromBase {
-                        Some(app.add_worktree_base_branch.clone())
-                    } else {
-                        None
-                    };
                     finalize_add_worktree(
                         app, terminals, event_tx, shell,
                         &branch,
-                        start_point.as_deref(),
+                        None,
+                    );
+                }
+                app::AddWorktreeMode::FromBase => {
+                    let branch = app.add_worktree_input.trim().to_string();
+                    if branch.is_empty() {
+                        return;
+                    }
+                    // カーソル位置のブランチを start_point にする
+                    let start_point = app
+                        .add_worktree_all_branches
+                        .get(app.add_worktree_base_cursor)
+                        .cloned()
+                        .unwrap_or_else(|| app.add_worktree_base_branch.clone());
+                    finalize_add_worktree(
+                        app, terminals, event_tx, shell,
+                        &branch,
+                        Some(&start_point),
                     );
                 }
                 app::AddWorktreeMode::FromRemote => {
@@ -1722,6 +1768,9 @@ fn handle_add_worktree_popup_key(
             if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
                 app.add_worktree_branch_cursor =
                     app.add_worktree_branch_cursor.saturating_sub(1);
+            } else if app.add_worktree_mode == app::AddWorktreeMode::FromBase {
+                app.add_worktree_base_cursor =
+                    app.add_worktree_base_cursor.saturating_sub(1);
             }
         }
         KeyCode::Down => {
@@ -1738,6 +1787,12 @@ fn handle_add_worktree_popup_key(
                     app.add_worktree_branch_cursor =
                         (app.add_worktree_branch_cursor + 1).min(filtered_count - 1);
                 }
+            } else if app.add_worktree_mode == app::AddWorktreeMode::FromBase {
+                let count = app.add_worktree_all_branches.len();
+                if count > 0 {
+                    app.add_worktree_base_cursor =
+                        (app.add_worktree_base_cursor + 1).min(count - 1);
+                }
             }
         }
         KeyCode::Char(c) => {
@@ -1745,6 +1800,7 @@ fn handle_add_worktree_popup_key(
                 app.add_worktree_branch_filter.push(c);
                 app.add_worktree_branch_cursor = 0;
             } else {
+                // NewBranch / FromBase: ブランチ名入力
                 app.add_worktree_input.push(c);
             }
         }
@@ -2340,6 +2396,9 @@ fn handle_left_panel_key(
                 app.add_worktree_remote_branches.clear();
                 app.add_worktree_loading = false;
                 app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
+                app.add_worktree_all_branches.clear();
+                app.add_worktree_base_cursor = 0;
+                app.add_worktree_base_loading = false;
 
                 // base_branch を解決: siki.json > config.toml > "origin/main"
                 let project_name = &app.projects[pi].name;
