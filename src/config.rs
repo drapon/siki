@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// ~/.siki/ ディレクトリのパスを返す
@@ -223,6 +224,9 @@ pub struct ProjectMeta {
     /// プロジェクト個別の共有ディレクトリ（worktree にシンボリックリンクする）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_dirs: Option<Vec<String>>,
+    /// worktree ごとのメタデータ
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub worktrees: HashMap<String, WorktreeMeta>,
 }
 
 /// プロジェクトの project.json パスを返す
@@ -240,6 +244,7 @@ pub fn save_project_meta(project_name: &str, source_path: &Path) -> Result<()> {
         scripts: existing.as_ref().and_then(|m| m.scripts.clone()),
         base_branch: existing.as_ref().and_then(|m| m.base_branch.clone()),
         shared_dirs: existing.as_ref().and_then(|m| m.shared_dirs.clone()),
+        worktrees: existing.map(|m| m.worktrees).unwrap_or_default(),
     };
     let dir = workspaces_dir().join(project_name);
     std::fs::create_dir_all(&dir)
@@ -323,45 +328,94 @@ pub fn discover_symlink_candidates(project_path: &Path) -> Vec<String> {
 }
 
 /// worktree メタデータ
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorktreeMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 }
 
-/// worktree.json のパスを返す
-pub fn worktree_meta_path(project_name: &str, worktree_name: &str) -> PathBuf {
-    workspaces_dir()
-        .join(project_name)
-        .join(worktree_name)
-        .join("worktree.json")
-}
-
-/// worktree.json を読み込む
+/// worktree メタデータを project.json から読み込む
 pub fn load_worktree_meta(project_name: &str, worktree_name: &str) -> Option<WorktreeMeta> {
-    let path = worktree_meta_path(project_name, worktree_name);
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let meta = load_project_meta(project_name)?;
+    meta.worktrees.get(worktree_name).cloned()
 }
 
-/// worktree.json の display_name を更新する
+/// project.json 内の worktree display_name を更新する
 pub fn save_worktree_display_name(
     project_name: &str,
     worktree_name: &str,
     display_name: Option<&str>,
 ) -> Result<()> {
-    let meta = WorktreeMeta {
-        display_name: display_name.map(|s| s.to_string()),
-    };
-    let dir = workspaces_dir().join(project_name).join(worktree_name);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("worktree ディレクトリの作成に失敗: {}", dir.display()))?;
+    let meta_path = project_meta_path(project_name);
+    let mut meta = load_project_meta(project_name)
+        .ok_or_else(|| anyhow::anyhow!("project.json が見つかりません: {}", project_name))?;
+    if let Some(name) = display_name {
+        meta.worktrees.insert(
+            worktree_name.to_string(),
+            WorktreeMeta {
+                display_name: Some(name.to_string()),
+            },
+        );
+    } else {
+        meta.worktrees.remove(worktree_name);
+    }
     let content =
-        serde_json::to_string_pretty(&meta).context("worktree.json のシリアライズに失敗")?;
-    let path = worktree_meta_path(project_name, worktree_name);
-    std::fs::write(&path, content)
-        .with_context(|| format!("worktree.json の保存に失敗: {}", path.display()))?;
+        serde_json::to_string_pretty(&meta).context("project.json のシリアライズに失敗")?;
+    std::fs::write(&meta_path, content)
+        .with_context(|| format!("project.json の保存に失敗: {}", meta_path.display()))?;
     Ok(())
+}
+
+/// 既存の worktree.json を project.json に統合するマイグレーション
+pub fn migrate_worktree_meta(project_name: &str) {
+    let project_dir = workspaces_dir().join(project_name);
+    let sub_entries = match std::fs::read_dir(&project_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    let mut migrated = Vec::new();
+
+    for entry in sub_entries.flatten() {
+        let sub_path = entry.path();
+        if !sub_path.is_dir() {
+            continue;
+        }
+        let wt_json = sub_path.join("worktree.json");
+        if !wt_json.exists() {
+            continue;
+        }
+        let wt_name = match sub_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        if let Ok(content) = std::fs::read_to_string(&wt_json) {
+            if let Ok(wt_meta) = serde_json::from_str::<WorktreeMeta>(&content) {
+                if wt_meta.display_name.is_some() {
+                    migrated.push((wt_name, wt_meta, wt_json));
+                } else {
+                    // display_name が空なら削除のみ
+                    let _ = std::fs::remove_file(&wt_json);
+                }
+            }
+        }
+    }
+
+    if migrated.is_empty() {
+        return;
+    }
+
+    // project.json にマージ
+    if let Some(mut meta) = load_project_meta(project_name) {
+        for (wt_name, wt_meta, wt_json) in migrated {
+            meta.worktrees.entry(wt_name).or_insert(wt_meta);
+            let _ = std::fs::remove_file(&wt_json);
+        }
+        let meta_path = project_meta_path(project_name);
+        if let Ok(content) = serde_json::to_string_pretty(&meta) {
+            let _ = std::fs::write(&meta_path, content);
+        }
+    }
 }
 
 /// プロジェクトディレクトリ（project.json 含む）を削除する
@@ -413,6 +467,9 @@ pub fn discover_projects() -> Vec<ProjectConfig> {
             Some(name) => name.to_string(),
             None => continue,
         };
+
+        // 既存の worktree.json を project.json に統合するマイグレーション
+        migrate_worktree_meta(&project_name);
 
         // project.json からソースパスを取得、なければ worktree から推定
         let loaded_meta = load_project_meta(&project_name);
@@ -1019,6 +1076,7 @@ worktrees = [
             scripts: None,
             base_branch: None,
             shared_dirs: None,
+            worktrees: HashMap::new(),
         };
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let meta_path = dir.path().join("project.json");

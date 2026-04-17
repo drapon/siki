@@ -535,7 +535,7 @@ async fn handle_event(
                     // パネル固有のキー処理
                     match app.focused_panel {
                         app::Panel::Left => {
-                            handle_left_panel_key(app, left_panel, source_tree, diff_view, local_changes, terminals, claude_terms, event_tx, shell, key);
+                            handle_left_panel_key(app, left_panel, source_tree, diff_view, local_changes, terminals, claude_terms, event_tx, shell, key, session_registry);
                         }
                         app::Panel::Main => {
                             // Claude タブは上で早期 return 済みなのでここは非 Claude タブのみ
@@ -1022,6 +1022,8 @@ async fn handle_event(
                                             let wt_id = (*project_index, *worktree_index);
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
+                                            // Done バッジをクリア（既読）
+                                            clear_done_badges(session_registry, app, wt_id);
                                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                                             let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                             source_tree.load(&wt_path);
@@ -1446,13 +1448,16 @@ async fn handle_event(
             if app.context_url_fetching {
                 app.context_url_spinner = app.context_url_spinner.wrapping_add(1);
             }
-            // ハートビートタイムアウト: 15秒→Stale、30秒→Dead
+            // 点滅タイマー: 800ms周期（Tick 100ms × 8回）
+            app.blink_counter = app.blink_counter.wrapping_add(1);
+            if app.blink_counter >= 8 {
+                app.blink_counter = 0;
+                app.blink_phase = !app.blink_phase;
+            }
+            // 期限切れセッションのクリーンアップ（5分）
             if let Some(registry) = session_registry {
                 let mut reg = registry.lock().unwrap();
-                reg.expire_stale_sessions(
-                    std::time::Duration::from_secs(15),
-                    std::time::Duration::from_secs(30),
-                );
+                reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
             }
         }
     }
@@ -1794,7 +1799,6 @@ fn finalize_add_worktree(
         display_name: None,
         branch: branch.to_string(),
         path: wt_path.clone(),
-        status: app::WorktreeStatus::Idle,
         chat_history: Vec::new(),
         open_files: Vec::new(),
         active_tab: 0,
@@ -1857,8 +1861,6 @@ async fn send_to_claude(
         // 既存セッションにメッセージ送信
         if let Err(e) = session.send_message(message).await {
             app.show_error(format!("メッセージ送信失敗: {}", e));
-        } else if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-            wt.status = app::WorktreeStatus::Running;
         }
     } else {
         // 新規セッションを起動（前回の session_id があれば再開を試行）
@@ -1884,8 +1886,6 @@ async fn send_to_claude(
             Ok(mut session) => {
                 if let Err(e) = session.send_message(message).await {
                     app.show_error(format!("メッセージ送信失敗: {}", e));
-                } else if let Some(wt) = app.worktree_by_id_mut(wt_id) {
-                    wt.status = app::WorktreeStatus::Running;
                 }
                 sessions.insert(wt_id, session);
             }
@@ -2286,6 +2286,7 @@ fn handle_left_panel_key(
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     shell: &str,
     key: crossterm::event::KeyEvent,
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2532,6 +2533,8 @@ fn handle_left_panel_key(
             if let Some(wt_id) = left_panel.select_worktree(&entries) {
                 app.selected_worktree = Some(wt_id);
                 app.focused_panel = app::Panel::Main;
+                // Done バッジをクリア（既読）
+                clear_done_badges(session_registry, app, wt_id);
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                 let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
@@ -4110,6 +4113,9 @@ fn handle_archive_confirm_key(
                 // git worktree を削除
                 match git::WorktreeManager::remove_worktree(&project_path, &wt_path) {
                     Ok(()) => {
+                        // project.json から worktree メタデータを削除
+                        let _ = config::save_worktree_display_name(&app.projects[pi].name, &wt_name, None);
+
                         // メモリから worktree を削除
                         app.projects[pi].worktrees.remove(wi);
 
@@ -4280,7 +4286,22 @@ fn has_active_sessions(
     let project = &app.projects[wt_id.0].name;
     reg.by_worktree(project, &wt.name)
         .iter()
-        .any(|s| !matches!(s.state, session::SessionState::Dead | session::SessionState::Stale))
+        .any(|s| matches!(s.state, session::SessionState::Working | session::SessionState::Waiting))
+}
+
+/// worktree 選択時に Done セッションをクリアする（既読）
+fn clear_done_badges(
+    session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
+    app: &app::App,
+    wt_id: app::WorktreeId,
+) {
+    let Some(wt) = app.worktree_by_id(wt_id) else {
+        return;
+    };
+    let project = &app.projects[wt_id.0].name;
+    if let Some(mut reg) = session_registry.as_ref().and_then(|r| r.lock().ok()) {
+        reg.clear_done_sessions(project, &wt.name);
+    }
 }
 
 fn launch_claude(
@@ -5458,8 +5479,6 @@ mod tests {
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
-
         handle_event(
             &mut app,
             &mut left_panel,
@@ -5481,10 +5500,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            app.worktree_by_id((0, 0)).unwrap().status,
-            app::WorktreeStatus::Idle
-        );
+        // パニックしないことを確認（状態管理は SessionRegistry 側）
     }
 
     #[tokio::test]
@@ -5500,8 +5516,6 @@ mod tests {
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-
-        app.worktree_by_id_mut((0, 0)).unwrap().status = app::WorktreeStatus::Running;
 
         handle_event(
             &mut app,
@@ -5525,10 +5539,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            app.worktree_by_id((0, 0)).unwrap().status,
-            app::WorktreeStatus::Idle
-        );
         let msg = app.status_message.as_ref().unwrap();
         assert_eq!(msg.level, app::StatusLevel::Error);
         assert!(msg.text.contains("test error"));
@@ -6178,7 +6188,6 @@ mod tests {
         let new_wt = app.projects[0].worktrees.last().unwrap();
         assert_eq!(new_wt.name, "tokyo");
         assert_eq!(new_wt.branch, "feature/auth");
-        assert_eq!(new_wt.status, app::WorktreeStatus::Idle);
 
         // テスト後に作成された worktree をクリーンアップ
         let wt_path = config::worktree_path("test-project", "tokyo");
