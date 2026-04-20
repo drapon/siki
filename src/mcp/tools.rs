@@ -22,6 +22,7 @@ pub fn execute_tool(
         "get_context" => get_context(conn, params),
         "save_skill" => save_skill(params),
         "list_skills" => list_skills(params),
+        "summarize_history" => summarize_history(conn, params),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -90,9 +91,62 @@ fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
         None
     };
 
+    // Claude Code の会話履歴を読み込む（全セッション全文、サマライズ済み除外）
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let excluded = db::get_summarized_session_ids(conn, &cwd_str).unwrap_or_default();
+    let conversation_history = {
+        let history = crate::claude_history::load_worktree_history(&cwd, &excluded);
+        if history.is_empty() {
+            None
+        } else {
+            let items: Vec<Value> = history
+                .iter()
+                .map(|h| {
+                    let msgs: Vec<Value> = h
+                        .messages
+                        .iter()
+                        .map(|m| {
+                            json!({
+                                "role": m.role,
+                                "content": m.content,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "session_id": h.session_id,
+                        "timestamp": h.timestamp,
+                        "git_branch": h.git_branch,
+                        "messages": msgs,
+                    })
+                })
+                .collect();
+            Some(json!(items))
+        }
+    };
+
     let mut result = json!({ "sessions": items, "pending_messages": messages });
     if let Some(ctx) = worktree_contexts {
         result["worktree_contexts"] = ctx;
+    }
+    if let Some(ref hist) = conversation_history {
+        // 統計情報を追加（履歴の大きさを把握するため）
+        let total_sessions = hist.as_array().map(|a| a.len()).unwrap_or(0);
+        let total_messages: usize = hist
+            .as_array()
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .filter_map(|s| s.get("messages").and_then(|m| m.as_array()).map(|a| a.len()))
+                    .sum()
+            })
+            .unwrap_or(0);
+        let summarized_count = excluded.len();
+        result["conversation_history"] = hist.clone();
+        result["history_stats"] = json!({
+            "loaded_sessions": total_sessions,
+            "loaded_messages": total_messages,
+            "summarized_sessions": summarized_count,
+        });
     }
     Ok(result)
 }
@@ -298,6 +352,54 @@ fn run_git(cwd: &str, args: &[&str]) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+/// 会話履歴をサマライズして worktree_contexts に保存し、元セッションをマーク
+fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
+    let summary = params
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("summary is required"))?;
+    let session_ids = params
+        .get("session_ids")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("session_ids is required (array of session IDs to mark as summarized)"))?;
+
+    let ids: Vec<String> = session_ids
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+
+    if ids.is_empty() {
+        anyhow::bail!("session_ids must not be empty");
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd_str = cwd.to_string_lossy().to_string();
+
+    // worktree_contexts ディレクトリに要約を保存
+    if let Some((proj, wt)) = crate::config::detect_project_worktree_from_cwd(&cwd) {
+        let ctx_dir = crate::config::worktree_contexts_dir(&proj, &wt);
+        std::fs::create_dir_all(&ctx_dir)?;
+        let summary_path = ctx_dir.join("conversation-summary.md");
+
+        // 既存の要約があれば追記、なければ新規作成
+        let existing = std::fs::read_to_string(&summary_path).unwrap_or_default();
+        let new_content = if existing.is_empty() {
+            format!("# Conversation History Summary\n\n{}", summary)
+        } else {
+            format!("{}\n\n---\n\n{}", existing, summary)
+        };
+        std::fs::write(&summary_path, new_content)?;
+    }
+
+    // セッションをサマライズ済みとしてマーク
+    db::mark_sessions_summarized(conn, &ids, &cwd_str)?;
+
+    Ok(json!({
+        "summarized": ids.len(),
+        "session_ids": ids,
+    }))
 }
 
 /// スキル名のバリデーション（英数字・ハイフン・アンダースコアのみ）
