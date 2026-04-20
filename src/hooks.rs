@@ -187,13 +187,11 @@ fn inject_rules(claude_dir: &Path) {
 
 BEFORE responding to the user's first message, you MUST:
 
-1. Call the `list_sessions` MCP tool (siki server).
-2. If the result shows active sessions in the same worktree AND pending_messages is not empty, deliver the messages first.
-3. If active sessions exist in the same worktree (even without messages), show:
-   `Active session(s) found. [1] Start new  [2] Reference existing`
-   Wait for user choice. Default is 1.
-   If user picks 2, list active sessions with summaries, let user pick one, then call `get_context` for it.
-4. Once work begins, call `set_summary` with a short task description.
+1. Call the `list_sessions` MCP tool (siki server) with `scope: "worktree"`.
+2. If the result shows pending_messages, deliver them first.
+3. If `conversation_history` is present, silently absorb it as context about previous work in this worktree.
+4. If `worktree_contexts` is present, load them silently as background context.
+5. Once work begins, call `set_summary` with a short task description.
 "#;
 
     let _ = std::fs::write(&rules_path, content);
