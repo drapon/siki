@@ -51,6 +51,18 @@ pub fn init(db_path: &Path) -> Result<Connection> {
         "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT;",
     );
 
+    // サマライズ済みセッション追跡テーブル
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS summarized_sessions (
+            claude_jsonl_session_id TEXT NOT NULL,
+            worktree_cwd TEXT NOT NULL,
+            summarized_at INTEGER NOT NULL,
+            PRIMARY KEY (claude_jsonl_session_id, worktree_cwd)
+        );
+        ",
+    )?;
+
     Ok(conn)
 }
 
@@ -272,6 +284,36 @@ pub struct MessageRow {
     pub message_type: String,
     pub metadata: Option<String>,
     pub created_at: i64,
+}
+
+/// サマライズ済みセッションIDを記録する
+pub fn mark_sessions_summarized(
+    conn: &Connection,
+    session_ids: &[String],
+    worktree_cwd: &str,
+) -> Result<()> {
+    let now = now_unix();
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO summarized_sessions (claude_jsonl_session_id, worktree_cwd, summarized_at) VALUES (?1, ?2, ?3)",
+    )?;
+    for id in session_ids {
+        stmt.execute(rusqlite::params![id, worktree_cwd, now])?;
+    }
+    Ok(())
+}
+
+/// 指定 worktree のサマライズ済みセッションIDを取得する
+pub fn get_summarized_session_ids(
+    conn: &Connection,
+    worktree_cwd: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT claude_jsonl_session_id FROM summarized_sessions WHERE worktree_cwd = ?1",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![worktree_cwd], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(ids)
 }
 
 fn now_unix() -> i64 {

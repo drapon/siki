@@ -186,6 +186,25 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["project_name"]
             }),
         },
+        ToolDefinition {
+            name: "summarize_history".to_string(),
+            description: "Summarize conversation history for this worktree. Call this manually when the conversation history has grown too large. Provide a summary text and the session IDs to mark as summarized. Summarized sessions will no longer be returned in full by list_sessions, replaced by the summary in worktree_contexts.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "The summary text of the conversation history"
+                    },
+                    "session_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Session IDs to mark as summarized (from conversation_history[].session_id)"
+                    }
+                },
+                "required": ["summary", "session_ids"]
+            }),
+        },
     ]
 }
 
@@ -220,7 +239,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
     }
 
     #[test]

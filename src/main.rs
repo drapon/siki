@@ -1,6 +1,7 @@
 mod app;
 mod broker;
 mod claude;
+mod claude_history;
 mod config;
 mod db;
 mod event;

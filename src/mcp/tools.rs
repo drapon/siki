@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::db;
@@ -22,6 +22,7 @@ pub fn execute_tool(
         "get_context" => get_context(conn, params),
         "save_skill" => save_skill(params),
         "list_skills" => list_skills(params),
+        "summarize_history" => summarize_history(conn, params),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -90,9 +91,65 @@ fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
         None
     };
 
+    // Claude Code の会話履歴を読み込む（全セッション全文、サマライズ済み除外）
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let excluded = db::get_summarized_session_ids(conn, &cwd_str).unwrap_or_default();
+    let conversation_history = {
+        let history = crate::claude_history::load_worktree_history(&cwd, &excluded);
+        if history.is_empty() {
+            None
+        } else {
+            let items: Vec<Value> = history
+                .iter()
+                .map(|h| {
+                    let msgs: Vec<Value> = h
+                        .messages
+                        .iter()
+                        .map(|m| {
+                            json!({
+                                "role": m.role,
+                                "content": m.content,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "session_id": h.session_id,
+                        "timestamp": h.timestamp,
+                        "git_branch": h.git_branch,
+                        "messages": msgs,
+                    })
+                })
+                .collect();
+            Some(json!(items))
+        }
+    };
+
     let mut result = json!({ "sessions": items, "pending_messages": messages });
     if let Some(ctx) = worktree_contexts {
         result["worktree_contexts"] = ctx;
+    }
+    if let Some(ref hist) = conversation_history {
+        // 統計情報を追加（履歴の大きさを把握するため）
+        let total_sessions = hist.as_array().map(|a| a.len()).unwrap_or(0);
+        let total_messages: usize = hist
+            .as_array()
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .filter_map(|s| s.get("messages").and_then(|m| m.as_array()).map(|a| a.len()))
+                    .sum()
+            })
+            .unwrap_or(0);
+        let summarized_count = excluded.len();
+        result["conversation_history"] = hist.clone();
+        // 500メッセージ超でサマライズを推奨
+        let summarize_recommended = total_messages > 500;
+        result["history_stats"] = json!({
+            "loaded_sessions": total_sessions,
+            "loaded_messages": total_messages,
+            "summarized_sessions": summarized_count,
+            "summarize_recommended": summarize_recommended,
+        });
     }
     Ok(result)
 }
@@ -298,6 +355,101 @@ fn run_git(cwd: &str, args: &[&str]) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+/// 会話履歴をサマライズして worktree_contexts に保存し、元セッションをマーク
+fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
+    let summary = params
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("summary is required"))?;
+    let session_ids = params
+        .get("session_ids")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("session_ids is required (array of session IDs to mark as summarized)"))?;
+
+    let ids: Vec<String> = session_ids
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+
+    if ids.is_empty() {
+        anyhow::bail!("session_ids must not be empty");
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd_str = cwd.to_string_lossy().to_string();
+
+    // worktree_contexts ディレクトリに要約を保存（ファイルが大きくなったら分割）
+    const MAX_FILE_SIZE: usize = 100_000; // 100KB per file
+
+    if let Some((proj, wt)) = crate::config::detect_project_worktree_from_cwd(&cwd) {
+        let ctx_dir = crate::config::worktree_contexts_dir(&proj, &wt);
+        std::fs::create_dir_all(&ctx_dir)?;
+
+        // 既存のサマリーファイルを探す（1回のスキャンで最新パスと次番号を取得）
+        let (latest_path, next_num) = scan_summary_files(&ctx_dir);
+        let existing = latest_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+
+        if existing.is_empty() {
+            // 新規作成
+            let path = ctx_dir.join("conversation-summary.md");
+            std::fs::write(&path, format!("# Conversation History Summary\n\n{}", summary))?;
+        } else if existing.len() + summary.len() > MAX_FILE_SIZE {
+            // ファイルが大きいので新しいファイルに分割
+            let path = ctx_dir.join(format!("conversation-summary-{}.md", next_num));
+            std::fs::write(&path, format!("# Conversation History Summary ({})\n\n{}", next_num, summary))?;
+        } else {
+            // 既存ファイルに追記
+            let path = latest_path.unwrap();
+            let new_content = format!("{}\n\n---\n\n{}", existing, summary);
+            std::fs::write(&path, new_content)?;
+        }
+    }
+
+    // セッションをサマライズ済みとしてマーク
+    db::mark_sessions_summarized(conn, &ids, &cwd_str)?;
+
+    Ok(json!({
+        "summarized": ids.len(),
+        "session_ids": ids,
+    }))
+}
+
+/// サマリーファイルをスキャンし、最新のファイルパスと次の番号を返す
+/// - 返り値: (最新ファイルのパス or None, 次に作成すべき番号)
+fn scan_summary_files(ctx_dir: &Path) -> (Option<PathBuf>, usize) {
+    let base = ctx_dir.join("conversation-summary.md");
+    if !base.exists() {
+        return (None, 2);
+    }
+
+    let mut max_existing = 0_usize; // 0 = ベースファイルのみ
+    if let Ok(entries) = std::fs::read_dir(ctx_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix("conversation-summary-") {
+                if let Some(num_str) = rest.strip_suffix(".md") {
+                    if let Ok(n) = num_str.parse::<usize>() {
+                        if n > max_existing {
+                            max_existing = n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if max_existing >= 2 {
+        let latest = ctx_dir.join(format!("conversation-summary-{}.md", max_existing));
+        (Some(latest), max_existing + 1)
+    } else {
+        (Some(base), 2)
+    }
 }
 
 /// スキル名のバリデーション（英数字・ハイフン・アンダースコアのみ）
@@ -523,5 +675,59 @@ mod tests {
         let params = json!({ "project_name": "nonexistent-project-12345" });
         let result = list_skills(&params).unwrap();
         assert_eq!(result["skills"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_scan_summary_files_no_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (latest, next) = scan_summary_files(dir.path());
+        assert!(latest.is_none());
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn test_scan_summary_files_base_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary").unwrap();
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary.md"));
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn test_scan_summary_files_with_numbered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary 1").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-2.md"), "# Summary 2").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-3.md"), "# Summary 3").unwrap();
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary-3.md"));
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn test_scan_summary_files_with_gap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary 1").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-5.md"), "# Summary 5").unwrap();
+        // gap: 2, 3, 4 are missing
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary-5.md"));
+        assert_eq!(next, 6);
+    }
+
+    #[test]
+    fn test_scan_summary_files_ignores_non_summary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary").unwrap();
+        std::fs::write(dir.path().join("other-file.md"), "other").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-abc.md"), "bad name").unwrap();
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary.md"));
+        assert_eq!(next, 2);
     }
 }
