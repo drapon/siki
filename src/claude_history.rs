@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -198,11 +199,13 @@ pub fn load_worktree_history(
     // 古い順（時系列順）
     jsonl_files.sort_by(|a, b| a.1.cmp(&b.1));
 
+    let excluded: HashSet<&str> = exclude_session_ids.iter().map(|s| s.as_str()).collect();
+
     jsonl_files
         .into_iter()
         .filter(|(path, _)| {
             let sid = session_id_from_path(path);
-            !exclude_session_ids.contains(&sid)
+            !excluded.contains(sid.as_str())
         })
         .filter_map(|(path, _)| parse_jsonl(&path))
         .collect()

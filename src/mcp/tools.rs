@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::db;
@@ -142,10 +142,13 @@ fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
             .unwrap_or(0);
         let summarized_count = excluded.len();
         result["conversation_history"] = hist.clone();
+        // 500メッセージ超でサマライズを推奨
+        let summarize_recommended = total_messages > 500;
         result["history_stats"] = json!({
             "loaded_sessions": total_sessions,
             "loaded_messages": total_messages,
             "summarized_sessions": summarized_count,
+            "summarize_recommended": summarize_recommended,
         });
     }
     Ok(result)
@@ -377,20 +380,35 @@ fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let cwd_str = cwd.to_string_lossy().to_string();
 
-    // worktree_contexts ディレクトリに要約を保存
+    // worktree_contexts ディレクトリに要約を保存（ファイルが大きくなったら分割）
+    const MAX_FILE_SIZE: usize = 100_000; // 100KB per file
+
     if let Some((proj, wt)) = crate::config::detect_project_worktree_from_cwd(&cwd) {
         let ctx_dir = crate::config::worktree_contexts_dir(&proj, &wt);
         std::fs::create_dir_all(&ctx_dir)?;
-        let summary_path = ctx_dir.join("conversation-summary.md");
 
-        // 既存の要約があれば追記、なければ新規作成
-        let existing = std::fs::read_to_string(&summary_path).unwrap_or_default();
-        let new_content = if existing.is_empty() {
-            format!("# Conversation History Summary\n\n{}", summary)
+        // 既存のサマリーファイルを探す（conversation-summary.md, conversation-summary-2.md, ...）
+        let latest_path = find_latest_summary_file(&ctx_dir);
+        let existing = latest_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+
+        if existing.is_empty() {
+            // 新規作成
+            let path = ctx_dir.join("conversation-summary.md");
+            std::fs::write(&path, format!("# Conversation History Summary\n\n{}", summary))?;
+        } else if existing.len() + summary.len() > MAX_FILE_SIZE {
+            // ファイルが大きいので新しいファイルに分割
+            let next_num = next_summary_number(&ctx_dir);
+            let path = ctx_dir.join(format!("conversation-summary-{}.md", next_num));
+            std::fs::write(&path, format!("# Conversation History Summary ({})\n\n{}", next_num, summary))?;
         } else {
-            format!("{}\n\n---\n\n{}", existing, summary)
-        };
-        std::fs::write(&summary_path, new_content)?;
+            // 既存ファイルに追記
+            let path = latest_path.unwrap();
+            let new_content = format!("{}\n\n---\n\n{}", existing, summary);
+            std::fs::write(&path, new_content)?;
+        }
     }
 
     // セッションをサマライズ済みとしてマーク
@@ -400,6 +418,44 @@ fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
         "summarized": ids.len(),
         "session_ids": ids,
     }))
+}
+
+/// 最新のサマリーファイルのパスを返す
+fn find_latest_summary_file(ctx_dir: &Path) -> Option<PathBuf> {
+    let base = ctx_dir.join("conversation-summary.md");
+    if !base.exists() {
+        return None;
+    }
+    // 番号付きファイルの最大番号を探す
+    let max_num = next_summary_number(ctx_dir).saturating_sub(1);
+    if max_num >= 2 {
+        let path = ctx_dir.join(format!("conversation-summary-{}.md", max_num));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    Some(base)
+}
+
+/// 次のサマリーファイル番号を返す（conversation-summary-N.md の N）
+fn next_summary_number(ctx_dir: &Path) -> usize {
+    let mut max = 1;
+    if let Ok(entries) = std::fs::read_dir(ctx_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix("conversation-summary-") {
+                if let Some(num_str) = rest.strip_suffix(".md") {
+                    if let Ok(n) = num_str.parse::<usize>() {
+                        if n >= max {
+                            max = n + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if max == 1 { 2 } else { max }
 }
 
 /// スキル名のバリデーション（英数字・ハイフン・アンダースコアのみ）
