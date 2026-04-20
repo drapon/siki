@@ -387,8 +387,8 @@ fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
         let ctx_dir = crate::config::worktree_contexts_dir(&proj, &wt);
         std::fs::create_dir_all(&ctx_dir)?;
 
-        // 既存のサマリーファイルを探す（conversation-summary.md, conversation-summary-2.md, ...）
-        let latest_path = find_latest_summary_file(&ctx_dir);
+        // 既存のサマリーファイルを探す（1回のスキャンで最新パスと次番号を取得）
+        let (latest_path, next_num) = scan_summary_files(&ctx_dir);
         let existing = latest_path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -400,7 +400,6 @@ fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
             std::fs::write(&path, format!("# Conversation History Summary\n\n{}", summary))?;
         } else if existing.len() + summary.len() > MAX_FILE_SIZE {
             // ファイルが大きいので新しいファイルに分割
-            let next_num = next_summary_number(&ctx_dir);
             let path = ctx_dir.join(format!("conversation-summary-{}.md", next_num));
             std::fs::write(&path, format!("# Conversation History Summary ({})\n\n{}", next_num, summary))?;
         } else {
@@ -420,26 +419,15 @@ fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
     }))
 }
 
-/// 最新のサマリーファイルのパスを返す
-fn find_latest_summary_file(ctx_dir: &Path) -> Option<PathBuf> {
+/// サマリーファイルをスキャンし、最新のファイルパスと次の番号を返す
+/// - 返り値: (最新ファイルのパス or None, 次に作成すべき番号)
+fn scan_summary_files(ctx_dir: &Path) -> (Option<PathBuf>, usize) {
     let base = ctx_dir.join("conversation-summary.md");
     if !base.exists() {
-        return None;
+        return (None, 2);
     }
-    // 番号付きファイルの最大番号を探す
-    let max_num = next_summary_number(ctx_dir).saturating_sub(1);
-    if max_num >= 2 {
-        let path = ctx_dir.join(format!("conversation-summary-{}.md", max_num));
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    Some(base)
-}
 
-/// 次のサマリーファイル番号を返す（conversation-summary-N.md の N）
-fn next_summary_number(ctx_dir: &Path) -> usize {
-    let mut max = 1;
+    let mut max_existing = 0_usize; // 0 = ベースファイルのみ
     if let Ok(entries) = std::fs::read_dir(ctx_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -447,15 +435,21 @@ fn next_summary_number(ctx_dir: &Path) -> usize {
             if let Some(rest) = name.strip_prefix("conversation-summary-") {
                 if let Some(num_str) = rest.strip_suffix(".md") {
                     if let Ok(n) = num_str.parse::<usize>() {
-                        if n >= max {
-                            max = n + 1;
+                        if n > max_existing {
+                            max_existing = n;
                         }
                     }
                 }
             }
         }
     }
-    if max == 1 { 2 } else { max }
+
+    if max_existing >= 2 {
+        let latest = ctx_dir.join(format!("conversation-summary-{}.md", max_existing));
+        (Some(latest), max_existing + 1)
+    } else {
+        (Some(base), 2)
+    }
 }
 
 /// スキル名のバリデーション（英数字・ハイフン・アンダースコアのみ）
@@ -681,5 +675,59 @@ mod tests {
         let params = json!({ "project_name": "nonexistent-project-12345" });
         let result = list_skills(&params).unwrap();
         assert_eq!(result["skills"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_scan_summary_files_no_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (latest, next) = scan_summary_files(dir.path());
+        assert!(latest.is_none());
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn test_scan_summary_files_base_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary").unwrap();
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary.md"));
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn test_scan_summary_files_with_numbered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary 1").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-2.md"), "# Summary 2").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-3.md"), "# Summary 3").unwrap();
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary-3.md"));
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn test_scan_summary_files_with_gap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary 1").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-5.md"), "# Summary 5").unwrap();
+        // gap: 2, 3, 4 are missing
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary-5.md"));
+        assert_eq!(next, 6);
+    }
+
+    #[test]
+    fn test_scan_summary_files_ignores_non_summary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("conversation-summary.md"), "# Summary").unwrap();
+        std::fs::write(dir.path().join("other-file.md"), "other").unwrap();
+        std::fs::write(dir.path().join("conversation-summary-abc.md"), "bad name").unwrap();
+
+        let (latest, next) = scan_summary_files(dir.path());
+        assert_eq!(latest.unwrap(), dir.path().join("conversation-summary.md"));
+        assert_eq!(next, 2);
     }
 }
