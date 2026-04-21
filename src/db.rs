@@ -63,6 +63,21 @@ pub fn init(db_path: &Path) -> Result<Connection> {
         ",
     )?;
 
+    // 会話ログテーブル（セッション完了時にJSONLから保存）
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS conversation_logs (
+            session_id TEXT PRIMARY KEY,
+            worktree_name TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            branch TEXT,
+            messages TEXT NOT NULL,
+            summary TEXT,
+            created_at INTEGER NOT NULL
+        );
+        ",
+    )?;
+
     Ok(conn)
 }
 
@@ -286,6 +301,98 @@ pub struct MessageRow {
     pub created_at: i64,
 }
 
+// ── conversation_logs ──
+
+#[derive(Debug, Clone)]
+pub struct ConversationLogRow {
+    pub session_id: String,
+    pub worktree_name: String,
+    pub project_name: String,
+    pub branch: Option<String>,
+    pub messages: String,
+    pub summary: Option<String>,
+    pub created_at: i64,
+}
+
+/// 会話ログを保存する（UPSERT）
+pub fn upsert_conversation_log(
+    conn: &Connection,
+    session_id: &str,
+    worktree_name: &str,
+    project_name: &str,
+    branch: Option<&str>,
+    messages_json: &str,
+) -> Result<()> {
+    let now = now_unix();
+    conn.execute(
+        "INSERT INTO conversation_logs (session_id, worktree_name, project_name, branch, messages, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+           messages = ?5,
+           branch = ?4",
+        rusqlite::params![session_id, worktree_name, project_name, branch, messages_json, now],
+    )?;
+    Ok(())
+}
+
+/// 会話ログのサマリを更新する
+pub fn update_conversation_log_summary(
+    conn: &Connection,
+    session_id: &str,
+    summary: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE conversation_logs SET summary = ?1 WHERE session_id = ?2",
+        rusqlite::params![summary, session_id],
+    )?;
+    Ok(())
+}
+
+/// worktree 単位で会話ログを取得する（古い順）
+pub fn get_conversation_logs_by_worktree(
+    conn: &Connection,
+    worktree_name: &str,
+    project_name: &str,
+) -> Result<Vec<ConversationLogRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, worktree_name, project_name, branch, messages, summary, created_at
+         FROM conversation_logs
+         WHERE worktree_name = ?1 AND project_name = ?2
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![worktree_name, project_name], |row| {
+        Ok(ConversationLogRow {
+            session_id: row.get(0)?,
+            worktree_name: row.get(1)?,
+            project_name: row.get(2)?,
+            branch: row.get(3)?,
+            messages: row.get(4)?,
+            summary: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// 保存済みセッションIDの一覧を取得する（未保存JSONL検出用）
+pub fn get_saved_conversation_session_ids(
+    conn: &Connection,
+    worktree_name: &str,
+    project_name: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id FROM conversation_logs WHERE worktree_name = ?1 AND project_name = ?2",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![worktree_name, project_name], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(ids)
+}
+
 /// サマライズ済みセッションIDを記録する
 pub fn mark_sessions_summarized(
     conn: &Connection,
@@ -435,6 +542,54 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         // AUTOINCREMENT id で順序保証（古い順）
         assert!(msgs[0].id < msgs[1].id);
+    }
+
+    #[test]
+    fn test_upsert_conversation_log() {
+        let conn = test_db();
+        let msgs = r#"[{"role":"user","content":"hello"}]"#;
+        upsert_conversation_log(&conn, "sess1", "osaka", "myapp", Some("main"), msgs).unwrap();
+
+        let logs = get_conversation_logs_by_worktree(&conn, "osaka", "myapp").unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].session_id, "sess1");
+        assert_eq!(logs[0].branch.as_deref(), Some("main"));
+        assert_eq!(logs[0].messages, msgs);
+        assert!(logs[0].summary.is_none());
+    }
+
+    #[test]
+    fn test_upsert_conversation_log_updates_on_conflict() {
+        let conn = test_db();
+        let msgs1 = r#"[{"role":"user","content":"v1"}]"#;
+        let msgs2 = r#"[{"role":"user","content":"v1"},{"role":"assistant","content":"v2"}]"#;
+        upsert_conversation_log(&conn, "sess1", "osaka", "myapp", Some("main"), msgs1).unwrap();
+        upsert_conversation_log(&conn, "sess1", "osaka", "myapp", Some("main"), msgs2).unwrap();
+
+        let logs = get_conversation_logs_by_worktree(&conn, "osaka", "myapp").unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].messages, msgs2);
+    }
+
+    #[test]
+    fn test_update_conversation_log_summary() {
+        let conn = test_db();
+        upsert_conversation_log(&conn, "sess1", "osaka", "myapp", None, "[]").unwrap();
+        update_conversation_log_summary(&conn, "sess1", "認証フロー実装").unwrap();
+
+        let logs = get_conversation_logs_by_worktree(&conn, "osaka", "myapp").unwrap();
+        assert_eq!(logs[0].summary.as_deref(), Some("認証フロー実装"));
+    }
+
+    #[test]
+    fn test_get_saved_conversation_session_ids() {
+        let conn = test_db();
+        upsert_conversation_log(&conn, "s1", "osaka", "myapp", None, "[]").unwrap();
+        upsert_conversation_log(&conn, "s2", "osaka", "myapp", None, "[]").unwrap();
+        upsert_conversation_log(&conn, "s3", "tokyo", "myapp", None, "[]").unwrap();
+
+        let ids = get_saved_conversation_session_ids(&conn, "osaka", "myapp").unwrap();
+        assert_eq!(ids.len(), 2);
     }
 
     #[test]

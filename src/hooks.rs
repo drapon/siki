@@ -189,9 +189,10 @@ BEFORE responding to the user's first message, you MUST:
 
 1. Call the `list_sessions` MCP tool (siki server) with `scope: "worktree"`.
 2. If the result shows pending_messages, deliver them first.
-3. If `conversation_history` is present, silently absorb it as context about previous work in this worktree.
+3. If `conversation_summaries` is present, silently absorb it as context about previous work in this worktree.
 4. If `worktree_contexts` is present, load them silently as background context.
 5. Once work begins, call `set_summary` with a short task description.
+6. If you need full conversation details from past sessions, use `get_context` with `include_conversation_log: true`.
 "#;
 
     let _ = std::fs::write(&rules_path, content);

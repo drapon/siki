@@ -146,7 +146,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "get_context".to_string(),
-            description: "Fetch context from another session or worktree (pull model). Returns git log, changed files, diff stats, branch, and work summary. Use this to understand what another session has been working on without requiring them to send you anything.".to_string(),
+            description: "Fetch context from another session or worktree (pull model). Returns git log, changed files, diff stats, branch, work summary, and optionally full conversation logs from past sessions.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -157,6 +157,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "id": { "type": "string", "description": "session_id, worktree name, or project name" }
                         },
                         "required": ["type", "id"]
+                    },
+                    "include_conversation_log": {
+                        "type": "boolean",
+                        "description": "If true, include full conversation messages from past sessions (default: false)"
                     }
                 },
                 "required": ["target"]
