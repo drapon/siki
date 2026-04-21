@@ -14,7 +14,7 @@ pub fn execute_tool(
     session_id: &str,
 ) -> Result<Value> {
     match tool_name {
-        "list_sessions" => list_sessions(conn, session_id),
+        "list_sessions" => list_sessions(conn, session_id, params),
         "send_message" => send_message(conn, params, session_id),
         "broadcast" => broadcast(conn, params, session_id),
         "set_summary" => set_summary(conn, params, session_id),
@@ -27,8 +27,33 @@ pub fn execute_tool(
     }
 }
 
-fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
-    let sessions = db::list_sessions(conn)?;
+fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<Value> {
+    let scope = params
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("machine");
+
+    let all_sessions = db::list_sessions(conn)?;
+
+    // 自セッションの worktree/project を特定（スコープフィルタに使用）
+    let my_worktree = all_sessions.iter().find(|s| s.session_id == session_id);
+    let (wt, proj) = my_worktree
+        .map(|s| (s.worktree_name.as_str(), s.project_name.as_str()))
+        .unwrap_or(("", ""));
+
+    // scope に応じてフィルタ
+    let sessions: Vec<&db::SessionRow> = match scope {
+        "worktree" => all_sessions
+            .iter()
+            .filter(|s| !wt.is_empty() && s.worktree_name == wt && s.project_name == proj)
+            .collect(),
+        "project" => all_sessions
+            .iter()
+            .filter(|s| !proj.is_empty() && s.project_name == proj)
+            .collect(),
+        _ => all_sessions.iter().collect(), // "machine" = 全件
+    };
+
     let items: Vec<Value> = sessions
         .iter()
         .map(|s| {
@@ -43,12 +68,6 @@ fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
             })
         })
         .collect();
-
-    // 自セッション宛の未読メッセージも取得
-    let my_worktree = sessions.iter().find(|s| s.session_id == session_id);
-    let (wt, proj) = my_worktree
-        .map(|s| (s.worktree_name.as_str(), s.project_name.as_str()))
-        .unwrap_or(("", ""));
 
     let pending = db::get_pending_messages(conn, session_id, wt, proj)?;
     let msg_ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
@@ -529,7 +548,7 @@ mod tests {
     #[test]
     fn test_list_sessions_empty() {
         let conn = test_db();
-        let result = list_sessions(&conn, "me").unwrap();
+        let result = list_sessions(&conn, "me", &json!({})).unwrap();
         assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
         assert_eq!(result["pending_messages"].as_array().unwrap().len(), 0);
     }
@@ -538,7 +557,7 @@ mod tests {
     fn test_list_sessions_with_data() {
         let conn = test_db();
         db::upsert_session(&conn, "s1", "frontend", "osaka", "myapp", "/tmp", "idle").unwrap();
-        let result = list_sessions(&conn, "s2").unwrap();
+        let result = list_sessions(&conn, "s2", &json!({})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["id"], "s1");
@@ -551,14 +570,37 @@ mod tests {
         db::upsert_session(&conn, "s2", "default", "osaka", "myapp", "/tmp", "idle").unwrap();
         db::insert_message(&conn, "s1", Some("s2"), None, None, "hello s2", "message", None).unwrap();
 
-        let result = list_sessions(&conn, "s2").unwrap();
+        let result = list_sessions(&conn, "s2", &json!({})).unwrap();
         let msgs = result["pending_messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"], "hello s2");
 
         // 2回目は既読なので空
-        let result2 = list_sessions(&conn, "s2").unwrap();
+        let result2 = list_sessions(&conn, "s2", &json!({})).unwrap();
         assert_eq!(result2["pending_messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_list_sessions_scope_worktree() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
+        db::upsert_session(&conn, "s2", "default", "osaka", "myapp", "/tmp/osaka", "working").unwrap();
+        db::upsert_session(&conn, "s3", "default", "tokyo", "myapp", "/tmp/tokyo", "idle").unwrap();
+
+        // scope: worktree → s1のworktree(osaka)のみ
+        let result = list_sessions(&conn, "s1", &json!({"scope": "worktree"})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // scope: project → myapp全体
+        let result = list_sessions(&conn, "s1", &json!({"scope": "project"})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 3);
+
+        // scope: machine（デフォルト）→ 全件
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 3);
     }
 
     #[test]
