@@ -91,65 +91,35 @@ fn list_sessions(conn: &Connection, session_id: &str) -> Result<Value> {
         None
     };
 
-    // Claude Code の会話履歴を読み込む（全セッション全文、サマライズ済み除外）
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let excluded = db::get_summarized_session_ids(conn, &cwd_str).unwrap_or_default();
-    let conversation_history = {
-        let history = crate::claude_history::load_worktree_history(&cwd, &excluded);
-        if history.is_empty() {
+    // SQLite から会話サマリを取得（JSONLパース不要）
+    let conversation_summaries = if !wt.is_empty() && !proj.is_empty() {
+        let logs = db::get_conversation_logs_by_worktree(conn, wt, proj).unwrap_or_default();
+        if logs.is_empty() {
             None
         } else {
-            let items: Vec<Value> = history
+            let items: Vec<Value> = logs
                 .iter()
-                .map(|h| {
-                    let msgs: Vec<Value> = h
-                        .messages
-                        .iter()
-                        .map(|m| {
-                            json!({
-                                "role": m.role,
-                                "content": m.content,
-                            })
-                        })
-                        .collect();
+                .map(|log| {
                     json!({
-                        "session_id": h.session_id,
-                        "timestamp": h.timestamp,
-                        "git_branch": h.git_branch,
-                        "messages": msgs,
+                        "session_id": log.session_id,
+                        "branch": log.branch,
+                        "summary": log.summary,
+                        "created_at": log.created_at,
                     })
                 })
                 .collect();
             Some(json!(items))
         }
+    } else {
+        None
     };
 
     let mut result = json!({ "sessions": items, "pending_messages": messages });
     if let Some(ctx) = worktree_contexts {
         result["worktree_contexts"] = ctx;
     }
-    if let Some(ref hist) = conversation_history {
-        // 統計情報を追加（履歴の大きさを把握するため）
-        let total_sessions = hist.as_array().map(|a| a.len()).unwrap_or(0);
-        let total_messages: usize = hist
-            .as_array()
-            .map(|sessions| {
-                sessions
-                    .iter()
-                    .filter_map(|s| s.get("messages").and_then(|m| m.as_array()).map(|a| a.len()))
-                    .sum()
-            })
-            .unwrap_or(0);
-        let summarized_count = excluded.len();
-        result["conversation_history"] = hist.clone();
-        // 500メッセージ超でサマライズを推奨
-        let summarize_recommended = total_messages > 500;
-        result["history_stats"] = json!({
-            "loaded_sessions": total_sessions,
-            "loaded_messages": total_messages,
-            "summarized_sessions": summarized_count,
-            "summarize_recommended": summarize_recommended,
-        });
+    if let Some(summaries) = conversation_summaries {
+        result["conversation_summaries"] = summaries;
     }
     Ok(result)
 }
@@ -315,6 +285,11 @@ fn get_context(conn: &Connection, params: &Value) -> Result<Value> {
         }));
     }
 
+    let include_log = params
+        .get("include_conversation_log")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut contexts = Vec::new();
     for session in &targets {
         let cwd = &session.cwd;
@@ -323,7 +298,7 @@ fn get_context(conn: &Connection, params: &Value) -> Result<Value> {
         let git_diff_stat = run_git(cwd, &["diff", "--stat", "HEAD"]);
         let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
 
-        contexts.push(json!({
+        let mut ctx = json!({
             "session_id": session.session_id,
             "worktree_name": session.worktree_name,
             "project_name": session.project_name,
@@ -334,7 +309,32 @@ fn get_context(conn: &Connection, params: &Value) -> Result<Value> {
             "recent_commits": git_log.lines().collect::<Vec<_>>(),
             "changed_files": git_status.lines().collect::<Vec<_>>(),
             "diff_stat": git_diff_stat.trim(),
-        }));
+        });
+
+        // 会話ログを含める
+        if include_log {
+            let logs = db::get_conversation_logs_by_worktree(
+                conn,
+                &session.worktree_name,
+                &session.project_name,
+            )
+            .unwrap_or_default();
+            let conv_items: Vec<Value> = logs
+                .iter()
+                .map(|log| {
+                    json!({
+                        "session_id": log.session_id,
+                        "branch": log.branch,
+                        "summary": log.summary,
+                        "messages": serde_json::from_str::<Value>(&log.messages).unwrap_or(json!([])),
+                        "created_at": log.created_at,
+                    })
+                })
+                .collect();
+            ctx["conversation_logs"] = json!(conv_items);
+        }
+
+        contexts.push(ctx);
     }
 
     Ok(json!({ "contexts": contexts }))

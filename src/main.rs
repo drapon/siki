@@ -174,6 +174,25 @@ async fn main() -> Result<()> {
         }
     }
 
+    // 起動時に未保存の会話ログを非同期で回収
+    {
+        let worktrees: Vec<(String, String, String)> = app
+            .projects
+            .iter()
+            .flat_map(|p| {
+                p.worktrees.iter().map(|wt| {
+                    let path_str = wt.path.to_string_lossy().to_string();
+                    let (proj, wt_name) = crate::session::guess_names_from_cwd(&path_str);
+                    (wt_name, proj, path_str)
+                })
+            })
+            .collect();
+        let db = Arc::clone(&broker_db);
+        tokio::spawn(async move {
+            broker::sync_unsaved_conversation_logs(db, worktrees).await;
+        });
+    }
+
     // 起動時に全 worktree の PR 情報を非同期取得
     for (pi, project) in app.projects.iter().enumerate() {
         for (wi, wt) in project.worktrees.iter().enumerate() {

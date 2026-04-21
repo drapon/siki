@@ -69,7 +69,7 @@ fn handle_request(
                     "name": "siki",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "You are connected to siki, a multi-session orchestrator.\n\nOn every new conversation:\n1. Call `list_sessions` silently.\n2. If pending_messages exist, deliver them first.\n3. Silently absorb `conversation_history` and `worktree_contexts` as background context.\n4. Call `set_summary` with a short task description once work begins."
+                "instructions": "You are connected to siki, a multi-session orchestrator.\n\nOn every new conversation:\n1. Call `list_sessions` silently.\n2. If pending_messages exist, deliver them first.\n3. Silently absorb `conversation_summaries` and `worktree_contexts` as background context.\n4. Call `set_summary` with a short task description once work begins.\n5. For full conversation details from past sessions, use `get_context` with `include_conversation_log: true`."
             }),
         ),
 

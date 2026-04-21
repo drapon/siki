@@ -19,20 +19,21 @@ pub struct ConversationHistory {
 }
 
 /// Claude Code の projects ディレクトリパスを返す
-fn claude_projects_dir() -> PathBuf {
+pub fn claude_projects_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".claude")
         .join("projects")
 }
 
-/// ファイルシス��ムパスを Claude Code のプロジェクトディレクトリ名にエンコード
-/// 例: /Users/hayashi/foo → -Users-hayashi-foo
-fn encode_path(path: &Path) -> String {
+/// ファイルシステムパスを Claude Code のプロジェクトディレクトリ名にエンコード
+/// Claude Code は `/` と `.` の両方を `-` に変換する
+/// 例: /Users/hayashi/.siki/workspaces → -Users-hayashi--siki-workspaces
+pub fn encode_path(path: &Path) -> String {
     let s = path.to_string_lossy();
     let mut encoded = String::with_capacity(s.len());
     for ch in s.chars() {
-        if ch == '/' {
+        if ch == '/' || ch == '.' {
             encoded.push('-');
         } else {
             encoded.push(ch);
@@ -41,8 +42,8 @@ fn encode_path(path: &Path) -> String {
     encoded
 }
 
-/// JSONL ファイルからセッションIDを抽出（ファ���ル名の拡張子を除いた部分）
-fn session_id_from_path(path: &Path) -> String {
+/// JSONL ファイルからセッションIDを抽出（ファイル名の拡張子を除いた部分）
+pub fn session_id_from_path(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default()
@@ -50,7 +51,7 @@ fn session_id_from_path(path: &Path) -> String {
 }
 
 /// 1つの JSONL ファイルを読み込んで全メッセージを返す
-fn parse_jsonl(path: &Path) -> Option<ConversationHistory> {
+pub fn parse_jsonl(path: &Path) -> Option<ConversationHistory> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
 
@@ -226,7 +227,7 @@ mod tests {
     #[test]
     fn test_encode_path_with_dots() {
         let path = Path::new("/Users/hayashi/.siki/workspaces");
-        assert_eq!(encode_path(path), "-Users-hayashi-.siki-workspaces");
+        assert_eq!(encode_path(path), "-Users-hayashi--siki-workspaces");
     }
 
     #[test]
