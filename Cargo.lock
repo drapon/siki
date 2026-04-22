@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "siki"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "anyhow",
  "arboard",
