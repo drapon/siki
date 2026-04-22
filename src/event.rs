@@ -76,6 +76,11 @@ pub enum AppEvent {
     GrepResults(Vec<crate::app::GrepResult>),
     /// Changes の再読み込み要求（broker 経由の refresh イベント）
     RefreshChanges,
+    /// git fetch 完了
+    FetchComplete {
+        project_index: usize,
+        result: Result<String, String>,
+    },
 }
 
 /// Claude Code ストリームイベント型

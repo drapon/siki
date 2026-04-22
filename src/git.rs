@@ -195,6 +195,23 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// リモートを fetch して追跡ブランチを最新化する
+    pub fn fetch_remote(project_path: &Path, remote: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args(["fetch", remote, "--prune"])
+            .current_dir(project_path)
+            .output()
+            .context("git fetch の実行に失敗")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git fetch に失敗: {}", stderr.trim());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Ok(stderr)
+    }
+
     /// Worktree の git diff を取得する
     pub fn get_diff(worktree_path: &Path) -> Result<String> {
         let output = Command::new("git")

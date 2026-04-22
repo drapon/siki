@@ -1323,6 +1323,16 @@ async fn handle_event(
         AppEvent::SessionUpdate { .. } => {
             // セッション状態の変化 — レジストリは broker 側で既に更新済み
         }
+        AppEvent::FetchComplete { project_index, result } => {
+            match result {
+                Ok(_) => {
+                    app.show_info(format!("Fetch 完了 ({})", app.projects[project_index].name));
+                }
+                Err(msg) => {
+                    app.show_error(format!("Fetch 失敗: {}", msg));
+                }
+            }
+        }
         AppEvent::RefreshChanges => {
             // Claude Code の hook 経由で Changes を再読み込み
             if let Some(wt_id) = app.selected_worktree {
@@ -2502,6 +2512,32 @@ fn handle_left_panel_key(
                     app.show_remove_project_confirm = true;
                 }
                 None => {}
+            }
+        }
+        KeyCode::Char('F') => {
+            // git fetch でリモート追跡ブランチを最新化
+            let project_index = match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Project { index }) => Some(*index),
+                Some(ui::left_panel::ListEntry::Worktree { project_index, .. }) => Some(*project_index),
+                None => None,
+            };
+            if let Some(pi) = project_index {
+                let project_path = app.projects[pi].path.clone();
+                let base = resolve_base_branch(&project_path, &app.projects[pi].name);
+                let remote = base.split('/').next().unwrap_or("origin").to_string();
+                app.show_info(format!("Fetching {}...", remote));
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        git::WorktreeManager::fetch_remote(&project_path, &remote)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("{}", e)));
+                    let _ = tx.send(event::AppEvent::FetchComplete {
+                        project_index: pi,
+                        result: result.map_err(|e| e.to_string()),
+                    });
+                });
             }
         }
         KeyCode::Char('S') => {
