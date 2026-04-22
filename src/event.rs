@@ -28,12 +28,14 @@ pub enum AppEvent {
     TerminalOutput {
         worktree_id: WorktreeId,
         tab_index: usize,
+        terminal_id: u64,
         data: Vec<u8>,
     },
     /// ターミナル（PTY）プロセスが終了した
     TerminalExited {
         worktree_id: WorktreeId,
         tab_index: usize,
+        terminal_id: u64,
     },
     /// GitHub PR 情報取得完了
     PrInfo {
@@ -201,6 +203,7 @@ mod tests {
         let _terminal_output = AppEvent::TerminalOutput {
             worktree_id: (0, 0),
             tab_index: 0,
+            terminal_id: 0,
             data: vec![0x41],
         };
         let _mouse = AppEvent::Mouse(crossterm::event::MouseEvent {

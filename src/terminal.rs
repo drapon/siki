@@ -3,15 +3,20 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::app::WorktreeId;
 use crate::event::AppEvent;
 
+/// グローバルなターミナルID生成用カウンタ
+static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
+
 /// PTY ベースのターミナルエミュレータ
 ///
 /// portable-pty でシェルを起動し、vt100 パーサーで画面状態を管理する。
 pub struct TerminalEmulator {
+    id: u64,
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: vt100::Parser,
@@ -109,6 +114,8 @@ impl TerminalEmulator {
             .try_clone_reader()
             .map_err(|e| anyhow::anyhow!("PTY reader の取得に失敗: {}", e))?;
 
+        let id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
+
         // PTY からの読み取りを背景スレッドで行う
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -118,6 +125,7 @@ impl TerminalEmulator {
                         let _ = event_tx.send(AppEvent::TerminalExited {
                             worktree_id,
                             tab_index,
+                            terminal_id: id,
                         });
                         break;
                     }
@@ -126,6 +134,7 @@ impl TerminalEmulator {
                             .send(AppEvent::TerminalOutput {
                                 worktree_id,
                                 tab_index,
+                                terminal_id: id,
                                 data: buf[..n].to_vec(),
                             })
                             .is_err()
@@ -137,6 +146,7 @@ impl TerminalEmulator {
                         let _ = event_tx.send(AppEvent::TerminalExited {
                             worktree_id,
                             tab_index,
+                            terminal_id: id,
                         });
                         break;
                     }
@@ -147,11 +157,17 @@ impl TerminalEmulator {
         let parser = vt100::Parser::new(size.1, size.0, scrollback_lines);
 
         Ok(Self {
+            id,
             master: pair.master,
             writer,
             parser,
             alive: true,
         })
+    }
+
+    /// このターミナルエミュレータのユニーク ID を返す
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// PTY にデータを書き込む（大きなデータはチャンク分割）
