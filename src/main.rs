@@ -667,44 +667,58 @@ async fn handle_event(
         AppEvent::TerminalOutput {
             worktree_id,
             tab_index,
+            terminal_id,
             data,
         } => {
             if worktree_id == SIKI_INIT_WORKTREE_ID && tab_index == SIKI_INIT_TAB_INDEX {
                 if let Some(emu) = siki_init_terminal.as_mut() {
-                    emu.process(&data);
+                    if emu.id() == terminal_id {
+                        emu.process(&data);
+                    }
                 }
             } else if tab_index >= CLAUDE_TAB_BASE {
                 let claude_idx = tab_index - CLAUDE_TAB_BASE;
                 if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
-                    emu.process(&data);
-                    // vt100 はスクロールバック中に新行が来ると内部で offset を
-                    // 調整するため、外部保持のオフセットを同期する
-                    let current = emu.scrollback();
-                    if current > 0 {
-                        if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
-                            wt.claude_scroll_offsets.insert(claude_idx, current);
+                    if emu.id() == terminal_id {
+                        emu.process(&data);
+                        // vt100 はスクロールバック中に新行が来ると内部で offset を
+                        // 調整するため、外部保持のオフセットを同期する
+                        let current = emu.scrollback();
+                        if current > 0 {
+                            if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
+                                wt.claude_scroll_offsets.insert(claude_idx, current);
+                            }
                         }
                     }
                 }
             } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
-                emu.process(&data);
+                if emu.id() == terminal_id {
+                    emu.process(&data);
+                }
             }
         }
         AppEvent::TerminalExited {
             worktree_id,
             tab_index,
+            terminal_id,
         } => {
             if worktree_id == SIKI_INIT_WORKTREE_ID && tab_index == SIKI_INIT_TAB_INDEX {
                 if let Some(emu) = siki_init_terminal.as_mut() {
-                    emu.mark_exited();
+                    if emu.id() == terminal_id {
+                        emu.mark_exited();
+                    }
                 }
             } else if tab_index >= CLAUDE_TAB_BASE {
                 let claude_idx = tab_index - CLAUDE_TAB_BASE;
                 if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
-                    emu.mark_exited();
+                    if emu.id() == terminal_id {
+                        emu.mark_exited();
+                    }
                 }
             } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
-                emu.mark_exited();
+                if emu.id() == terminal_id {
+                    emu.mark_exited();
+                }
             }
         }
         AppEvent::Mouse(mouse) => {
