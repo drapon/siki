@@ -24,7 +24,10 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_n
 
     // stdin の JSON から session_id を抽出する共通スクリプト
     // Claude Code はすべての hook に {"session_id": "...", ...} を stdin で渡す
-    let read_sid = r#"SID=$(head -1 | sed -n 's/.*"session_id" *: *"\([^"]*\)".*/\1/p'); [ -z "$SID" ] && SID="siki-$$""#;
+    // ソケットが存在しない場合はサイレントにスキップ（siki 未起動時のエラー抑止）
+    let read_sid = format!(
+        r#"SID=$(head -1 | sed -n 's/.*"session_id" *: *"\([^"]*\)".*/\1/p'); [ -z "$SID" ] && SID="siki-$$"; [ -S {sock} ] || exit 0"#
+    );
 
     inject_hook(hooks, "SessionStart", &format!(
         r#"{read_sid}; echo '{{"event":"register","session_id":"'"$SID"'","cwd":"'"$PWD"'","role":"'"${{SIKI_ROLE:-default}}"'"}}' | nc -U {sock}"#
