@@ -135,6 +135,35 @@ pub fn update_session_alert(
     Ok(())
 }
 
+/// 指定 worktree のセッションのアラートをクリアする
+pub fn clear_alerts_by_worktree(
+    conn: &Connection,
+    project_name: &str,
+    worktree_name: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET alert = 0, alert_message = NULL
+         WHERE project_name = ?1 AND worktree_name = ?2 AND alert != 0",
+        rusqlite::params![project_name, worktree_name],
+    )?;
+    Ok(())
+}
+
+/// アラートが有効なセッションの一覧を返す（DB→インメモリ同期用）
+pub fn get_alerted_sessions(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, alert_message FROM sessions WHERE alert != 0 AND state != 'dead'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
 /// セッションの summary を更新する
 pub fn update_session_summary(
     conn: &Connection,
@@ -652,5 +681,36 @@ mod tests {
         let sessions = list_sessions(&conn).unwrap();
         assert!(!sessions[0].alert);
         assert!(sessions[0].alert_message.is_none());
+    }
+
+    #[test]
+    fn test_clear_alerts_by_worktree() {
+        let conn = test_db();
+        upsert_session(&conn, "s1", "default", "wt1", "proj", "/tmp", "idle").unwrap();
+        upsert_session(&conn, "s2", "default", "wt1", "proj", "/tmp", "idle").unwrap();
+        upsert_session(&conn, "s3", "default", "wt2", "proj", "/tmp", "idle").unwrap();
+        update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
+        update_session_alert(&conn, "s3", true, Some("test failed")).unwrap();
+
+        clear_alerts_by_worktree(&conn, "proj", "wt1").unwrap();
+
+        let sessions = list_sessions(&conn).unwrap();
+        let s1 = sessions.iter().find(|s| s.session_id == "s1").unwrap();
+        let s3 = sessions.iter().find(|s| s.session_id == "s3").unwrap();
+        assert!(!s1.alert);
+        assert!(s3.alert); // 別 worktree は影響なし
+    }
+
+    #[test]
+    fn test_get_alerted_sessions() {
+        let conn = test_db();
+        upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+        upsert_session(&conn, "s2", "default", "wt", "proj", "/tmp", "idle").unwrap();
+        update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
+
+        let alerted = get_alerted_sessions(&conn).unwrap();
+        assert_eq!(alerted.len(), 1);
+        assert_eq!(alerted[0].0, "s1");
+        assert_eq!(alerted[0].1.as_deref(), Some("CI failed"));
     }
 }

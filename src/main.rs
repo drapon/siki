@@ -588,7 +588,7 @@ async fn handle_event(
                     // パネル固有のキー処理
                     match app.focused_panel {
                         app::Panel::Left => {
-                            handle_left_panel_key(app, left_panel, source_tree, diff_view, local_changes, terminals, claude_terms, event_tx, shell, key, session_registry);
+                            handle_left_panel_key(app, left_panel, source_tree, diff_view, local_changes, terminals, claude_terms, event_tx, shell, key, session_registry, broker_db);
                         }
                         app::Panel::Main => {
                             // Claude タブは上で早期 return 済みなのでここは非 Claude タブのみ
@@ -1090,7 +1090,7 @@ async fn handle_event(
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
                                             // Done バッジをクリア（既読）
-                                            clear_done_badges(session_registry, app, wt_id);
+                                            clear_done_badges(session_registry, app, wt_id, broker_db);
                                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                                             let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                             source_tree.load(&wt_path);
@@ -1549,6 +1549,15 @@ async fn handle_event(
             if let Some(registry) = session_registry {
                 let mut reg = registry.lock().unwrap();
                 reg.cleanup_expired_sessions(std::time::Duration::from_secs(300));
+            }
+            // DB→インメモリのアラート状態同期（MCP別プロセスからの書き込みを反映）
+            if let Some(registry) = session_registry {
+                if let Ok(conn) = broker_db.lock() {
+                    if let Ok(alerted) = db::get_alerted_sessions(&conn) {
+                        let mut reg = registry.lock().unwrap();
+                        reg.sync_alerts_from_db(&alerted);
+                    }
+                }
             }
         }
     }
@@ -2423,6 +2432,7 @@ fn handle_left_panel_key(
     shell: &str,
     key: crossterm::event::KeyEvent,
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
+    broker_db: &Arc<Mutex<rusqlite::Connection>>,
 ) {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2699,7 +2709,7 @@ fn handle_left_panel_key(
                 app.selected_worktree = Some(wt_id);
                 app.focused_panel = app::Panel::Main;
                 // Done バッジをクリア（既読）
-                clear_done_badges(session_registry, app, wt_id);
+                clear_done_badges(session_registry, app, wt_id, broker_db);
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
                 let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
@@ -4456,11 +4466,12 @@ fn has_active_sessions(
         .any(|s| matches!(s.state, session::SessionState::Working | session::SessionState::Waiting))
 }
 
-/// worktree 選択時に Done セッションをクリアする（既読）
+/// worktree 選択時に Done セッションとアラートをクリアする（既読）
 fn clear_done_badges(
     session_registry: &Option<Arc<Mutex<session::SessionRegistry>>>,
     app: &app::App,
     wt_id: app::WorktreeId,
+    broker_db: &Arc<Mutex<rusqlite::Connection>>,
 ) {
     let Some(wt) = app.worktree_by_id(wt_id) else {
         return;
@@ -4469,6 +4480,10 @@ fn clear_done_badges(
     if let Some(mut reg) = session_registry.as_ref().and_then(|r| r.lock().ok()) {
         reg.clear_done_sessions(project, &wt.name);
         reg.clear_alerts(project, &wt.name);
+    }
+    // DB 側のアラートもクリア
+    if let Ok(conn) = broker_db.lock() {
+        let _ = db::clear_alerts_by_worktree(&conn, project, &wt.name);
     }
 }
 

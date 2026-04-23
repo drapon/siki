@@ -279,6 +279,41 @@ impl SessionRegistry {
         }
     }
 
+    /// DBのアラート状態をインメモリに同期する
+    ///
+    /// MCPツール(別プロセス)がDBにアラートを書き込むため、
+    /// 定期的にDBから読み取ってインメモリ状態を更新する必要がある。
+    /// 戻り値: 変更があった場合 true
+    pub fn sync_alerts_from_db(&mut self, alerted: &[(String, Option<String>)]) -> bool {
+        let mut changed = false;
+
+        // DB でアラートが立っているセッションID
+        let alerted_ids: std::collections::HashSet<&str> =
+            alerted.iter().map(|(id, _)| id.as_str()).collect();
+
+        // DB にアラートがあるセッションをインメモリでも有効化
+        for (id, message) in alerted {
+            if let Some(session) = self.sessions.get_mut(id.as_str()) {
+                if !session.alert {
+                    session.alert = true;
+                    session.alert_message = message.clone();
+                    changed = true;
+                }
+            }
+        }
+
+        // DB でアラートが解除されたセッションをインメモリでもクリア
+        for session in self.sessions.values_mut() {
+            if session.alert && !alerted_ids.contains(session.session_id.as_str()) {
+                session.alert = false;
+                session.alert_message = None;
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
     /// 指定 worktree の Done セッションを Idle にリセットする（既読クリア）
     ///
     /// セッションを削除するとメタデータ（cwd, project_name, worktree_name）が失われ、
@@ -730,5 +765,44 @@ mod tests {
         assert!(reg.get("s1").unwrap().alert_message.is_none());
         // wt2 は影響なし
         assert!(reg.get("s3").unwrap().alert);
+    }
+
+    #[test]
+    fn test_sync_alerts_from_db_sets_alert() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Working);
+
+        // DB にアラートがある状態をシミュレート
+        let alerted = vec![("s1".to_string(), Some("CI failed".to_string()))];
+        let changed = reg.sync_alerts_from_db(&alerted);
+
+        assert!(changed);
+        assert!(reg.get("s1").unwrap().alert);
+        assert_eq!(reg.get("s1").unwrap().alert_message.as_deref(), Some("CI failed"));
+    }
+
+    #[test]
+    fn test_sync_alerts_from_db_clears_alert() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Working);
+        reg.set_alert("s1", true, Some("CI failed".into()));
+
+        // DB ではアラートがクリア済み
+        let alerted: Vec<(String, Option<String>)> = vec![];
+        let changed = reg.sync_alerts_from_db(&alerted);
+
+        assert!(changed);
+        assert!(!reg.get("s1").unwrap().alert);
+    }
+
+    #[test]
+    fn test_sync_alerts_from_db_no_change() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Working);
+
+        // DB にもインメモリにもアラートなし → 変更なし
+        let alerted: Vec<(String, Option<String>)> = vec![];
+        let changed = reg.sync_alerts_from_db(&alerted);
+        assert!(!changed);
     }
 }

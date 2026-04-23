@@ -196,16 +196,26 @@ fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Va
 }
 
 fn set_alert(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
-    let message = params
-        .get("message")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("message is required"))?;
     let alert = params
         .get("alert")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let message = params
+        .get("message")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
 
-    db::update_session_alert(conn, session_id, alert, if alert { Some(message) } else { None })?;
+    if alert && message.is_none() {
+        anyhow::bail!("message is required when raising an alert");
+    }
+
+    if let Some(msg) = message {
+        if msg.len() > 500 {
+            anyhow::bail!("message must be 500 characters or fewer");
+        }
+    }
+
+    db::update_session_alert(conn, session_id, alert, if alert { message } else { None })?;
 
     Ok(json!({ "ok": true, "alert": alert }))
 }
@@ -709,14 +719,36 @@ mod tests {
         db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
         db::update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
 
-        // アラート解除
-        let params = json!({ "message": "resolved", "alert": false });
+        // アラート解除（message なしでOK）
+        let params = json!({ "alert": false });
         let result = set_alert(&conn, &params, "s1").unwrap();
         assert_eq!(result["alert"], false);
 
         let sessions = db::list_sessions(&conn).unwrap();
         assert!(!sessions[0].alert);
         assert!(sessions[0].alert_message.is_none());
+    }
+
+    #[test]
+    fn test_set_alert_requires_message_when_raising() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+
+        // message なしでアラート発火はエラー
+        let params = json!({ "alert": true });
+        let result = set_alert(&conn, &params, "s1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_alert_rejects_long_message() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+
+        let long_msg = "x".repeat(501);
+        let params = json!({ "message": long_msg });
+        let result = set_alert(&conn, &params, "s1");
+        assert!(result.is_err());
     }
 
     #[test]

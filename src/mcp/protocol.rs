@@ -204,8 +204,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Set to true to raise alert, false to clear (default: true)"
                     }
-                },
-                "required": ["message"]
+                }
             }),
         },
         ToolDefinition {
