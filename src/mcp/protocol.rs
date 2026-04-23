@@ -191,6 +191,23 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "set_alert".to_string(),
+            description: "Signal that this session needs human attention (e.g. CI failed, tests broken). Shows a red alert badge in the siki worktree list. Call with alert=false to clear the alert.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Reason for the alert (e.g. 'CI failed on main', 'Tests broken')"
+                    },
+                    "alert": {
+                        "type": "boolean",
+                        "description": "Set to true to raise alert, false to clear (default: true)"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
             name: "summarize_history".to_string(),
             description: "Summarize conversation history for this worktree. Call this manually when the conversation history has grown too large. Provide a summary text and the session IDs to mark as summarized. Summarized sessions will no longer be returned in full by list_sessions, replaced by the summary in worktree_contexts.".to_string(),
             input_schema: serde_json::json!({
@@ -243,7 +260,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
