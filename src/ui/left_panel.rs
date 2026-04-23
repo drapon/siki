@@ -132,9 +132,14 @@ impl LeftPanel {
                             == app.projects[*project_index].worktrees.len() - 1;
                         let branch_char = if is_last { "└" } else { "├" };
                         // セッションレジストリから状態バッジを取得（なければ既存アイコン）
+                        let has_alert = session_registry
+                            .map(|reg| reg.has_alert(project_name, &wt.name))
+                            .unwrap_or(false);
                         let session_state = session_registry
                             .and_then(|reg| reg.aggregate_state(project_name, &wt.name));
-                        let (icon, icon_color) = if let Some(state) = session_state {
+                        let (icon, icon_color) = if has_alert {
+                            ("●", Color::Red)
+                        } else if let Some(state) = session_state {
                             (state.badge_char(app.blink_phase), state.badge_color())
                         } else {
                             ("○", Color::DarkGray)

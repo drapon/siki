@@ -51,6 +51,14 @@ pub fn init(db_path: &Path) -> Result<Connection> {
         "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT;",
     );
 
+    // マイグレーション: alert カラムが無ければ追加
+    let _ = conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN alert INTEGER NOT NULL DEFAULT 0;",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN alert_message TEXT;",
+    );
+
     // サマライズ済みセッション追跡テーブル
     conn.execute_batch(
         "
@@ -113,6 +121,20 @@ pub fn update_session_state(conn: &Connection, session_id: &str, state: &str) ->
     Ok(())
 }
 
+/// セッションのアラート状態を更新する
+pub fn update_session_alert(
+    conn: &Connection,
+    session_id: &str,
+    alert: bool,
+    message: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET alert = ?1, alert_message = ?2 WHERE session_id = ?3",
+        rusqlite::params![alert as i64, message, session_id],
+    )?;
+    Ok(())
+}
+
 /// セッションの summary を更新する
 pub fn update_session_summary(
     conn: &Connection,
@@ -166,11 +188,12 @@ pub fn get_latest_claude_session_id(
 /// セッション一覧を取得する
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRow>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, role, worktree_name, project_name, cwd, state, summary
+        "SELECT session_id, role, worktree_name, project_name, cwd, state, summary, alert, alert_message
          FROM sessions WHERE state != 'dead'
          ORDER BY project_name, worktree_name, role",
     )?;
     let rows = stmt.query_map([], |row| {
+        let alert_int: i64 = row.get(7)?;
         Ok(SessionRow {
             session_id: row.get(0)?,
             role: row.get(1)?,
@@ -179,6 +202,8 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRow>> {
             cwd: row.get(4)?,
             state: row.get(5)?,
             summary: row.get(6)?,
+            alert: alert_int != 0,
+            alert_message: row.get(8)?,
         })
     })?;
     let mut result = Vec::new();
@@ -289,6 +314,8 @@ pub struct SessionRow {
     pub cwd: String,
     pub state: String,
     pub summary: Option<String>,
+    pub alert: bool,
+    pub alert_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -598,5 +625,32 @@ mod tests {
         upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "dead").unwrap();
         let sessions = list_sessions(&conn).unwrap();
         assert_eq!(sessions.len(), 0);
+    }
+
+    #[test]
+    fn test_update_session_alert() {
+        let conn = test_db();
+        upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+
+        // アラート設定
+        update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
+        let sessions = list_sessions(&conn).unwrap();
+        assert!(sessions[0].alert);
+        assert_eq!(sessions[0].alert_message.as_deref(), Some("CI failed"));
+
+        // アラート解除
+        update_session_alert(&conn, "s1", false, None).unwrap();
+        let sessions = list_sessions(&conn).unwrap();
+        assert!(!sessions[0].alert);
+        assert!(sessions[0].alert_message.is_none());
+    }
+
+    #[test]
+    fn test_session_alert_default() {
+        let conn = test_db();
+        upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+        let sessions = list_sessions(&conn).unwrap();
+        assert!(!sessions[0].alert);
+        assert!(sessions[0].alert_message.is_none());
     }
 }

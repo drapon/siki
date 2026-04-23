@@ -60,6 +60,10 @@ pub struct Session {
     pub last_seen: Instant,
     /// idle 遷移の遅延（working/waiting を最低限の時間表示するため）
     pub idle_pending_since: Option<Instant>,
+    /// 人間の確認が必要なアラート（SessionState とは独立）
+    pub alert: bool,
+    /// アラートの理由メッセージ
+    pub alert_message: Option<String>,
 }
 
 /// Hook から送信されるイベント
@@ -139,6 +143,8 @@ impl SessionRegistry {
                     state: SessionState::Idle,
                     last_seen: Instant::now(),
                     idle_pending_since: None,
+                    alert: false,
+                    alert_message: None,
                 },
             );
         }
@@ -243,6 +249,34 @@ impl SessionRegistry {
         // 一定時間応答なしのセッションを削除
         self.sessions
             .retain(|_, session| now.duration_since(session.last_seen) <= expire_timeout);
+    }
+
+    /// セッションのアラートを設定/解除する
+    pub fn set_alert(&mut self, session_id: &str, alert: bool, message: Option<String>) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.alert = alert;
+            session.alert_message = if alert { message } else { None };
+        }
+    }
+
+    /// 指定 worktree にアラートがあるセッションが存在するか
+    pub fn has_alert(&self, project: &str, worktree: &str) -> bool {
+        self.by_worktree(project, worktree)
+            .iter()
+            .any(|s| s.alert)
+    }
+
+    /// 指定 worktree のアラートをクリアする
+    pub fn clear_alerts(&mut self, project: &str, worktree: &str) {
+        for session in self.sessions.values_mut() {
+            if session.project_name == project
+                && session.worktree_name == worktree
+                && session.alert
+            {
+                session.alert = false;
+                session.alert_message = None;
+            }
+        }
     }
 
     /// 指定 worktree の Done セッションを Idle にリセットする（既読クリア）
@@ -591,6 +625,8 @@ mod tests {
                 state,
                 last_seen: Instant::now(),
                 idle_pending_since: None,
+                alert: false,
+                alert_message: None,
             },
         );
     }
@@ -636,5 +672,63 @@ mod tests {
         // 何も削除されない
         assert!(reg.get("s1").is_some());
         assert!(reg.get("s2").is_some());
+    }
+
+    #[test]
+    fn test_set_alert() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Working);
+
+        reg.set_alert("s1", true, Some("CI failed".into()));
+        let s = reg.get("s1").unwrap();
+        assert!(s.alert);
+        assert_eq!(s.alert_message.as_deref(), Some("CI failed"));
+
+        // 解除
+        reg.set_alert("s1", false, None);
+        let s = reg.get("s1").unwrap();
+        assert!(!s.alert);
+        assert!(s.alert_message.is_none());
+    }
+
+    #[test]
+    fn test_set_alert_nonexistent() {
+        let mut reg = SessionRegistry::new();
+        // パニックしない
+        reg.set_alert("nonexistent", true, Some("test".into()));
+    }
+
+    #[test]
+    fn test_has_alert() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Working);
+        insert_session(&mut reg, "s2", "proj", "wt1", SessionState::Idle);
+
+        assert!(!reg.has_alert("proj", "wt1"));
+
+        reg.set_alert("s1", true, Some("CI failed".into()));
+        assert!(reg.has_alert("proj", "wt1"));
+
+        // 別 worktree には影響しない
+        assert!(!reg.has_alert("proj", "wt2"));
+    }
+
+    #[test]
+    fn test_clear_alerts() {
+        let mut reg = SessionRegistry::new();
+        insert_session(&mut reg, "s1", "proj", "wt1", SessionState::Working);
+        insert_session(&mut reg, "s2", "proj", "wt1", SessionState::Idle);
+        insert_session(&mut reg, "s3", "proj", "wt2", SessionState::Working);
+
+        reg.set_alert("s1", true, Some("CI failed".into()));
+        reg.set_alert("s3", true, Some("test failed".into()));
+
+        reg.clear_alerts("proj", "wt1");
+
+        // wt1 のアラートはクリア
+        assert!(!reg.get("s1").unwrap().alert);
+        assert!(reg.get("s1").unwrap().alert_message.is_none());
+        // wt2 は影響なし
+        assert!(reg.get("s3").unwrap().alert);
     }
 }

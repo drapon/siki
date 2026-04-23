@@ -4468,6 +4468,7 @@ fn clear_done_badges(
     let project = &app.projects[wt_id.0].name;
     if let Some(mut reg) = session_registry.as_ref().and_then(|r| r.lock().ok()) {
         reg.clear_done_sessions(project, &wt.name);
+        reg.clear_alerts(project, &wt.name);
     }
 }
 

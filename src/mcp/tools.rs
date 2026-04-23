@@ -18,6 +18,7 @@ pub fn execute_tool(
         "send_message" => send_message(conn, params, session_id),
         "broadcast" => broadcast(conn, params, session_id),
         "set_summary" => set_summary(conn, params, session_id),
+        "set_alert" => set_alert(conn, params, session_id),
         "handoff" => handoff(conn, params, session_id),
         "get_context" => get_context(conn, params),
         "save_skill" => save_skill(params),
@@ -65,6 +66,8 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
                 "state": s.state,
                 "summary": s.summary,
                 "cwd": s.cwd,
+                "alert": s.alert,
+                "alert_message": s.alert_message,
             })
         })
         .collect();
@@ -190,6 +193,21 @@ fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Va
     db::update_session_summary(conn, session_id, summary)?;
 
     Ok(json!({ "ok": true }))
+}
+
+fn set_alert(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
+    let message = params
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("message is required"))?;
+    let alert = params
+        .get("alert")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    db::update_session_alert(conn, session_id, alert, if alert { Some(message) } else { None })?;
+
+    Ok(json!({ "ok": true, "alert": alert }))
 }
 
 fn handoff(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
@@ -667,6 +685,50 @@ mod tests {
         assert!(msgs[0].content.contains("note: please write tests"));
         assert!(msgs[0].content.contains("summary: auth done"));
         assert_eq!(msgs[0].message_type, "handoff");
+    }
+
+    #[test]
+    fn test_set_alert() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+
+        // アラート発火
+        let params = json!({ "message": "CI failed" });
+        let result = set_alert(&conn, &params, "s1").unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["alert"], true);
+
+        let sessions = db::list_sessions(&conn).unwrap();
+        assert!(sessions[0].alert);
+        assert_eq!(sessions[0].alert_message.as_deref(), Some("CI failed"));
+    }
+
+    #[test]
+    fn test_set_alert_clear() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+        db::update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
+
+        // アラート解除
+        let params = json!({ "message": "resolved", "alert": false });
+        let result = set_alert(&conn, &params, "s1").unwrap();
+        assert_eq!(result["alert"], false);
+
+        let sessions = db::list_sessions(&conn).unwrap();
+        assert!(!sessions[0].alert);
+        assert!(sessions[0].alert_message.is_none());
+    }
+
+    #[test]
+    fn test_list_sessions_includes_alert() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
+        db::update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
+
+        let result = list_sessions(&conn, "s2", &json!({})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions[0]["alert"], true);
+        assert_eq!(sessions[0]["alert_message"], "CI failed");
     }
 
     #[test]

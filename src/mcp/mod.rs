@@ -172,7 +172,7 @@ mod tests {
         let resp = handle_request(&conn, &req, "test");
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
