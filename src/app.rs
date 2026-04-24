@@ -25,6 +25,7 @@ pub enum RightPanelMode {
     Tree,
     Diff,
     Context,
+    History,
 }
 
 /// Changes モード内の上下パネルフォーカス
