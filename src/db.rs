@@ -104,6 +104,10 @@ pub fn upsert_session(
         "INSERT INTO sessions (session_id, role, worktree_name, project_name, cwd, state, last_heartbeat, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
          ON CONFLICT(session_id) DO UPDATE SET
+           role = ?2,
+           worktree_name = ?3,
+           project_name = ?4,
+           cwd = ?5,
            state = ?6,
            last_heartbeat = ?7",
         rusqlite::params![session_id, role, worktree_name, project_name, cwd, state, now],
@@ -517,6 +521,24 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "s1");
         assert_eq!(sessions[1].state, "working");
+    }
+
+    #[test]
+    fn test_upsert_session_updates_metadata_on_conflict() {
+        let conn = test_db();
+        // 初回: unknown worktree で登録（レースコンディションで空 cwd 登録されたケース）
+        upsert_session(&conn, "s1", "default", "unknown", "unknown", "", "idle").unwrap();
+        let sessions = list_sessions(&conn).unwrap();
+        assert_eq!(sessions[0].worktree_name, "unknown");
+        assert_eq!(sessions[0].project_name, "unknown");
+
+        // 2回目: 正しい情報で Register が到着
+        upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
+        let sessions = list_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].worktree_name, "osaka");
+        assert_eq!(sessions[0].project_name, "myapp");
+        assert_eq!(sessions[0].cwd, "/tmp/osaka");
     }
 
     #[test]
