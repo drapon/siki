@@ -599,7 +599,7 @@ async fn handle_event(
                             handle_main_panel_key(app, claude_terms, event_tx, key, session_registry);
                         }
                         app::Panel::Right => {
-                            handle_right_panel_key(app, source_tree, diff_view, local_changes, history_view, broker_db, key);
+                            handle_right_panel_key(app, claude_terms, event_tx, source_tree, diff_view, local_changes, history_view, broker_db, key);
                         }
                         app::Panel::Terminal => unreachable!(),
                     }
@@ -1294,10 +1294,23 @@ async fn handle_event(
                                         }
                                     }
                                     app::RightPanelMode::History => {
-                                        if is_up {
-                                            history_view.select_prev();
+                                        // 右パネルの上40%がセッション一覧、下60%がサマリ
+                                        let rt = layout.right_top;
+                                        let split_y = rt.y + (rt.height * 40 / 100);
+                                        if mouse.row < split_y {
+                                            // セッション一覧のスクロール
+                                            if is_up {
+                                                history_view.select_prev();
+                                            } else {
+                                                history_view.select_next();
+                                            }
                                         } else {
-                                            history_view.select_next();
+                                            // サマリのスクロール
+                                            if is_up {
+                                                history_view.scroll_up(3);
+                                            } else {
+                                                history_view.scroll_down(3);
+                                            }
                                         }
                                     }
                                 }
@@ -1379,6 +1392,23 @@ async fn handle_event(
                     app.show_error(format!("Fetch 失敗: {}", msg));
                 }
             }
+        }
+        AppEvent::HistorySummaryGenerated { session_id, summary } => {
+            // DB にサマリを保存
+            if let Ok(conn) = broker_db.lock() {
+                let _ = db::update_conversation_log_summary(&conn, &session_id, &summary);
+            }
+            // History ビューをリロード
+            if let Some(wt_id) = app.selected_worktree {
+                if let Some(wt) = app.worktree_by_id(wt_id) {
+                    let project_name = app.projects[wt_id.0].name.clone();
+                    let worktree_name = wt.name.clone();
+                    if let Ok(conn) = broker_db.lock() {
+                        history_view.load(&conn, &worktree_name, &project_name);
+                    }
+                }
+            }
+            app.show_info(format!("Summary generated for {}", &session_id[..session_id.len().min(12)]));
         }
         AppEvent::RefreshChanges => {
             // Claude Code の hook 経由で Changes を再読み込み
@@ -4731,6 +4761,8 @@ fn handle_claude_terminal_key(
 
 fn handle_right_panel_key(
     app: &mut app::App,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     source_tree: &mut SourceTree,
     diff_view: &mut DiffView,
     local_changes: &mut ui::diff_view::LocalChangesView,
@@ -4738,7 +4770,7 @@ fn handle_right_panel_key(
     broker_db: &Arc<Mutex<rusqlite::Connection>>,
     key: crossterm::event::KeyEvent,
 ) {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     let mode = app
         .selected_worktree()
@@ -4937,10 +4969,16 @@ fn handle_right_panel_key(
                     history_view.select_prev();
                 }
                 KeyCode::Char('J') => {
-                    history_view.scroll_down();
+                    history_view.scroll_down(1);
                 }
                 KeyCode::Char('K') => {
-                    history_view.scroll_up();
+                    history_view.scroll_up(1);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    history_view.scroll_down(10);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    history_view.scroll_up(10);
                 }
                 KeyCode::Char('y') => {
                     // セッション ID をクリップボードにコピー
@@ -4964,12 +5002,38 @@ fn handle_right_panel_key(
                     }
                 }
                 KeyCode::Enter => {
-                    // 選択中のセッションを claude -r で再開
+                    // 選択中のセッションを claude -r <session_id> で直接再開
                     if let Some(session_id) = history_view.selected_session_id() {
-                        if let Some(wt) = app.selected_worktree_mut() {
-                            wt.claude_session_id = Some(session_id.to_string());
+                        let sid = session_id.to_string();
+                        if let Some(wt_id) = app.selected_worktree {
+                            launch_llm_with_args(app, claude_terms, event_tx, wt_id, "claude", &["-r", &sid]);
                         }
-                        app.show_info(format!("Session set: {} (press 'i' to resume)", &session_id[..session_id.len().min(12)]));
+                    }
+                }
+                KeyCode::Char('s') => {
+                    // 選択中セッションのサマリを claude で生成
+                    if let Some(session_id) = history_view.selected_session_id() {
+                        let sid = session_id.to_string();
+                        let messages_json = if let Ok(conn) = broker_db.lock() {
+                            db::get_conversation_log_messages(&conn, &sid).ok()
+                        } else {
+                            None
+                        };
+                        if let Some(messages_json) = messages_json {
+                            let tx = event_tx.clone();
+                            app.show_info(format!("Generating summary for {}…", &sid[..sid.len().min(12)]));
+                            tokio::spawn(async move {
+                                let summary = generate_summary_from_messages(&messages_json).await;
+                                if let Some(summary) = summary {
+                                    let _ = tx.send(event::AppEvent::HistorySummaryGenerated {
+                                        session_id: sid,
+                                        summary,
+                                    });
+                                }
+                            });
+                        } else {
+                            app.show_error("No conversation log found".to_string());
+                        }
                     }
                 }
                 KeyCode::Char('t') => {
@@ -4979,6 +5043,47 @@ fn handle_right_panel_key(
                 _ => {}
             }
         }
+    }
+}
+
+/// 会話ログ JSON から claude でサマリを生成する
+async fn generate_summary_from_messages(messages_json: &str) -> Option<String> {
+    let messages: Vec<serde_json::Value> = serde_json::from_str(messages_json).ok()?;
+    if messages.is_empty() {
+        return None;
+    }
+
+    let mut summary_input = String::new();
+    for msg in &messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let truncated: String = content.chars().take(200).collect();
+        summary_input.push_str(&format!("[{}] {}\n", role, truncated));
+    }
+
+    if summary_input.len() > 4000 {
+        let chars: Vec<char> = summary_input.chars().collect();
+        let head: String = chars[..1500].iter().collect();
+        let tail: String = chars[chars.len() - 1500..].iter().collect();
+        summary_input = format!("{}\n...(中略)...\n{}", head, tail);
+    }
+
+    let prompt = format!(
+        "以下はClaude Codeの会話ログです。このworktreeで何をやったかを3-5行で簡潔に要約してください。技術的な詳細（変更したファイル、実装内容、修正したバグ等）を含めてください。\n\n{}",
+        summary_input
+    );
+
+    let result = tokio::process::Command::new("claude")
+        .args(["--print", "-p", &prompt])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => None,
     }
 }
 

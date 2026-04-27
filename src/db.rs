@@ -438,6 +438,16 @@ pub fn get_conversation_logs_by_worktree(
     Ok(result)
 }
 
+/// session_id で会話ログの messages を取得する
+pub fn get_conversation_log_messages(conn: &Connection, session_id: &str) -> Result<String> {
+    let messages: String = conn.query_row(
+        "SELECT messages FROM conversation_logs WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(messages)
+}
+
 /// 保存済みセッションIDの一覧を取得する（未保存JSONL検出用）
 pub fn get_saved_conversation_session_ids(
     conn: &Connection,

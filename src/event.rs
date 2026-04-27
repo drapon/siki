@@ -78,6 +78,11 @@ pub enum AppEvent {
     GrepResults(Vec<crate::app::GrepResult>),
     /// Changes の再読み込み要求（broker 経由の refresh イベント）
     RefreshChanges,
+    /// History タブでの手動サマリ生成完了
+    HistorySummaryGenerated {
+        session_id: String,
+        summary: String,
+    },
     /// git fetch 完了
     FetchComplete {
         project_index: usize,

@@ -67,12 +67,12 @@ impl HistoryView {
         }
     }
 
-    pub fn scroll_down(&mut self) {
-        self.summary_scroll += 1;
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.summary_scroll += lines;
     }
 
-    pub fn scroll_up(&mut self) {
-        self.summary_scroll = self.summary_scroll.saturating_sub(1);
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.summary_scroll = self.summary_scroll.saturating_sub(lines);
     }
 
     /// 選択中のエントリのセッション ID を返す
@@ -122,7 +122,7 @@ impl HistoryView {
     ) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("History (y: copy ID  Enter: resume)")
+            .title("History (Enter: open  s: summarize  y: copy ID)")
             .border_style(border_style);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -309,16 +309,20 @@ mod tests {
     fn test_scroll() {
         let mut view = HistoryView::new();
         assert_eq!(view.summary_scroll, 0);
-        view.scroll_down();
+        view.scroll_down(1);
         assert_eq!(view.summary_scroll, 1);
-        view.scroll_down();
+        view.scroll_down(1);
         assert_eq!(view.summary_scroll, 2);
-        view.scroll_up();
+        view.scroll_up(1);
         assert_eq!(view.summary_scroll, 1);
-        view.scroll_up();
+        view.scroll_up(1);
         assert_eq!(view.summary_scroll, 0);
-        view.scroll_up(); // doesn't go below 0
+        view.scroll_up(1); // doesn't go below 0
         assert_eq!(view.summary_scroll, 0);
+        view.scroll_down(5);
+        assert_eq!(view.summary_scroll, 5);
+        view.scroll_up(3);
+        assert_eq!(view.summary_scroll, 2);
     }
 
     #[test]
