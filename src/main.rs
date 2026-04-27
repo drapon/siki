@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
     let mut source_tree = SourceTree::new();
     let mut diff_view = DiffView::new();
     let mut local_changes = ui::diff_view::LocalChangesView::new();
+    let mut history_view = ui::history_view::HistoryView::new();
     let mut sessions: HashMap<app::WorktreeId, claude::ClaudeSession> = HashMap::new();
     let mut terminals: HashMap<TerminalKey, terminal::TerminalEmulator> = HashMap::new();
     let mut claude_terms: HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator> =
@@ -279,6 +280,7 @@ async fn main() -> Result<()> {
                 &mut source_tree,
                 &diff_view,
                 &local_changes,
+                &history_view,
                 terminal_screen,
                 terminal_tab_info.as_ref(),
                 claude_screen,
@@ -307,6 +309,7 @@ async fn main() -> Result<()> {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -339,6 +342,7 @@ async fn handle_event(
     source_tree: &mut SourceTree,
     diff_view: &mut DiffView,
     local_changes: &mut ui::diff_view::LocalChangesView,
+    history_view: &mut ui::history_view::HistoryView,
     sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
@@ -595,7 +599,7 @@ async fn handle_event(
                             handle_main_panel_key(app, claude_terms, event_tx, key, session_registry);
                         }
                         app::Panel::Right => {
-                            handle_right_panel_key(app, source_tree, diff_view, local_changes, key);
+                            handle_right_panel_key(app, claude_terms, event_tx, source_tree, diff_view, local_changes, history_view, broker_db, key);
                         }
                         app::Panel::Terminal => unreachable!(),
                     }
@@ -972,7 +976,7 @@ async fn handle_event(
                             // タブバー行のクリック → Tree/Changes 切替
                             if mouse.row == layout.right_top.y {
                                 handle_right_panel_tab_click(
-                                    app, diff_view, local_changes, layout.right_top, mouse.column,
+                                    app, diff_view, local_changes, history_view, broker_db, layout.right_top, mouse.column,
                                 );
                             } else {
                                 // Treeモードならクリックでアイテム選択・ディレクトリ開閉
@@ -1070,6 +1074,28 @@ async fn handle_event(
                                                     ui::main_panel::open_diff_tab(app, &path, content);
                                                 }
                                             }
+                                        }
+                                    }
+                                } else if mode == app::RightPanelMode::History {
+                                    // History モード: クリックでセッション選択
+                                    let content_area = ratatui::prelude::Rect {
+                                        x: layout.right_top.x,
+                                        y: layout.right_top.y + 1,
+                                        width: layout.right_top.width,
+                                        height: layout.right_top.height.saturating_sub(1),
+                                    };
+                                    let history_chunks = ratatui::prelude::Layout::vertical([
+                                        ratatui::prelude::Constraint::Percentage(40),
+                                        ratatui::prelude::Constraint::Percentage(60),
+                                    ])
+                                    .split(content_area);
+                                    // セッション一覧領域のクリック
+                                    let inner_top = history_chunks[0].y + 1;
+                                    if mouse.row >= inner_top && mouse.row < history_chunks[1].y {
+                                        let clicked_row = (mouse.row - inner_top) as usize;
+                                        if clicked_row < history_view.entries.len() {
+                                            history_view.selected = clicked_row;
+                                            history_view.summary_scroll = 0;
                                         }
                                     }
                                 }
@@ -1267,6 +1293,26 @@ async fn handle_event(
                                             }
                                         }
                                     }
+                                    app::RightPanelMode::History => {
+                                        // 右パネルの上40%がセッション一覧、下60%がサマリ
+                                        let rt = layout.right_top;
+                                        let split_y = rt.y + (rt.height * 40 / 100);
+                                        if mouse.row < split_y {
+                                            // セッション一覧のスクロール
+                                            if is_up {
+                                                history_view.select_prev();
+                                            } else {
+                                                history_view.select_next();
+                                            }
+                                        } else {
+                                            // サマリのスクロール
+                                            if is_up {
+                                                history_view.scroll_up(3);
+                                            } else {
+                                                history_view.scroll_down(3);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Some(app::Panel::Terminal) => {
@@ -1346,6 +1392,23 @@ async fn handle_event(
                     app.show_error(format!("Fetch 失敗: {}", msg));
                 }
             }
+        }
+        AppEvent::HistorySummaryGenerated { session_id, summary } => {
+            // DB にサマリを保存
+            if let Ok(conn) = broker_db.lock() {
+                let _ = db::update_conversation_log_summary(&conn, &session_id, &summary);
+            }
+            // History ビューをリロード
+            if let Some(wt_id) = app.selected_worktree {
+                if let Some(wt) = app.worktree_by_id(wt_id) {
+                    let project_name = app.projects[wt_id.0].name.clone();
+                    let worktree_name = wt.name.clone();
+                    if let Ok(conn) = broker_db.lock() {
+                        history_view.load(&conn, &worktree_name, &project_name);
+                    }
+                }
+            }
+            app.show_info(format!("Summary generated for {}", &session_id[..session_id.len().min(12)]));
         }
         AppEvent::RefreshChanges => {
             // Claude Code の hook 経由で Changes を再読み込み
@@ -2303,29 +2366,34 @@ fn extract_file_selection(
     Some(result)
 }
 
-/// 右パネルのタブバー (Tree | Changes) のクリックを処理する
+/// 右パネルのタブバー (Tree | Changes | Context | History) のクリックを処理する
 fn handle_right_panel_tab_click(
     app: &mut app::App,
     diff_view: &mut ui::diff_view::DiffView,
     local_changes: &mut ui::diff_view::LocalChangesView,
+    history_view: &mut ui::history_view::HistoryView,
+    broker_db: &Arc<Mutex<rusqlite::Connection>>,
     right_top_area: ratatui::prelude::Rect,
     click_x: u16,
 ) {
     let Some(wt_id) = app.selected_worktree else {
         return;
     };
-    // ratatui 0.30 Tabs: "Tree|Changes|Context" (パディングなし)
-    // "Tree" = 4文字, "|" = 1文字, "Changes" = 7文字, "|" = 1文字, "Context" = 7文字
+    // ratatui 0.30 Tabs: "Tree|Changes|Context|History" (パディングなし)
+    // "Tree" = 4, "|" = 1, "Changes" = 7, "|" = 1, "Context" = 7, "|" = 1, "History" = 7
+    // positions: Tree=0..3, |=4, Changes=5..11, |=12, Context=13..19, |=20, History=21..27
     let tab_x = click_x.saturating_sub(right_top_area.x);
     let new_mode = if tab_x < 4 {
         app::RightPanelMode::Tree
-    } else if tab_x == 4 || tab_x == 12 {
+    } else if tab_x == 4 || tab_x == 12 || tab_x == 20 {
         // divider 上のクリックは無視
         return;
     } else if tab_x >= 5 && tab_x < 12 {
         app::RightPanelMode::Diff
-    } else {
+    } else if tab_x >= 13 && tab_x < 20 {
         app::RightPanelMode::Context
+    } else {
+        app::RightPanelMode::History
     };
     let current_mode = app.worktree_by_id(wt_id).map(|wt| wt.right_panel_mode);
     if current_mode == Some(new_mode) {
@@ -2352,6 +2420,16 @@ fn handle_right_panel_tab_click(
         if let Some(wt) = app.worktree_by_id_mut(wt_id) {
             wt.context_items = items;
             wt.context_cursor = 0;
+        }
+    }
+    // History モードに切り替えた時は会話ログを読み込む
+    if new_mode == app::RightPanelMode::History {
+        if let Some(wt) = app.worktree_by_id(wt_id) {
+            let project_name = app.projects[wt_id.0].name.clone();
+            let worktree_name = wt.name.clone();
+            if let Ok(conn) = broker_db.lock() {
+                history_view.load(&conn, &worktree_name, &project_name);
+            }
         }
     }
 }
@@ -4683,12 +4761,16 @@ fn handle_claude_terminal_key(
 
 fn handle_right_panel_key(
     app: &mut app::App,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     source_tree: &mut SourceTree,
     diff_view: &mut DiffView,
     local_changes: &mut ui::diff_view::LocalChangesView,
+    history_view: &mut ui::history_view::HistoryView,
+    broker_db: &Arc<Mutex<rusqlite::Connection>>,
     key: crossterm::event::KeyEvent,
 ) {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     let mode = app
         .selected_worktree()
@@ -4740,7 +4822,7 @@ fn handle_right_panel_key(
                 }
                 KeyCode::Char('t') => {
                     ui::right_panel::toggle_mode(app);
-                    load_right_panel_data_if_needed(app, diff_view, local_changes);
+                    load_right_panel_data_if_needed(app, diff_view, local_changes, history_view, broker_db);
                 }
                 _ => {}
             }
@@ -4824,7 +4906,7 @@ fn handle_right_panel_key(
                 }
                 KeyCode::Char('t') => {
                     ui::right_panel::toggle_mode(app);
-                    load_right_panel_data_if_needed(app, diff_view, local_changes);
+                    load_right_panel_data_if_needed(app, diff_view, local_changes, history_view, broker_db);
                 }
                 KeyCode::Tab => {
                     // Tab で上下パネル切替
@@ -4873,11 +4955,135 @@ fn handle_right_panel_key(
                 }
                 KeyCode::Char('t') => {
                     ui::right_panel::toggle_mode(app);
-                    load_right_panel_data_if_needed(app, diff_view, local_changes);
+                    load_right_panel_data_if_needed(app, diff_view, local_changes, history_view, broker_db);
                 }
                 _ => {}
             }
         }
+        app::RightPanelMode::History => {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    history_view.select_next();
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    history_view.select_prev();
+                }
+                KeyCode::Char('J') => {
+                    history_view.scroll_down(1);
+                }
+                KeyCode::Char('K') => {
+                    history_view.scroll_up(1);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    history_view.scroll_down(10);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    history_view.scroll_up(10);
+                }
+                KeyCode::Char('y') => {
+                    // セッション ID をクリップボードにコピー
+                    if let Some(session_id) = history_view.selected_session_id() {
+                        let id = session_id.to_string();
+                        if let Ok(status) = std::process::Command::new("pbcopy")
+                            .stdin(std::process::Stdio::piped())
+                            .spawn()
+                            .and_then(|mut child| {
+                                use std::io::Write;
+                                if let Some(ref mut stdin) = child.stdin {
+                                    let _ = stdin.write_all(id.as_bytes());
+                                }
+                                child.wait()
+                            })
+                        {
+                            if status.success() {
+                                app.show_info(format!("Copied: {}", id));
+                            }
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    // 選択中のセッションを claude -r <session_id> で直接再開
+                    if let Some(session_id) = history_view.selected_session_id() {
+                        let sid = session_id.to_string();
+                        if let Some(wt_id) = app.selected_worktree {
+                            launch_llm_with_args(app, claude_terms, event_tx, wt_id, "claude", &["-r", &sid]);
+                        }
+                    }
+                }
+                KeyCode::Char('s') => {
+                    // 選択中セッションのサマリを claude で生成
+                    if let Some(session_id) = history_view.selected_session_id() {
+                        let sid = session_id.to_string();
+                        let messages_json = if let Ok(conn) = broker_db.lock() {
+                            db::get_conversation_log_messages(&conn, &sid).ok()
+                        } else {
+                            None
+                        };
+                        if let Some(messages_json) = messages_json {
+                            let tx = event_tx.clone();
+                            app.show_info(format!("Generating summary for {}…", &sid[..sid.len().min(12)]));
+                            tokio::spawn(async move {
+                                let summary = generate_summary_from_messages(&messages_json).await;
+                                if let Some(summary) = summary {
+                                    let _ = tx.send(event::AppEvent::HistorySummaryGenerated {
+                                        session_id: sid,
+                                        summary,
+                                    });
+                                }
+                            });
+                        } else {
+                            app.show_error("No conversation log found".to_string());
+                        }
+                    }
+                }
+                KeyCode::Char('t') => {
+                    ui::right_panel::toggle_mode(app);
+                    load_right_panel_data_if_needed(app, diff_view, local_changes, history_view, broker_db);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 会話ログ JSON から claude でサマリを生成する
+async fn generate_summary_from_messages(messages_json: &str) -> Option<String> {
+    let messages: Vec<serde_json::Value> = serde_json::from_str(messages_json).ok()?;
+    if messages.is_empty() {
+        return None;
+    }
+
+    let mut summary_input = String::new();
+    for msg in &messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let truncated: String = content.chars().take(200).collect();
+        summary_input.push_str(&format!("[{}] {}\n", role, truncated));
+    }
+
+    if summary_input.len() > 4000 {
+        let chars: Vec<char> = summary_input.chars().collect();
+        let head: String = chars[..1500].iter().collect();
+        let tail: String = chars[chars.len() - 1500..].iter().collect();
+        summary_input = format!("{}\n...(中略)...\n{}", head, tail);
+    }
+
+    let prompt = format!(
+        "以下はClaude Codeの会話ログです。このworktreeで何をやったかを3-5行で簡潔に要約してください。技術的な詳細（変更したファイル、実装内容、修正したバグ等）を含めてください。\n\n{}",
+        summary_input
+    );
+
+    let result = tokio::process::Command::new("claude")
+        .args(["--print", "-p", &prompt])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        _ => None,
     }
 }
 
@@ -4886,6 +5092,8 @@ fn load_right_panel_data_if_needed(
     app: &mut app::App,
     diff_view: &mut DiffView,
     local_changes: &mut ui::diff_view::LocalChangesView,
+    history_view: &mut ui::history_view::HistoryView,
+    broker_db: &Arc<Mutex<rusqlite::Connection>>,
 ) {
     if let Some(wt_id) = app.selected_worktree {
         if let Some(wt) = app.worktree_by_id(wt_id) {
@@ -4903,6 +5111,13 @@ fn load_right_panel_data_if_needed(
                     if let Some(wt) = app.worktree_by_id_mut(wt_id) {
                         wt.context_items = items;
                         wt.context_cursor = 0;
+                    }
+                }
+                app::RightPanelMode::History => {
+                    let project_name = app.projects[wt_id.0].name.clone();
+                    let worktree_name = wt.name.clone();
+                    if let Ok(conn) = broker_db.lock() {
+                        history_view.load(&conn, &worktree_name, &project_name);
                     }
                 }
                 _ => {}
@@ -5025,6 +5240,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5038,6 +5254,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5061,6 +5278,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5074,6 +5292,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5097,6 +5316,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5110,6 +5330,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5133,6 +5354,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5147,6 +5369,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5171,6 +5394,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5184,6 +5408,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5207,6 +5432,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5220,6 +5446,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5244,6 +5471,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5257,6 +5485,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5280,6 +5509,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5293,6 +5523,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5318,6 +5549,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5332,6 +5564,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5356,6 +5589,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5370,6 +5604,7 @@ mod tests {
                 &mut source_tree,
                 &mut diff_view,
                 &mut local_changes,
+                &mut history_view,
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
@@ -5394,6 +5629,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5408,6 +5644,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5431,6 +5668,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5445,6 +5683,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5471,6 +5710,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5485,6 +5725,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5508,6 +5749,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5522,6 +5764,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5547,6 +5790,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5564,6 +5808,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5587,6 +5832,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5601,6 +5847,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5626,6 +5873,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5638,6 +5886,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5669,6 +5918,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5681,6 +5931,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5707,6 +5958,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5719,6 +5971,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5750,6 +6003,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5763,6 +6017,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5786,6 +6041,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5801,6 +6057,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5832,6 +6089,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5851,6 +6109,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5879,6 +6138,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5903,6 +6163,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5926,6 +6187,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5949,6 +6211,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -5977,6 +6240,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -5991,6 +6255,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6018,6 +6283,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6032,6 +6298,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6058,6 +6325,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6070,6 +6338,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6096,6 +6365,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6108,6 +6378,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6131,6 +6402,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6145,6 +6417,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6169,6 +6442,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6183,6 +6457,7 @@ mod tests {
                 &mut source_tree,
                 &mut diff_view,
                 &mut local_changes,
+                &mut history_view,
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
@@ -6207,6 +6482,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6221,6 +6497,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6244,6 +6521,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6259,6 +6537,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6284,6 +6563,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6298,6 +6578,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6347,6 +6628,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6365,6 +6647,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6399,6 +6682,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6412,6 +6696,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6437,6 +6722,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6451,6 +6737,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6475,6 +6762,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6489,6 +6777,7 @@ mod tests {
                 &mut source_tree,
                 &mut diff_view,
                 &mut local_changes,
+                &mut history_view,
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
@@ -6513,6 +6802,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6528,6 +6818,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6552,6 +6843,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6567,6 +6859,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6596,6 +6889,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6612,6 +6906,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6639,6 +6934,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6652,6 +6948,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
@@ -6676,6 +6973,7 @@ mod tests {
         let mut source_tree = SourceTree::new();
         let mut diff_view = DiffView::new();
         let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
@@ -6697,6 +6995,7 @@ mod tests {
             &mut source_tree,
             &mut diff_view,
             &mut local_changes,
+            &mut history_view,
             &mut sessions,
             &mut terminals,
             &mut claude_terms,

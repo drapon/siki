@@ -3,6 +3,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 
 use super::diff_view::{DiffView, LocalChangesView};
+use super::history_view::HistoryView;
 use super::source_tree::SourceTree;
 
 /// 右パネル上部を描画する
@@ -13,6 +14,7 @@ pub fn render_top(
     source_tree: &mut SourceTree,
     diff_view: &DiffView,
     local_changes: &LocalChangesView,
+    history_view: &HistoryView,
     focused: bool,
 ) {
     match app.selected_worktree() {
@@ -28,8 +30,9 @@ pub fn render_top(
                 RightPanelMode::Tree => 0,
                 RightPanelMode::Diff => 1,
                 RightPanelMode::Context => 2,
+                RightPanelMode::History => 3,
             };
-            let tabs = Tabs::new(vec!["Tree", "Changes", "Context"])
+            let tabs = Tabs::new(vec!["Tree", "Changes", "Context", "History"])
                 .select(active)
                 .highlight_style(
                     Style::default()
@@ -66,6 +69,9 @@ pub fn render_top(
                 RightPanelMode::Context => {
                     render_context_list(frame, chunks[1], &wt.context_items, wt.context_cursor, focused);
                 }
+                RightPanelMode::History => {
+                    history_view.render(frame, chunks[1], focused);
+                }
             }
         }
         None => {
@@ -93,7 +99,8 @@ pub fn toggle_mode(app: &mut App) {
         wt.right_panel_mode = match wt.right_panel_mode {
             RightPanelMode::Tree => RightPanelMode::Diff,
             RightPanelMode::Diff => RightPanelMode::Context,
-            RightPanelMode::Context => RightPanelMode::Tree,
+            RightPanelMode::Context => RightPanelMode::History,
+            RightPanelMode::History => RightPanelMode::Tree,
         };
     }
 }
@@ -185,6 +192,12 @@ mod tests {
         assert_eq!(
             app.selected_worktree().unwrap().right_panel_mode,
             RightPanelMode::Context
+        );
+
+        toggle_mode(&mut app);
+        assert_eq!(
+            app.selected_worktree().unwrap().right_panel_mode,
+            RightPanelMode::History
         );
 
         toggle_mode(&mut app);

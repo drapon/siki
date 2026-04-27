@@ -1,5 +1,6 @@
 pub mod diff_view;
 pub mod grep_view;
+pub mod history_view;
 pub mod layout;
 pub mod left_panel;
 pub mod main_panel;
@@ -14,6 +15,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use diff_view::{DiffView, LocalChangesView};
+use history_view::HistoryView;
 use source_tree::SourceTree;
 
 /// ターミナルタブ情報（描画用）
@@ -40,6 +42,7 @@ pub fn render(
     source_tree: &mut SourceTree,
     diff_view: &DiffView,
     local_changes: &LocalChangesView,
+    history_view: &HistoryView,
     terminal_screen: Option<&vt100::Screen>,
     terminal_tab_info: Option<&TerminalTabInfo>,
     claude_screen: Option<&vt100::Screen>,
@@ -62,7 +65,7 @@ pub fn render(
         grep_rows,
     );
 
-    // 右パネル上部（SourceTree / DiffView）
+    // 右パネル上部（SourceTree / DiffView / History）
     right_panel::render_top(
         frame,
         areas.right_top,
@@ -70,6 +73,7 @@ pub fn render(
         source_tree,
         diff_view,
         local_changes,
+        history_view,
         app.focused_panel == Panel::Right,
     );
 
