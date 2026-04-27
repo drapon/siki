@@ -23,7 +23,7 @@ pub fn execute_tool(
         "get_context" => get_context(conn, params),
         "save_skill" => save_skill(params),
         "list_skills" => list_skills(params),
-        "summarize_history" => summarize_history(conn, params),
+        "summarize_history" => summarize_history(conn, params, session_id),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -90,12 +90,10 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         let _ = db::mark_messages_read(conn, &msg_ids);
     }
 
-    // cwd から自分の worktree のコンテキストを読み込む
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let worktree_contexts = if let Some((proj, wt)) =
-        crate::config::detect_project_worktree_from_cwd(&cwd)
-    {
-        let contexts = crate::config::load_contexts(&proj, &wt);
+    // DB から自分のセッション情報で worktree のコンテキストを読み込む
+    // （std::env::current_dir() はMCPサーバーの起動元CWDであり、worktreeパスと異なる場合がある）
+    let worktree_contexts = if !proj.is_empty() && !wt.is_empty() {
+        let contexts = crate::config::load_contexts(proj, wt);
         if contexts.is_empty() {
             None
         } else {
@@ -405,7 +403,7 @@ fn run_git(cwd: &str, args: &[&str]) -> String {
 }
 
 /// 会話履歴をサマライズして worktree_contexts に保存し、元セッションをマーク
-fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
+fn summarize_history(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
     let summary = params
         .get("summary")
         .and_then(|v| v.as_str())
@@ -424,13 +422,23 @@ fn summarize_history(conn: &Connection, params: &Value) -> Result<Value> {
         anyhow::bail!("session_ids must not be empty");
     }
 
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let cwd_str = cwd.to_string_lossy().to_string();
+    // DB からセッション情報を取得して worktree を特定
+    // （std::env::current_dir() はMCPサーバーの起動元CWDであり、worktreeパスと異なる場合がある）
+    let all_sessions = db::list_sessions(conn)?;
+    let my_session = all_sessions.iter().find(|s| s.session_id == session_id);
+    let (proj, wt) = my_session
+        .map(|s| (s.project_name.as_str(), s.worktree_name.as_str()))
+        .unwrap_or(("", ""));
+
+    let cwd_str = my_session
+        .map(|s| s.cwd.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // worktree_contexts ディレクトリに要約を保存（ファイルが大きくなったら分割）
     const MAX_FILE_SIZE: usize = 100_000; // 100KB per file
 
-    if let Some((proj, wt)) = crate::config::detect_project_worktree_from_cwd(&cwd) {
+    if !proj.is_empty() && !wt.is_empty() {
         let ctx_dir = crate::config::worktree_contexts_dir(&proj, &wt);
         std::fs::create_dir_all(&ctx_dir)?;
 
