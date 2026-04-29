@@ -61,59 +61,70 @@ impl Broker {
 
                     let saved_sessions = Arc::clone(&self.saved_sessions);
                     tokio::spawn(async move {
-                        let reader = tokio::io::BufReader::new(stream);
-                        let mut lines = reader.lines();
+                        // 1接続 = 1行のJSONメッセージ — 読み取り後すぐに接続を閉じる
+                        // （nc クライアントが接続終了を待ってブロックするのを防ぐ）
+                        let line = {
+                            let reader = tokio::io::BufReader::new(stream);
+                            let mut lines = reader.lines();
+                            lines.next_line().await
+                        };
+                        // ↑ reader + stream がここで drop → nc は即座に EOF を受け取り終了
 
-                        // 1接続 = 1行のJSONメッセージ
-                        if let Ok(Some(line)) = lines.next_line().await {
-                            if let Ok(hook_event) = serde_json::from_str::<HookEvent>(&line) {
-                                let is_refresh = matches!(hook_event, HookEvent::Refresh { .. });
-                                let is_idle = matches!(hook_event, HookEvent::Idle { .. });
-                                let session_id = hook_event.session_id().to_string();
+                        let line = match line {
+                            Ok(Some(l)) => l,
+                            _ => return,
+                        };
 
-                                // SQLite にも書き込む
-                                Self::sync_to_db(&db, &hook_event);
+                        let hook_event = match serde_json::from_str::<HookEvent>(&line) {
+                            Ok(e) => e,
+                            Err(_) => return,
+                        };
 
-                                let changed = {
-                                    let mut reg = registry.lock().unwrap();
-                                    reg.handle_event(hook_event)
-                                };
+                        let is_refresh = matches!(hook_event, HookEvent::Refresh { .. });
+                        let is_idle = matches!(hook_event, HookEvent::Idle { .. });
+                        let session_id = hook_event.session_id().to_string();
 
-                                // Idle 時に会話ログを非同期保存
-                                if is_idle {
-                                    let already_saved = {
-                                        let set = saved_sessions.lock().unwrap();
-                                        set.contains(&session_id)
-                                    };
-                                    if !already_saved {
-                                        let db2 = Arc::clone(&db);
-                                        let saved2 = Arc::clone(&saved_sessions);
-                                        let sid = session_id.clone();
-                                        tokio::spawn(async move {
-                                            save_conversation_log(&db2, &sid, &saved2).await;
-                                        });
-                                    }
-                                }
+                        // SQLite にも書き込む
+                        Self::sync_to_db(&db, &hook_event);
 
-                                // Refresh イベントは Changes の再読み込みを通知
-                                if is_refresh {
-                                    let _ = event_tx.send(AppEvent::RefreshChanges);
-                                    return;
-                                }
+                        let changed = {
+                            let mut reg = registry.lock().unwrap();
+                            reg.handle_event(hook_event)
+                        };
 
-                                if changed {
-                                    let state = {
-                                        let reg = registry.lock().unwrap();
-                                        reg.get(&session_id)
-                                            .map(|s| s.state)
-                                            .unwrap_or(SessionState::Idle)
-                                    };
-                                    let _ = event_tx.send(AppEvent::SessionUpdate {
-                                        session_id,
-                                        state,
-                                    });
-                                }
+                        // Idle 時に会話ログを非同期保存
+                        if is_idle {
+                            let already_saved = {
+                                let set = saved_sessions.lock().unwrap();
+                                set.contains(&session_id)
+                            };
+                            if !already_saved {
+                                let db2 = Arc::clone(&db);
+                                let saved2 = Arc::clone(&saved_sessions);
+                                let sid = session_id.clone();
+                                tokio::spawn(async move {
+                                    save_conversation_log(&db2, &sid, &saved2).await;
+                                });
                             }
+                        }
+
+                        // Refresh イベントは Changes の再読み込みを通知
+                        if is_refresh {
+                            let _ = event_tx.send(AppEvent::RefreshChanges);
+                            return;
+                        }
+
+                        if changed {
+                            let state = {
+                                let reg = registry.lock().unwrap();
+                                reg.get(&session_id)
+                                    .map(|s| s.state)
+                                    .unwrap_or(SessionState::Idle)
+                            };
+                            let _ = event_tx.send(AppEvent::SessionUpdate {
+                                session_id,
+                                state,
+                            });
                         }
                     });
                 }
