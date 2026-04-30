@@ -133,6 +133,11 @@ pub fn render(
         render_archive_confirm_popup(frame, app);
     }
 
+    // 削除確認ダイアログ
+    if app.show_delete_confirm {
+        render_delete_confirm_popup(frame, app);
+    }
+
     // プロジェクト除外確認ダイアログ
     if app.show_remove_project_confirm {
         render_remove_project_confirm_popup(frame, app);
@@ -299,6 +304,7 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  C          : コンテキスト管理",
         "  L          : シンボリックリンク設定",
         "  d          : worktree アーカイブ / プロジェクト除外",
+        "  D          : worktree 削除（完全消去）",
         "",
         "[中央パネル]",
         "  Tab        : 次のタブ",
@@ -615,6 +621,30 @@ fn render_archive_confirm_popup(frame: &mut Frame, app: &App) {
 
     let text = format!(
         "\n  \"{}\" ({})\n  をアーカイブしますか？\n\n  y: アーカイブ  n: キャンセル",
+        wt_name, wt_branch,
+    );
+    let paragraph = Paragraph::new(text).block(block);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_delete_confirm_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(40, 20, frame.area());
+
+    let (wt_name, wt_branch) = app
+        .delete_target
+        .and_then(|id| app.worktree_by_id(id))
+        .map(|wt| (wt.name.as_str(), wt.branch.as_str()))
+        .unwrap_or(("???", "???"));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Worktree 削除")
+        .border_style(Style::default().fg(Color::Red));
+
+    let text = format!(
+        "\n  \"{}\" ({})\n  を完全に削除しますか？\n  （この操作は取り消せません）\n\n  y: 削除  n: キャンセル",
         wt_name, wt_branch,
     );
     let paragraph = Paragraph::new(text).block(block);
