@@ -195,6 +195,56 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Worktree をアーカイブする
+    ///
+    /// worktree のディレクトリを ~/.siki/archived/<project>/<worktree>/ に移動し、
+    /// git worktree prune で管理情報をクリーンアップする。
+    pub fn archive_worktree(
+        project_path: &Path,
+        worktree_path: &Path,
+        archive_dest: &Path,
+    ) -> Result<()> {
+        if !worktree_path.exists() {
+            anyhow::bail!("worktree が存在しません: {}", worktree_path.display());
+        }
+
+        // アーカイブ先の親ディレクトリを作成
+        if let Some(parent) = archive_dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("アーカイブディレクトリの作成に失敗: {}", parent.display()))?;
+        }
+
+        // 同名のアーカイブが既に存在する場合はタイムスタンプ付きにリネーム
+        let dest = if archive_dest.exists() {
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let name = archive_dest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("worktree");
+            archive_dest.with_file_name(format!("{}_{}", name, timestamp))
+        } else {
+            archive_dest.to_path_buf()
+        };
+
+        // worktree ディレクトリを移動
+        std::fs::rename(worktree_path, &dest)
+            .with_context(|| {
+                format!(
+                    "worktree の移動に失敗: {} → {}",
+                    worktree_path.display(),
+                    dest.display()
+                )
+            })?;
+
+        // git worktree prune で管理情報をクリーンアップ
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(project_path)
+            .output();
+
+        Ok(())
+    }
+
     /// リモートを fetch して追跡ブランチを最新化する
     pub fn fetch_remote(project_path: &Path, remote: &str) -> Result<String> {
         let output = Command::new("git")

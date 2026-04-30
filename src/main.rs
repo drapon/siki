@@ -520,6 +520,10 @@ async fn handle_event(
                 handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, left_panel, key);
                 return;
             }
+            if app.show_delete_confirm {
+                handle_delete_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, left_panel, key);
+                return;
+            }
             if app.show_remove_project_confirm {
                 handle_remove_project_confirm_key(app, sessions, terminals, claude_terms, key);
                 return;
@@ -844,7 +848,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings || app.show_context_list || app.show_context_name_popup || app.show_context_url_popup {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_delete_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings || app.show_context_list || app.show_context_name_popup || app.show_context_url_popup {
                 return;
             }
             match mouse.kind {
@@ -2616,6 +2620,15 @@ fn handle_left_panel_key(
                 None => {}
             }
         }
+        KeyCode::Char('D') => {
+            match left_panel.current_entry(&entries) {
+                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) => {
+                    app.delete_target = Some((*project_index, *worktree_index));
+                    app.show_delete_confirm = true;
+                }
+                None | Some(ui::left_panel::ListEntry::Project { .. }) => {}
+            }
+        }
         KeyCode::Char('F') => {
             // git fetch でリモート追跡ブランチを最新化
             let project_index = match left_panel.current_entry(&entries) {
@@ -4365,7 +4378,110 @@ fn handle_archive_confirm_key(
                     claude_terms.remove(&key);
                 }
 
-                // git worktree を削除
+                // worktree をアーカイブ（~/.siki/archived/<project>/<worktree>/ に移動）
+                let archive_dest = config::archived_dir()
+                    .join(&app.projects[pi].name)
+                    .join(&wt_name);
+                match git::WorktreeManager::archive_worktree(&project_path, &wt_path, &archive_dest) {
+                    Ok(()) => {
+                        // project.json から worktree メタデータを削除
+                        let _ = config::save_worktree_display_name(&app.projects[pi].name, &wt_name, None);
+
+                        // メモリから worktree を削除
+                        app.projects[pi].worktrees.remove(wi);
+
+                        // selected_worktree をリセット（削除対象 or インデックスずれ対応）
+                        if let Some((sel_pi, sel_wi)) = app.selected_worktree {
+                            if sel_pi == pi && sel_wi == wi {
+                                app.selected_worktree = None;
+                            } else if sel_pi == pi && sel_wi > wi {
+                                app.selected_worktree = Some((sel_pi, sel_wi - 1));
+                            }
+                        }
+
+                        // 同一プロジェクト内の削除位置より後の worktree のインデックスを再調整
+                        reindex_worktree_maps(sessions, terminals, claude_terms, pi, wi);
+
+                        // left_panel のカーソル位置を調整
+                        let entries = LeftPanel::build_entries(&app.projects);
+                        left_panel.clamp_cursor(entries.len());
+                        left_panel.scroll_offset = 0;
+
+                        app.show_info(format!("worktree をアーカイブしました: {}", wt_name));
+                    }
+                    Err(e) => {
+                        app.show_error(format!("worktree のアーカイブに失敗: {}", e));
+                    }
+                }
+            }
+
+            app.show_archive_confirm = false;
+            app.archive_target = None;
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            app.show_archive_confirm = false;
+            app.archive_target = None;
+        }
+        _ => {}
+    }
+}
+
+/// 削除確認ダイアログのキー処理
+fn handle_delete_confirm_key(
+    app: &mut app::App,
+    sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    left_panel: &mut LeftPanel,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+            if let Some((pi, wi)) = app.delete_target {
+                let project_path = app.projects[pi].path.clone();
+                let wt_name = app.projects[pi].worktrees[wi].name.clone();
+                let wt_path = app.projects[pi].worktrees[wi].path.clone();
+                let wt_id = (pi, wi);
+
+                // archive スクリプトがあれば実行（siki.json 優先、なければ project.json）
+                let project_name = &app.projects[pi].name;
+                if let Some(siki_json) = config::load_effective_siki_json(&project_path, project_name) {
+                    if let Some(ref archive_script) = siki_json.scripts.archive {
+                        run_siki_script(
+                            app, terminals, event_tx, shell,
+                            wt_id, archive_script, &wt_name, &wt_path,
+                        );
+                    }
+                }
+
+                // 関連する Claude セッションをクリーンアップ
+                sessions.remove(&wt_id);
+
+                // 関連するターミナルをクリーンアップ
+                let term_keys: Vec<_> = terminals
+                    .keys()
+                    .filter(|k| k.0 == wt_id)
+                    .cloned()
+                    .collect();
+                for key in term_keys {
+                    terminals.remove(&key);
+                }
+
+                // 関連する Claude ターミナルをクリーンアップ
+                let claude_keys: Vec<_> = claude_terms
+                    .keys()
+                    .filter(|k| k.0 == wt_id)
+                    .cloned()
+                    .collect();
+                for key in claude_keys {
+                    claude_terms.remove(&key);
+                }
+
+                // git worktree を完全削除
                 match git::WorktreeManager::remove_worktree(&project_path, &wt_path) {
                     Ok(()) => {
                         // project.json から worktree メタデータを削除
@@ -4399,12 +4515,12 @@ fn handle_archive_confirm_key(
                 }
             }
 
-            app.show_archive_confirm = false;
-            app.archive_target = None;
+            app.show_delete_confirm = false;
+            app.delete_target = None;
         }
         KeyCode::Char('n') | KeyCode::Esc => {
-            app.show_archive_confirm = false;
-            app.archive_target = None;
+            app.show_delete_confirm = false;
+            app.delete_target = None;
         }
         _ => {}
     }
