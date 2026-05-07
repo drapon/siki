@@ -88,6 +88,11 @@ pub enum AppEvent {
         project_index: usize,
         result: Result<String, String>,
     },
+    /// worktree の git 削除がバックグラウンドで完了した
+    WorktreeRemoveCompleted {
+        worktree_name: String,
+        result: Result<(), String>,
+    },
 }
 
 /// Claude Code ストリームイベント型

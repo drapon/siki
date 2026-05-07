@@ -1393,6 +1393,19 @@ async fn handle_event(
                 }
             }
         }
+        AppEvent::WorktreeRemoveCompleted { worktree_name, result } => {
+            match result {
+                Ok(()) => {
+                    app.show_info(format!("worktree を削除しました: {}", worktree_name));
+                }
+                Err(e) => {
+                    app.show_error(format!(
+                        "worktree の削除に失敗 ({}): {} — `git worktree prune` の手動実行が必要かもしれません",
+                        worktree_name, e
+                    ));
+                }
+            }
+        }
         AppEvent::HistorySummaryGenerated { session_id, summary } => {
             // DB にサマリを保存
             if let Ok(conn) = broker_db.lock() {
@@ -4365,38 +4378,43 @@ fn handle_archive_confirm_key(
                     claude_terms.remove(&key);
                 }
 
-                // git worktree を削除
-                match git::WorktreeManager::remove_worktree(&project_path, &wt_path) {
-                    Ok(()) => {
-                        // project.json から worktree メタデータを削除
-                        let _ = config::save_worktree_display_name(&app.projects[pi].name, &wt_name, None);
+                // project.json から worktree メタデータを削除
+                let _ = config::save_worktree_display_name(&app.projects[pi].name, &wt_name, None);
 
-                        // メモリから worktree を削除
-                        app.projects[pi].worktrees.remove(wi);
+                // メモリから worktree を削除（楽観的）
+                app.projects[pi].worktrees.remove(wi);
 
-                        // selected_worktree をリセット（削除対象 or インデックスずれ対応）
-                        if let Some((sel_pi, sel_wi)) = app.selected_worktree {
-                            if sel_pi == pi && sel_wi == wi {
-                                app.selected_worktree = None;
-                            } else if sel_pi == pi && sel_wi > wi {
-                                app.selected_worktree = Some((sel_pi, sel_wi - 1));
-                            }
-                        }
-
-                        // 同一プロジェクト内の削除位置より後の worktree のインデックスを再調整
-                        reindex_worktree_maps(sessions, terminals, claude_terms, pi, wi);
-
-                        // left_panel のカーソル位置を調整
-                        let entries = LeftPanel::build_entries(&app.projects);
-                        left_panel.clamp_cursor(entries.len());
-                        left_panel.scroll_offset = 0;
-
-                        app.show_info(format!("worktree を削除しました: {}", wt_name));
-                    }
-                    Err(e) => {
-                        app.show_error(format!("worktree の削除に失敗: {}", e));
+                // selected_worktree をリセット（削除対象 or インデックスずれ対応）
+                if let Some((sel_pi, sel_wi)) = app.selected_worktree {
+                    if sel_pi == pi && sel_wi == wi {
+                        app.selected_worktree = None;
+                    } else if sel_pi == pi && sel_wi > wi {
+                        app.selected_worktree = Some((sel_pi, sel_wi - 1));
                     }
                 }
+
+                // 同一プロジェクト内の削除位置より後の worktree のインデックスを再調整
+                reindex_worktree_maps(sessions, terminals, claude_terms, pi, wi);
+
+                // left_panel のカーソル位置を調整
+                let entries = LeftPanel::build_entries(&app.projects);
+                left_panel.clamp_cursor(entries.len());
+                left_panel.scroll_offset = 0;
+
+                app.show_info(format!("worktree を削除中: {}", wt_name));
+
+                // git worktree 削除はメインスレッドをブロックするため
+                // バックグラウンドで実行（target/ や node_modules/ の再帰削除に時間がかかる）
+                let event_tx2 = event_tx.clone();
+                let wt_name_async = wt_name.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = git::WorktreeManager::remove_worktree(&project_path, &wt_path)
+                        .map_err(|e| e.to_string());
+                    let _ = event_tx2.send(event::AppEvent::WorktreeRemoveCompleted {
+                        worktree_name: wt_name_async,
+                        result,
+                    });
+                });
             }
 
             app.show_archive_confirm = false;
