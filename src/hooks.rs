@@ -29,9 +29,14 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_n
         r#"SID=$(head -1 | sed -n 's/.*"session_id" *: *"\([^"]*\)".*/\1/p'); [ -z "$SID" ] && SID="siki-$$"; [ -S {sock} ] || exit 0"#
     );
 
-    inject_hook(hooks, "SessionStart", &format!(
-        r#"{read_sid}; echo '{{"event":"register","session_id":"'"$SID"'","cwd":"'"$PWD"'","role":"'"${{SIKI_ROLE:-default}}"'"}}' | nc -U {sock}"#
-    ), false);
+    // SessionStart は siki バイナリのサブコマンド経由で実行する。
+    // - broker への register イベント送信
+    // - DB から pending_messages / 利用可能な背景情報を取得して additionalContext を返す
+    // これにより、最初のメッセージで `list_sessions` MCP を呼ばせる必要がなくなる。
+    let siki_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "siki".to_string());
+    inject_hook(hooks, "SessionStart", &format!(r#"{siki_path} session-start"#), false);
 
     inject_hook(hooks, "PreToolUse", &format!(
         r#"{read_sid}; echo '{{"event":"working","session_id":"'"$SID"'"}}' | nc -U {sock}"#
@@ -176,26 +181,51 @@ pub fn sync_project_skills(worktree_path: &Path, project_name: &str) {
 }
 
 /// .claude/rules/siki.md にセッション開始ルールを書き込む
+///
+/// siki が以前書き込んだファイル（先頭が `# siki session rules`）は上書きし、
+/// ユーザが置き換えた他の内容は保持する。
 fn inject_rules(claude_dir: &Path) {
     let rules_dir = claude_dir.join("rules");
     let _ = std::fs::create_dir_all(&rules_dir);
     let rules_path = rules_dir.join("siki.md");
 
-    // 既に存在すれば上書きしない
-    if rules_path.exists() {
-        return;
+    // siki 以外の内容に置き換えられている場合は上書きしない
+    if let Ok(existing) = std::fs::read_to_string(&rules_path) {
+        if !existing.trim_start().starts_with("# siki session rules") {
+            return;
+        }
     }
 
     let content = r#"# siki session rules
 
-BEFORE responding to the user's first message, you MUST:
+This worktree is managed by siki. On session start, the SessionStart hook
+injects pending cross-session messages and a pointer to background information
+into your context automatically — you do not need to call `list_sessions`
+first thing.
 
-1. Call the `list_sessions` MCP tool (siki server) with `scope: "worktree"`.
-2. If the result shows pending_messages, deliver them first.
-3. If `conversation_summaries` is present, silently absorb it as context about previous work in this worktree.
-4. If `worktree_contexts` is present, load them silently as background context.
-5. Once work begins, call `set_summary` with a short task description.
-6. If you need full conversation details from past sessions, use `get_context` with `include_conversation_log: true`.
+When you begin working on a task, call the `set_summary` MCP tool (siki
+server) with a short task description so other sessions can see what this
+worktree is doing.
+
+Other tools you can use:
+
+- `siki:list_sessions` — list sessions in the project / worktree / machine and
+  read full conversation summaries and worktree context bodies. Use this only
+  when you need that content for the current task.
+- `siki:get_context` — pull state for a specific session/worktree. Passing
+  `include_conversation_log: true` returns the full message log, which can be
+  very large; delegate that call to an Explore or general-purpose subagent so
+  the log does not consume your main context window.
+- `siki:send_message`, `siki:broadcast`, `siki:handoff` — coordinate with
+  other sessions.
+- `siki:set_alert` — raise a human-attention signal (CI failed, ambiguous
+  spec, blocker, etc.). Always pass a short `message`.
+- `siki:summarize_history` — fold older sessions into a worktree context file
+  before they grow too large.
+
+If you have already received the SessionStart context once in this
+conversation (for example, the conversation summary mentions it after
+`/compact`), do not re-fetch it; just continue the task.
 "#;
 
     let _ = std::fs::write(&rules_path, content);
@@ -256,7 +286,9 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
         None => return,
     };
 
-    // 既存の siki hook を削除して最新版に置き換える（nc -U と .siki を含むもの）
+    // 既存の siki hook を削除して最新版に置き換える
+    // - 旧形式: `nc -U .../.siki/sock` を含むコマンド
+    // - 新形式: `siki ... session-start` のように `session-start` サブコマンドを呼ぶコマンド
     arr.retain(|entry| {
         !entry
             .get("hooks")
@@ -265,7 +297,10 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains("nc -U") && c.contains(".siki"))
+                        .is_some_and(|c| {
+                            (c.contains("nc -U") && c.contains(".siki"))
+                                || c.contains("session-start")
+                        })
                 })
             })
             .unwrap_or(false)
@@ -332,6 +367,45 @@ mod tests {
     }
 
     #[test]
+    fn test_inject_hook_replaces_old_session_start_with_new() {
+        // 旧 SessionStart (nc -U + .siki) を新形式 (session-start サブコマンド) に置き換える
+        let mut hooks = json!({
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": r#"SID=$(...); echo '...' | nc -U /home/user/.siki/sock"#
+                }]
+            }]
+        });
+        inject_hook(&mut hooks, "SessionStart", "/usr/local/bin/siki session-start", false);
+
+        let arr = hooks["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "old hook should be replaced, not appended");
+        assert_eq!(
+            arr[0]["hooks"][0]["command"],
+            "/usr/local/bin/siki session-start"
+        );
+    }
+
+    #[test]
+    fn test_inject_hook_replaces_existing_session_start_subcommand() {
+        // 既存の session-start hook をさらに新しいパスに置き換える（アップグレード時）
+        let mut hooks = json!({
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "/old/path/siki session-start"
+                }]
+            }]
+        });
+        inject_hook(&mut hooks, "SessionStart", "/new/path/siki session-start", false);
+
+        let arr = hooks["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "old siki session-start should be replaced");
+        assert_eq!(arr[0]["hooks"][0]["command"], "/new/path/siki session-start");
+    }
+
+    #[test]
     fn test_inject_hook_async_has_timeout() {
         let mut hooks = json!({});
         inject_hook(&mut hooks, "PreToolUse", "echo test", true);
@@ -369,6 +443,59 @@ mod tests {
         assert!(settings["hooks"]["PostToolUse"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["Stop"].as_array().unwrap().len() > 0);
         assert!(settings["hooks"]["SessionEnd"].as_array().unwrap().len() > 0);
+
+        // SessionStart は siki session-start サブコマンドを呼ぶ
+        let ss_cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ss_cmd.contains("session-start"),
+            "SessionStart hook should invoke `siki session-start`, got: {}",
+            ss_cmd
+        );
+
+        // 生成された siki.md ルールに新形式の説明が含まれる
+        let rule = std::fs::read_to_string(dir.path().join(".claude/rules/siki.md")).unwrap();
+        assert!(rule.contains("SessionStart hook"));
+        assert!(rule.contains("subagent"));
+    }
+
+    #[test]
+    fn test_inject_rules_refreshes_siki_managed_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let rules_dir = claude_dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let rules_path = rules_dir.join("siki.md");
+
+        // 旧 siki が書いた内容を置く
+        std::fs::write(&rules_path, "# siki session rules\n\nold instructions\n").unwrap();
+
+        inject_rules(&claude_dir);
+
+        let content = std::fs::read_to_string(&rules_path).unwrap();
+        // siki 管理ファイルは更新される
+        assert!(!content.contains("old instructions"));
+        assert!(content.contains("SessionStart hook"));
+    }
+
+    #[test]
+    fn test_inject_rules_preserves_user_replaced_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let rules_dir = claude_dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let rules_path = rules_dir.join("siki.md");
+
+        // ユーザが完全に置き換えた内容
+        let user_content = "# my custom rules\n\nignore siki defaults.\n";
+        std::fs::write(&rules_path, user_content).unwrap();
+
+        inject_rules(&claude_dir);
+
+        let content = std::fs::read_to_string(&rules_path).unwrap();
+        // ユーザ内容は保持される
+        assert_eq!(content, user_content);
     }
 
     #[test]
