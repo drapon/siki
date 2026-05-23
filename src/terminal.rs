@@ -21,6 +21,24 @@ pub struct TerminalEmulator {
     writer: Box<dyn Write + Send>,
     parser: vt100::Parser,
     alive: bool,
+    /// 子プロセスハンドル。Drop 時に kill + wait してリーダースレッドの停止と
+    /// ゾンビプロセス化の防止を行う。
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+
+impl Drop for TerminalEmulator {
+    fn drop(&mut self) {
+        // 子プロセスを止めないと PTY の reader thread (try_clone_reader で複製した
+        // fd を保持) が永久に読み続け、event channel に stale tab_index を持つ
+        // TerminalOutput が流れ続ける。kill するだけでは zombie が残るので
+        // wait まで行う必要があるが、wait は同期ブロックするので別スレッドに逃がす。
+        if let Some(mut child) = self.child.take() {
+            std::thread::spawn(move || {
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
+    }
 }
 
 impl TerminalEmulator {
@@ -98,7 +116,8 @@ impl TerminalEmulator {
             cmd.env(*key, *value);
         }
 
-        pair.slave
+        let child = pair
+            .slave
             .spawn_command(cmd)
             .map_err(|e| anyhow::anyhow!("シェルの起動に失敗: {}", e))?;
 
@@ -162,6 +181,7 @@ impl TerminalEmulator {
             writer,
             parser,
             alive: true,
+            child: Some(child),
         })
     }
 
