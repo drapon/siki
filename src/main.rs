@@ -31,6 +31,28 @@ type TerminalKey = (app::WorktreeId, usize);
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 
+/// reader thread が spawn 時に保持した tab_index に対応する claude_terms の key を返す。
+///
+/// Ctrl+W で Claude タブを閉じると `handle_claude_terminal_key` が HashMap key を詰めるため、
+/// reader thread が送ってくる event の `tab_index` は古くなる。まず元の位置を試し、
+/// terminal_id が一致しなければ同 worktree 内を scan して現在の key を再特定する。
+fn resolve_claude_term_key(
+    claude_terms: &HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    worktree_id: app::WorktreeId,
+    claude_idx: usize,
+    terminal_id: u64,
+) -> Option<(app::WorktreeId, usize)> {
+    if let Some(emu) = claude_terms.get(&(worktree_id, claude_idx)) {
+        if emu.id() == terminal_id {
+            return Some((worktree_id, claude_idx));
+        }
+    }
+    claude_terms
+        .iter()
+        .find(|(key, emu)| key.0 == worktree_id && emu.id() == terminal_id)
+        .map(|(key, _)| *key)
+}
+
 /// siki.json 作成用オーバーレイターミナルのセンチネル値
 const SIKI_INIT_WORKTREE_ID: app::WorktreeId = (usize::MAX, usize::MAX);
 const SIKI_INIT_TAB_INDEX: usize = usize::MAX;
@@ -692,16 +714,20 @@ async fn handle_event(
                     }
                 }
             } else if tab_index >= CLAUDE_TAB_BASE {
+                // Claude タブを Ctrl+W で閉じると HashMap の key を詰めるため、
+                // reader thread が spawn 時に持った tab_index は古くなる。
+                // まず元の位置を試し、ヒットしなければ terminal_id で再探索する。
                 let claude_idx = tab_index - CLAUDE_TAB_BASE;
-                if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
-                    if emu.id() == terminal_id {
+                let target_key = resolve_claude_term_key(claude_terms, worktree_id, claude_idx, terminal_id);
+                if let Some(key) = target_key {
+                    if let Some(emu) = claude_terms.get_mut(&key) {
                         emu.process(&data);
                         // vt100 はスクロールバック中に新行が来ると内部で offset を
                         // 調整するため、外部保持のオフセットを同期する
                         let current = emu.scrollback();
                         if current > 0 {
                             if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
-                                wt.claude_scroll_offsets.insert(claude_idx, current);
+                                wt.claude_scroll_offsets.insert(key.1, current);
                             }
                         }
                     }
@@ -725,8 +751,9 @@ async fn handle_event(
                 }
             } else if tab_index >= CLAUDE_TAB_BASE {
                 let claude_idx = tab_index - CLAUDE_TAB_BASE;
-                if let Some(emu) = claude_terms.get_mut(&(worktree_id, claude_idx)) {
-                    if emu.id() == terminal_id {
+                let target_key = resolve_claude_term_key(claude_terms, worktree_id, claude_idx, terminal_id);
+                if let Some(key) = target_key {
+                    if let Some(emu) = claude_terms.get_mut(&key) {
                         emu.mark_exited();
                     }
                 }
@@ -7038,5 +7065,92 @@ mod tests {
         )
         .await;
         assert_eq!(app.focused_panel, app::Panel::Left);
+    }
+
+    // --- Claude タブ close 後の event routing 回帰テスト ---
+    //
+    // Ctrl+W で Claude タブを閉じると claude_terms の key を詰めるため、
+    // reader thread が spawn 時に保持した tab_index は古くなる。
+    // 古い tab_index で event が来ても terminal_id で再特定して
+    // 現在の key にルーティングできることを確認する。
+
+    fn spawn_dummy_term(
+        tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+        wt_id: app::WorktreeId,
+        tab_index: usize,
+    ) -> terminal::TerminalEmulator {
+        terminal::TerminalEmulator::with_args(
+            "/bin/sh",
+            &["-c", "sleep 30"],
+            std::path::Path::new("/tmp"),
+            (80, 24),
+            tx.clone(),
+            wt_id,
+            tab_index,
+        )
+        .expect("spawn dummy terminal")
+    }
+
+    #[test]
+    fn test_resolve_claude_term_key_direct_hit() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+        let emu = spawn_dummy_term(&tx, wt_id, CLAUDE_TAB_BASE);
+        let id = emu.id();
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert((wt_id, 0), emu);
+
+        let key = resolve_claude_term_key(&claude_terms, wt_id, 0, id);
+        assert_eq!(key, Some((wt_id, 0)));
+    }
+
+    #[test]
+    fn test_resolve_claude_term_key_finds_by_id_after_shift() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+
+        // 元々 tab 1 に居た emulator (id1) が close 後 key=0 に shift された状態を再現
+        let shifted = spawn_dummy_term(&tx, wt_id, CLAUDE_TAB_BASE + 1);
+        let id1 = shifted.id();
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert((wt_id, 0), shifted);
+
+        // reader thread は古い tab_index=1 を持っているので、claude_idx=1 で問い合わせる
+        let key = resolve_claude_term_key(&claude_terms, wt_id, 1, id1);
+        assert_eq!(key, Some((wt_id, 0)), "shift 後でも terminal_id で再特定できるべき");
+    }
+
+    #[test]
+    fn test_resolve_claude_term_key_none_for_dropped() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+        let other = spawn_dummy_term(&tx, wt_id, CLAUDE_TAB_BASE);
+        let other_id = other.id();
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert((wt_id, 0), other);
+
+        // 既に drop された emulator の id で問い合わせる → どこにも居ない
+        let dropped_id = other_id + 999;
+        let key = resolve_claude_term_key(&claude_terms, wt_id, 0, dropped_id);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn test_resolve_claude_term_key_isolates_worktrees() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_a: app::WorktreeId = (0, 0);
+        let wt_b: app::WorktreeId = (0, 1);
+
+        let emu_a = spawn_dummy_term(&tx, wt_a, CLAUDE_TAB_BASE);
+        let id_a = emu_a.id();
+        let emu_b = spawn_dummy_term(&tx, wt_b, CLAUDE_TAB_BASE);
+
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert((wt_a, 0), emu_a);
+        claude_terms.insert((wt_b, 0), emu_b);
+
+        // wt_b で id_a を問い合わせても、別 worktree の emulator は返さない
+        let key = resolve_claude_term_key(&claude_terms, wt_b, 0, id_a);
+        assert_eq!(key, None);
     }
 }
