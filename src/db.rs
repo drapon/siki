@@ -312,6 +312,29 @@ pub fn mark_messages_read(conn: &Connection, message_ids: &[i64]) -> Result<()> 
     Ok(())
 }
 
+/// 単一セッション宛 (`to_session = ?`) のメッセージのみを既読化する。
+///
+/// broadcast (全 NULL) や worktree/project 宛 fanout は受信者が複数いるため
+/// ここでは触らない。一受信者が読んだだけで他受信者に届かなくなる事故を防ぐ。
+/// 呼び出し側（SessionStart hook など）が pending を一律 mark すると broadcast の
+/// 「全員に届く」セマンティクスが壊れるので、この関数を使うこと。
+pub fn mark_messages_read_for_session(
+    conn: &Connection,
+    session_id: &str,
+    message_ids: &[i64],
+) -> Result<usize> {
+    let now = now_unix();
+    let mut marked = 0_usize;
+    for id in message_ids {
+        let n = conn.execute(
+            "UPDATE messages SET read_at = ?1 WHERE id = ?2 AND to_session = ?3 AND read_at IS NULL",
+            rusqlite::params![now, id, session_id],
+        )?;
+        marked += n;
+    }
+    Ok(marked)
+}
+
 /// 全メッセージを取得する（TUI表示用）
 pub fn get_all_messages(conn: &Connection, limit: usize) -> Result<Vec<MessageRow>> {
     let mut stmt = conn.prepare(

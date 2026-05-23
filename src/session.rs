@@ -383,6 +383,10 @@ impl SessionRegistry {
 /// cwd パスからプロジェクト名とworktree名を推定する
 ///
 /// 期待パス形式: `~/.siki/workspaces/<project>/<worktree>/...`
+///
+/// 戻り値は `load_contexts` の `PathBuf::join` に直接食わせる可能性があるため、
+/// `..`・空文字・パス区切りを含む不正な値は `unknown` に丸める
+/// （workspaces 配下を逸脱させないための defense-in-depth）。
 pub fn guess_names_from_cwd(cwd: &str) -> (String, String) {
     let workspaces = crate::config::workspaces_dir();
     let workspaces_str = workspaces.to_string_lossy();
@@ -390,16 +394,48 @@ pub fn guess_names_from_cwd(cwd: &str) -> (String, String) {
     if let Some(rest) = cwd.strip_prefix(workspaces_str.as_ref()) {
         let rest = rest.trim_start_matches('/');
         let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        if parts.len() >= 2 {
+        if parts.len() >= 2 && is_safe_segment(parts[0]) && is_safe_segment(parts[1]) {
             return (parts[0].to_string(), parts[1].to_string());
         }
     }
     ("unknown".to_string(), "unknown".to_string())
 }
 
+/// パスセグメント単独で意味のある名前か（`..` / `.` / 空 / セパレータ等を弾く）。
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_safe_segment_rejects_traversal() {
+        assert!(is_safe_segment("myproj"));
+        assert!(is_safe_segment("my-worktree_1"));
+        assert!(!is_safe_segment(""));
+        assert!(!is_safe_segment("."));
+        assert!(!is_safe_segment(".."));
+        assert!(!is_safe_segment("a/b"));
+        assert!(!is_safe_segment("a\\b"));
+        assert!(!is_safe_segment("a\0b"));
+    }
+
+    #[test]
+    fn test_guess_names_rejects_path_traversal() {
+        // workspaces プレフィックスから ".." で抜けようとする入力
+        let workspaces = crate::config::workspaces_dir();
+        let evil = format!("{}/../../etc/passwd", workspaces.display());
+        let (proj, wt) = guess_names_from_cwd(&evil);
+        assert_eq!(proj, "unknown", "must not yield '..' as project name");
+        assert_eq!(wt, "unknown");
+    }
 
     #[test]
     fn test_session_state_badge_char() {

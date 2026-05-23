@@ -10,6 +10,7 @@ mod hooks;
 mod mcp;
 mod selection;
 mod session;
+mod session_start;
 mod terminal;
 mod tui;
 mod ui;
@@ -52,8 +53,9 @@ async fn main() -> Result<()> {
         println!("Usage: siki [OPTIONS] [COMMAND]");
         println!();
         println!("Commands:");
-        println!("  list       List projects and worktrees");
-        println!("  mcp        Start MCP stdio server");
+        println!("  list           List projects and worktrees");
+        println!("  mcp            Start MCP stdio server");
+        println!("  session-start  Internal: SessionStart hook (reads stdin, emits additionalContext)");
         println!();
         println!("Options:");
         println!("  -p <name>  Filter projects by name prefix");
@@ -82,6 +84,15 @@ async fn main() -> Result<()> {
     if args.len() > 1 && args[1] == "mcp" {
         let db_path = config::db_path();
         return mcp::run_stdio_server(&db_path);
+    }
+
+    // サブコマンド: siki session-start → Claude Code の SessionStart hook 用
+    // stdin で受け取った session_id をもとに broker へ register し、
+    // additionalContext を stdout に出力する
+    if args.len() > 1 && args[1] == "session-start" {
+        let sock_path = config::sock_path();
+        let db_path = config::db_path();
+        return session_start::run(&sock_path, &db_path);
     }
 
     // -p <prefix> オプションの取得
