@@ -85,9 +85,11 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         })
         .collect();
 
-    // 取得したメッセージを既読にする
+    // 取得したメッセージのうち、単一セッション宛 (to_session = ?) のみを既読化する。
+    // broadcast (全 NULL) や worktree/project 宛 fanout はここで mark すると他の受信者が
+    // 取れなくなるため触らない。SessionStart hook 側 (session_start.rs) と同じポリシー。
     if !msg_ids.is_empty() {
-        let _ = db::mark_messages_read(conn, &msg_ids);
+        let _ = db::mark_messages_read_for_session(conn, session_id, &msg_ids);
     }
 
     // DB から自分のセッション情報で worktree のコンテキストを読み込む
@@ -614,6 +616,75 @@ mod tests {
         // 2回目は既読なので空
         let result2 = list_sessions(&conn, "s2", &json!({})).unwrap();
         assert_eq!(result2["pending_messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_list_sessions_does_not_consume_broadcast_for_other_sessions() {
+        // 回帰テスト: H-1（broadcast の二重消費）
+        // list_sessions が broadcast を全 session 横断で mark すると、
+        // 他セッションが broadcast を受け取れなくなる。to_session 厳密一致のみ
+        // mark することを保証する。
+        let conn = test_db();
+        db::upsert_session(&conn, "a", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
+        db::upsert_session(&conn, "b", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
+
+        // broadcast (to_session/to_worktree/to_project すべて NULL)
+        db::insert_message(&conn, "sender", None, None, None, "broadcast", "message", None).unwrap();
+        // worktree fanout
+        db::insert_message(
+            &conn,
+            "sender",
+            None,
+            Some("osaka"),
+            None,
+            "worktree msg",
+            "message",
+            None,
+        )
+        .unwrap();
+        // 単一セッション宛 (a 宛)
+        db::insert_message(&conn, "sender", Some("a"), None, None, "direct to a", "message", None)
+            .unwrap();
+
+        // a が list_sessions を呼ぶ → 3件すべて受信
+        let result_a = list_sessions(&conn, "a", &json!({})).unwrap();
+        let msgs_a = result_a["pending_messages"].as_array().unwrap();
+        assert_eq!(msgs_a.len(), 3, "a should see all 3 messages");
+
+        // b が呼ぶ → broadcast と worktree fanout は **まだ届く**
+        // direct to a は b 宛ではないので元から見えない
+        let result_b = list_sessions(&conn, "b", &json!({})).unwrap();
+        let msgs_b = result_b["pending_messages"].as_array().unwrap();
+        let contents: Vec<&str> = msgs_b
+            .iter()
+            .map(|m| m.get("content").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert!(
+            contents.contains(&"broadcast"),
+            "broadcast was consumed by a; b lost it. got: {:?}",
+            contents
+        );
+        assert!(
+            contents.contains(&"worktree msg"),
+            "worktree fanout was consumed by a; b lost it. got: {:?}",
+            contents
+        );
+        assert!(
+            !contents.contains(&"direct to a"),
+            "direct-to-a should not be in b's pending. got: {:?}",
+            contents
+        );
+
+        // a が再度呼ぶ → direct to a は既読化済み、broadcast/worktree fanout はまだ残る
+        let result_a2 = list_sessions(&conn, "a", &json!({})).unwrap();
+        let msgs_a2 = result_a2["pending_messages"].as_array().unwrap();
+        let contents_a2: Vec<&str> = msgs_a2
+            .iter()
+            .map(|m| m.get("content").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert!(!contents_a2.contains(&"direct to a"));
+        assert!(contents_a2.contains(&"broadcast"));
+        assert!(contents_a2.contains(&"worktree msg"));
     }
 
     #[test]

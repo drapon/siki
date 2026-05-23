@@ -10,16 +10,32 @@ use std::time::Duration;
 
 use crate::db;
 
-/// stdin から JSON を読むときのタイムアウト
+/// stdin から JSON を読むときのタイムアウト。
+///
+/// SessionStart hook は `is_async=false` で注入されており、Claude Code は本プロセスの
+/// 終了を待ってからセッションを開始する。`read_to_end` は EOF まで戻らないため、
+/// stdio リダイレクト事故・Claude Code 側のバグ等で EOF が来ないとセッション開始が
+/// 止まる（過去 `33719cf` / `75415c9` で同種の hook ブロッキングを 2 回踏んだ実績あり）。
+/// 通常のペイロードは数 KB / 1ms 未満で読めるので、3 秒は余裕を持った打ち切り値。
 const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// stdin から読み取る最大バイト数（過大ペイロードによるメモリ膨張防止）
+/// stdin から読み取る最大バイト数。
+///
+/// Claude Code の hook 入力 JSON は典型的に 1 KB 未満。256 KB は安全マージンとして
+/// 十分かつ、悪意ある巨大入力でも本プロセスの常駐メモリを 1 MB 以下に抑える。
 const STDIN_READ_MAX: usize = 256 * 1024;
 
-/// broker への connect + write を含む全体のタイムアウト
+/// broker への connect + write を含む全体のタイムアウト。
+///
+/// 通常 Unix socket への 1 行書き込みは数 ms。broker (siki TUI 内) が panic で
+/// accept ループから抜けた場合、`UnixStream::connect` 自体がブロックし得るため、
+/// stdin 読み取りと別枠で短めに打ち切る。
 const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// busy_timeout は db::init と揃える
+/// SQLite の busy_timeout (ms)。
+///
+/// `db::init` のデフォルト (5000ms) と非対称だと、TUI / MCP / hook の同時アクセスで
+/// hook 側だけ早期に SQLITE_BUSY で落ちる経路ができてしまうので揃える。
 const DB_BUSY_TIMEOUT_MS: u32 = 5000;
 
 /// 何かおかしかったときに stderr に短いメッセージを出す。
