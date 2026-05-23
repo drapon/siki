@@ -182,23 +182,54 @@ pub fn sync_project_skills(worktree_path: &Path, project_name: &str) {
 
 /// .claude/rules/siki.md にセッション開始ルールを書き込む
 ///
-/// siki が以前書き込んだファイル（先頭が `# siki session rules`）は上書きし、
-/// ユーザが置き換えた他の内容は保持する。
+/// siki が以前書き込んだファイル（HTML マーカーまたは旧版の固有フレーズで識別）は
+/// 上書きし、ユーザが置き換えた他の内容は保持する。
 fn inject_rules(claude_dir: &Path) {
     let rules_dir = claude_dir.join("rules");
     let _ = std::fs::create_dir_all(&rules_dir);
     let rules_path = rules_dir.join("siki.md");
 
-    // siki 以外の内容に置き換えられている場合は上書きしない
+    // 既存ファイルがあって、かつ siki 管理であると判定できない場合は触らない
     if let Ok(existing) = std::fs::read_to_string(&rules_path) {
-        if !existing.trim_start().starts_with("# siki session rules") {
+        if !is_siki_managed_rules(&existing) {
             return;
         }
     }
 
-    let content = r#"# siki session rules
+    let content = format!(
+        "{}\n# siki session rules\n\n{}",
+        SIKI_MANAGED_RULES_MARKER, SIKI_RULES_BODY
+    );
 
-This worktree is managed by siki. On session start, the SessionStart hook
+    let _ = std::fs::write(&rules_path, content);
+}
+
+/// siki 管理 siki.md を識別するためのマーカー。本文の冒頭に出力される。
+/// 改版時はバージョン番号を上げる（既存マーカーも検出される）。
+const SIKI_MANAGED_RULES_MARKER: &str = "<!-- siki-managed-rules: v2 -->";
+
+/// 旧版（マーカーなし）の siki.md に含まれていた固有フレーズ。
+/// アップグレード経路で見つけたら新フォーマットに書き換える。
+const SIKI_LEGACY_RULES_SIGNATURE: &str =
+    "BEFORE responding to the user's first message, you MUST:";
+
+/// 与えられた `.claude/rules/siki.md` の内容が siki によって書かれたものか判定する。
+fn is_siki_managed_rules(content: &str) -> bool {
+    // 新形式: 機械可読マーカー
+    if content.contains("<!-- siki-managed-rules:") {
+        return true;
+    }
+    // 旧形式（マーカー導入前）: 見出し + 当時の固有フレーズ両方がある場合のみ
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("# siki session rules")
+        && content.contains(SIKI_LEGACY_RULES_SIGNATURE)
+    {
+        return true;
+    }
+    false
+}
+
+const SIKI_RULES_BODY: &str = r#"This worktree is managed by siki. On session start, the SessionStart hook
 injects pending cross-session messages and a pointer to background information
 into your context automatically — you do not need to call `list_sessions`
 first thing.
@@ -212,7 +243,8 @@ Other tools you can use:
 - `siki:list_sessions` — list sessions in the project / worktree / machine and
   read full conversation summaries and worktree context bodies. Use this only
   when you need that content for the current task.
-- `siki:get_context` — pull state for a specific session/worktree. Passing
+- `siki:get_context` — pull state for a specific session/worktree. Always pass
+  `target: { type: "session"|"worktree"|"project", id: "<name>" }`. Passing
   `include_conversation_log: true` returns the full message log, which can be
   very large; delegate that call to an Explore or general-purpose subagent so
   the log does not consume your main context window.
@@ -227,9 +259,6 @@ If you have already received the SessionStart context once in this
 conversation (for example, the conversation summary mentions it after
 `/compact`), do not re-fetch it; just continue the task.
 "#;
-
-    let _ = std::fs::write(&rules_path, content);
-}
 
 /// .git/info/exclude にパターンを追加して git 追跡から除外する
 fn exclude_from_git(worktree_path: &Path, pattern: &str) {
@@ -461,22 +490,48 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_rules_refreshes_siki_managed_file() {
+    fn test_inject_rules_refreshes_marker_managed_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let claude_dir = dir.path().join(".claude");
         let rules_dir = claude_dir.join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         let rules_path = rules_dir.join("siki.md");
 
-        // 旧 siki が書いた内容を置く
-        std::fs::write(&rules_path, "# siki session rules\n\nold instructions\n").unwrap();
+        // siki が書いた印つきファイル（マーカーつき）
+        std::fs::write(
+            &rules_path,
+            "<!-- siki-managed-rules: v1 -->\n# siki session rules\n\nold instructions\n",
+        )
+        .unwrap();
 
         inject_rules(&claude_dir);
 
         let content = std::fs::read_to_string(&rules_path).unwrap();
-        // siki 管理ファイルは更新される
         assert!(!content.contains("old instructions"));
         assert!(content.contains("SessionStart hook"));
+        assert!(content.starts_with("<!-- siki-managed-rules:"));
+    }
+
+    #[test]
+    fn test_inject_rules_migrates_legacy_unmarked_file() {
+        // マーカー導入前の siki が書いたファイルも、本文の固有フレーズがあれば
+        // 新形式に書き換える（移行経路）
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let rules_dir = claude_dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let rules_path = rules_dir.join("siki.md");
+
+        let legacy = "# siki session rules\n\nBEFORE responding to the user's first message, you MUST:\n\n1. Call the `list_sessions` MCP tool.\n";
+        std::fs::write(&rules_path, legacy).unwrap();
+
+        inject_rules(&claude_dir);
+
+        let content = std::fs::read_to_string(&rules_path).unwrap();
+        // 新フォーマットに置換され、マーカーが付く
+        assert!(content.contains("<!-- siki-managed-rules:"));
+        assert!(content.contains("SessionStart hook"));
+        assert!(!content.contains("BEFORE responding"));
     }
 
     #[test]
@@ -496,6 +551,46 @@ mod tests {
         let content = std::fs::read_to_string(&rules_path).unwrap();
         // ユーザ内容は保持される
         assert_eq!(content, user_content);
+    }
+
+    #[test]
+    fn test_inject_rules_preserves_file_with_matching_title_only() {
+        // L-3 reviewer concern: ユーザが偶発的に `# siki session rules` という見出しを
+        // 書いていただけのファイルは siki 管理と誤判定してはいけない。
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        let rules_dir = claude_dir.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let rules_path = rules_dir.join("siki.md");
+
+        let user_content = "# siki session rules\n\nmy own notes about siki, not siki-generated.\n";
+        std::fs::write(&rules_path, user_content).unwrap();
+
+        inject_rules(&claude_dir);
+
+        let content = std::fs::read_to_string(&rules_path).unwrap();
+        assert_eq!(
+            content, user_content,
+            "user content matching only the title should NOT be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_is_siki_managed_rules_detection() {
+        assert!(is_siki_managed_rules(
+            "<!-- siki-managed-rules: v2 -->\n# anything\n"
+        ));
+        assert!(is_siki_managed_rules(
+            "<!-- siki-managed-rules: v999 -->\nanything\n"
+        ));
+        // 旧版固有フレーズ
+        assert!(is_siki_managed_rules(
+            "# siki session rules\n\nBEFORE responding to the user's first message, you MUST:\n"
+        ));
+        // タイトルだけは siki 管理と認めない
+        assert!(!is_siki_managed_rules("# siki session rules\n\nuser content\n"));
+        // 完全に別物
+        assert!(!is_siki_managed_rules("# my custom rules\n"));
     }
 
     #[test]
