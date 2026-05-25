@@ -149,6 +149,14 @@ impl TerminalEmulator {
                         break;
                     }
                     Ok(n) => {
+                        // Claude や make 等が出す BEL (0x07) を外側ターミナル
+                        // (cmux / tmux / iTerm 等) に転送する。vt100 パーサーが
+                        // BEL を吸収してしまうため、ここで siki の stdout に
+                        // 再出力しないと外側のターミナル通知が発火しない。
+                        // BEL は非表示・非状態変更なので ratatui の描画と交錯
+                        // しても画面は壊れない。stdout の内部 Mutex により
+                        // ratatui の write とは直列化される。
+                        forward_bell(&buf[..n]);
                         if event_tx
                             .send(AppEvent::TerminalOutput {
                                 worktree_id,
@@ -257,6 +265,26 @@ impl TerminalEmulator {
     pub fn scrollback(&self) -> usize {
         self.parser.screen().scrollback()
     }
+}
+
+/// PTY 出力に含まれる BEL (0x07) を siki の stdout に転送する。
+///
+/// 子プロセス (claude 等) が通知用に BEL を出しても、vt100 パーサーで吸収されて
+/// 外側ターミナル (cmux / tmux / iTerm 等) には届かない。そのため siki 自身が
+/// 一度 BEL を見つけたら自分の stdout に書き戻して、外側ターミナルが通知を
+/// 発火できるようにする。
+///
+/// 同じチャンクに BEL が複数含まれていても 1 度だけ転送する。連続する PTY 読み取り
+/// で多数の BEL が短時間に出る場合は連発するが、これは siki なしの場合と同じ
+/// 振る舞いなので問題ない。
+fn forward_bell(data: &[u8]) {
+    if !data.contains(&0x07) {
+        return;
+    }
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let _ = handle.write_all(&[0x07]);
+    let _ = handle.flush();
 }
 
 /// crossterm の KeyEvent をターミナルバイト列に変換する
