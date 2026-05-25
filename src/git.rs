@@ -49,8 +49,15 @@ impl WorktreeManager {
             }
         }
 
-        // git worktree add -b <branch> <path> [<start_point>]
-        let mut args = vec!["worktree", "add", "-b", branch];
+        // git worktree add --no-track -b <branch> <path> [<start_point>]
+        //
+        // --no-track を付けないと、start_point が remote-tracking branch
+        // (origin/main 等) の場合に git が自動で upstream をその remote-tracking
+        // branch に設定してしまう (branch.autoSetupMerge=true がデフォルトのため)。
+        // siki の worktree は独立した feature ブランチとして扱いたいので、
+        // upstream は付けず、初回 push 時にユーザが `git push -u origin HEAD`
+        // で同名リモートブランチを張る運用にする。
+        let mut args = vec!["worktree", "add", "--no-track", "-b", branch];
         let wt_path_str = worktree_path.to_string_lossy().to_string();
         args.push(&wt_path_str);
         if let Some(sp) = start_point {
