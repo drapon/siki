@@ -22,6 +22,13 @@ struct BellCounter {
     bells: usize,
 }
 
+impl BellCounter {
+    /// 蓄積したベル回数を取り出してリセットする
+    fn take(&mut self) -> usize {
+        std::mem::take(&mut self.bells)
+    }
+}
+
 impl vt100::Callbacks for BellCounter {
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bells += 1;
@@ -260,10 +267,10 @@ impl TerminalEmulator {
     /// 吸収されて外側ターミナルに届かないため、検出したら siki 自身の stdout に
     /// 書き戻して外側ターミナル (tmux / iTerm 等) の通知を発火させる。
     pub fn process(&mut self, data: &[u8]) {
-        let bells_before = self.parser.callbacks().bells;
         self.parser.process(data);
-        if self.parser.callbacks().bells > bells_before {
-            forward_bell();
+        let bells = self.parser.callbacks_mut().take();
+        if bells > 0 {
+            forward_bell(bells);
         }
     }
 
@@ -292,10 +299,17 @@ impl TerminalEmulator {
 ///
 /// BEL は表示にも端末状態にも影響しないため、ratatui の描画と交錯しても
 /// 画面は壊れない。stdout の内部ロックにより描画の write とは直列化される。
-fn forward_bell() {
+/// stdout が端末でない場合（パイプ・リダイレクト時）は出力を汚染しないため
+/// 転送しない。
+fn forward_bell(count: usize) {
+    use std::io::IsTerminal;
+
     let stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return;
+    }
     let mut handle = stdout.lock();
-    let _ = handle.write_all(&[0x07]);
+    let _ = handle.write_all(&vec![0x07; count]);
     let _ = handle.flush();
 }
 
@@ -554,6 +568,26 @@ mod tests {
             vt100::Parser::new_with_callbacks(24, 80, 0, BellCounter::default());
         parser.process(b"\x1b]0;title\x07done\x07");
         assert_eq!(parser.callbacks().bells, 1);
+    }
+
+    #[test]
+    fn test_bell_counter_counts_multiple_bells() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, BellCounter::default());
+        parser.process(b"\x07a\x07b\x07");
+        assert_eq!(parser.callbacks().bells, 3);
+    }
+
+    #[test]
+    fn test_bell_counter_take_resets() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, BellCounter::default());
+        parser.process(b"\x07");
+        assert_eq!(parser.callbacks_mut().take(), 1);
+        // take 後はリセットされ、次のチャンクの分だけ数える
+        assert_eq!(parser.callbacks_mut().take(), 0);
+        parser.process(b"\x07");
+        assert_eq!(parser.callbacks_mut().take(), 1);
     }
 
     // --- PTY 統合テスト ---

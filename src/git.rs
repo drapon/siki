@@ -48,6 +48,7 @@ impl WorktreeManager {
         }
 
         // リモート追跡ブランチの場合は事前に fetch して最新化
+        // （fetch 失敗時はローカルの追跡情報のまま続行する）
         if let Some(sp) = start_point {
             if sp.contains('/') {
                 // "origin/main" → remote="origin"
@@ -94,6 +95,17 @@ impl WorktreeManager {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("git worktree add に失敗: {}", stderr.trim());
+                }
+
+                // 既存ブランチの流用時も no_track の意図を反映する。
+                // 過去にベースブランチを upstream にしたまま作られたブランチが
+                // 残っているケースで、誤 push 先が引き継がれるのを防ぐ。
+                // （upstream が未設定の場合は失敗するが無視してよい）
+                if no_track {
+                    let _ = Command::new("git")
+                        .args(["branch", "--unset-upstream", branch])
+                        .current_dir(project_path)
+                        .output();
                 }
             } else {
                 anyhow::bail!("git worktree add に失敗: {}", stderr.trim());
@@ -332,6 +344,48 @@ mod tests {
         dir
     }
 
+    /// origin リモートを持つテストリポジトリを作成する
+    ///
+    /// 戻り値: (リモート側 TempDir, ローカル側 TempDir, ローカルリポジトリのパス, デフォルトブランチ名)
+    fn init_test_repo_with_origin() -> (TempDir, TempDir, std::path::PathBuf, String) {
+        let remote = init_test_repo();
+        let default_branch = {
+            let out = Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(remote.path())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let holder = TempDir::new().unwrap();
+        let local = holder.path().join("local");
+        Command::new("git")
+            .args([
+                "clone",
+                remote.path().to_str().unwrap(),
+                local.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        (remote, holder, local, default_branch)
+    }
+
+    /// branch.<name>.merge の設定値を返す（未設定なら None）
+    fn branch_upstream(repo: &Path, branch: &str) -> Option<String> {
+        let out = Command::new("git")
+            .args(["config", &format!("branch.{}.merge", branch)])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
     #[test]
     fn test_create_worktree() {
         let repo = init_test_repo();
@@ -351,6 +405,87 @@ mod tests {
         assert_eq!(wt_path, wt_dest);
         // README.md がコピーされている
         assert!(wt_path.join("README.md").exists());
+    }
+
+    #[test]
+    fn test_create_worktree_from_remote_ref_no_track_has_no_upstream() {
+        let (_remote, _holder, local, default_branch) = init_test_repo_with_origin();
+        let wt_dest = local.join("worktrees/no-track");
+        let start_point = format!("origin/{}", default_branch);
+
+        let result = WorktreeManager::create_worktree_from_ref(
+            &local,
+            &wt_dest,
+            "feature/no-track",
+            Some(&start_point),
+            true,
+            &[],
+        );
+
+        assert!(result.is_ok(), "worktree 作成に失敗: {:?}", result.err());
+        // no_track=true なら upstream は設定されない
+        assert_eq!(branch_upstream(&local, "feature/no-track"), None);
+    }
+
+    #[test]
+    fn test_create_worktree_from_remote_ref_with_track_has_upstream() {
+        let (_remote, _holder, local, default_branch) = init_test_repo_with_origin();
+        let wt_dest = local.join("worktrees/with-track");
+        let start_point = format!("origin/{}", default_branch);
+
+        let result = WorktreeManager::create_worktree_from_ref(
+            &local,
+            &wt_dest,
+            "feature/with-track",
+            Some(&start_point),
+            false,
+            &[],
+        );
+
+        assert!(result.is_ok(), "worktree 作成に失敗: {:?}", result.err());
+        // no_track=false なら従来通り upstream が設定される
+        assert_eq!(
+            branch_upstream(&local, "feature/with-track"),
+            Some(format!("refs/heads/{}", default_branch)),
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_no_track_unsets_upstream_of_existing_branch() {
+        let (_remote, _holder, local, default_branch) = init_test_repo_with_origin();
+
+        // ベースブランチを upstream に持つ既存ブランチを用意
+        // （旧実装で作られた worktree のブランチを再利用するケースを再現）
+        Command::new("git")
+            .args(["branch", "feature/existing"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "branch",
+                &format!("--set-upstream-to=origin/{}", default_branch),
+                "feature/existing",
+            ])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert!(branch_upstream(&local, "feature/existing").is_some());
+
+        let wt_dest = local.join("worktrees/existing");
+        let start_point = format!("origin/{}", default_branch);
+        let result = WorktreeManager::create_worktree_from_ref(
+            &local,
+            &wt_dest,
+            "feature/existing",
+            Some(&start_point),
+            true,
+            &[],
+        );
+
+        assert!(result.is_ok(), "worktree 作成に失敗: {:?}", result.err());
+        // 既存ブランチ流用のフォールバックでも upstream が解除される
+        assert_eq!(branch_upstream(&local, "feature/existing"), None);
     }
 
     #[test]
