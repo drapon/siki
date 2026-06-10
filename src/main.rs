@@ -1544,11 +1544,15 @@ async fn handle_event(
             }
             // ワークツリー追加ポップアップ
             if app.show_add_worktree_popup {
+                // 単一行入力のため改行などの制御文字を除去
+                let sanitized: String = text.chars().filter(|c| !c.is_control()).collect();
                 if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
-                    app.add_worktree_branch_filter.push_str(&text);
+                    app.add_worktree_branch_filter.push_str(&sanitized);
                     app.add_worktree_branch_cursor = 0;
+                } else if app.add_worktree_display_focus {
+                    app.add_worktree_display_input.push_str(&sanitized);
                 } else {
-                    app.add_worktree_input.push_str(&text);
+                    app.add_worktree_input.push_str(&sanitized);
                 }
                 return;
             }
@@ -6932,6 +6936,70 @@ mod tests {
         assert!(!app.show_add_worktree_popup);
         assert!(!app.add_worktree_display_focus);
         assert_eq!(app.add_worktree_display_input, "");
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_paste() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+
+        // ブランチ欄へのペースト（末尾改行は除去される）
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Paste("feature/pasted\n".to_string()),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert_eq!(app.add_worktree_input, "feature/pasted");
+
+        // 表示名フォーカス中のペーストは表示名欄に入る
+        app.add_worktree_display_focus = true;
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Paste("ログイン改修".to_string()),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert_eq!(app.add_worktree_display_input, "ログイン改修");
+        assert_eq!(app.add_worktree_input, "feature/pasted");
     }
 
     // --- プロジェクト追加ポップアップのテスト ---
