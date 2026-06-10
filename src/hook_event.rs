@@ -7,6 +7,11 @@ use crate::session_start::{read_stdin_with_timeout, send_line_to_broker, STDIN_R
 
 /// Claude Code が hook 入力 JSON で渡してくる状態イベント。
 /// broker 側の `HookEvent`（serde tag = "event"）に対応する。
+///
+/// `register` は含まない。セッション登録は `siki session-start` サブコマンドが
+/// 専用経路で担当するため（broker の `HookEvent::Register` はそちらから送られる）。
+/// broker 側の `HookEvent` に状態を追加した場合は、この配列にも追記すること
+/// （未追記だと送信側でここで弾かれ、状態イベントが取りこぼされる）。
 const KNOWN_STATES: &[&str] = &["working", "waiting", "refresh", "idle", "dead"];
 
 /// 状態系 hook の stdin 読み取りタイムアウト。
@@ -40,7 +45,10 @@ const HOOK_EVENT_STDIN_TIMEOUT: Duration = Duration::from_secs(1);
 pub fn run(sock_path: &Path, state: &str) -> Result<()> {
     if !KNOWN_STATES.contains(&state) {
         // 未知の状態は broker 側でも捨てられるが、ここで弾いて送信自体を避ける。
-        eprintln!("siki hook-event: unknown state {:?}", state);
+        eprintln!(
+            "siki hook-event: unknown state {:?}; for session registration use `siki session-start`",
+            state
+        );
         return Ok(());
     }
 
@@ -53,8 +61,14 @@ pub fn run(sock_path: &Path, state: &str) -> Result<()> {
         .unwrap_or("");
 
     // session_id 無しでは更新対象が定まらない。フォールバックで PID 由来の幽霊 ID を
-    // 作ると本物のセッションとは別行を更新してしまうため、ここで黙って終了する。
+    // 作ると本物のセッションとは別行を更新してしまうため、ここで終了する。
+    // stdin タイムアウト・payload 変更・JSON パース失敗のいずれでもここに来るため、
+    // 全状態遷移が無言で止まるのを避けるべく stderr に診断を残す（stdout は使わない）。
     if session_id.is_empty() {
+        eprintln!(
+            "siki hook-event: missing session_id for state {:?}; dropping event",
+            state
+        );
         return Ok(());
     }
 

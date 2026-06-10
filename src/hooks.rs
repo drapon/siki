@@ -286,6 +286,24 @@ fn load_or_default(path: &Path) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// コマンド文字列が siki の生成した hook かどうかを判定する。
+///
+/// 再注入時に古い siki hook だけを置き換えるための識別に使う。ユーザが独自に登録した
+/// 無関係な hook を巻き込んで削除しないよう、サブコマンドは部分一致ではなく空白区切りの
+/// 独立トークンとして照合する（例: `my-tool hook-event-logger` の `hook-event-logger` は
+/// 1 トークンなので `hook-event` には一致しない）。
+fn is_siki_managed_command(command: &str) -> bool {
+    // 旧形式: `... | nc -U <.siki ソケット>` で状態を送るシェルコマンド
+    if command.contains("nc -U") && command.contains(".siki") {
+        return true;
+    }
+    // 新形式: `<path>/siki session-start` または `<path>/siki hook-event <state>`
+    // サブコマンド名を独立トークンとして含むかで判定する。
+    command
+        .split_whitespace()
+        .any(|tok| tok == "session-start" || tok == "hook-event")
+}
+
 /// hook イベントに siki 用コマンドを注入する
 ///
 /// 既存の hook 配列がある場合、siki のコマンドが含まれていなければ追加する。
@@ -303,8 +321,6 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
     };
 
     // 既存の siki hook を削除して最新版に置き換える（再実行時の重複・旧形式の残存を防ぐ）
-    // - 旧形式: `nc -U .../.siki/sock` を含むコマンド（netcat 方式）
-    // - 新形式: `siki session-start` / `siki hook-event <state>` サブコマンドを呼ぶコマンド
     arr.retain(|entry| {
         !entry
             .get("hooks")
@@ -313,11 +329,7 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| {
-                            (c.contains("nc -U") && c.contains(".siki"))
-                                || c.contains("session-start")
-                                || c.contains("hook-event")
-                        })
+                        .is_some_and(is_siki_managed_command)
                 })
             })
             .unwrap_or(false)
@@ -453,6 +465,40 @@ mod tests {
         let arr = hooks["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "re-running must not duplicate hook-event hooks");
         assert_eq!(arr[0]["hooks"][0]["command"], "/new/siki hook-event working");
+    }
+
+    #[test]
+    fn test_is_siki_managed_command() {
+        // 新形式 siki サブコマンド
+        assert!(is_siki_managed_command("/usr/local/bin/siki session-start"));
+        assert!(is_siki_managed_command("/usr/local/bin/siki hook-event working"));
+        assert!(is_siki_managed_command("siki hook-event dead"));
+        // 旧形式 nc
+        assert!(is_siki_managed_command(
+            r#"SID=$(...); echo '...' | nc -U /home/user/.siki/sock"#
+        ));
+        // ユーザの無関係 hook は誤検出しない（部分一致ではなくトークン照合のため）
+        assert!(!is_siki_managed_command("my-tool hook-event-logger --json"));
+        assert!(!is_siki_managed_command("./session-start.sh deploy"));
+        assert!(!is_siki_managed_command("echo my-session-started"));
+        assert!(!is_siki_managed_command("nc -U /tmp/other.sock")); // .siki を含まない
+    }
+
+    #[test]
+    fn test_inject_hook_preserves_user_hook_with_similar_name() {
+        // `hook-event-logger` のような siki 無関係コマンドは置換で消えてはならない
+        let mut hooks = json!({
+            "PreToolUse": [{
+                "hooks": [{"type": "command", "command": "my-tool hook-event-logger --json"}]
+            }]
+        });
+        inject_hook(&mut hooks, "PreToolUse", "/usr/local/bin/siki hook-event working", true);
+
+        let arr = hooks["PreToolUse"].as_array().unwrap();
+        // ユーザ hook(0) は残り、siki hook(1) が追加される
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["hooks"][0]["command"], "my-tool hook-event-logger --json");
+        assert_eq!(arr[1]["hooks"][0]["command"], "/usr/local/bin/siki hook-event working");
     }
 
     #[test]
