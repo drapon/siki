@@ -474,29 +474,45 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
         .collect::<Vec<_>>()
         .join(" ");
 
-    let mut lines = vec![
-        format!(""),
-        format!("  名前: {}", app.add_worktree_name),
-        format!(""),
-        format!("  モード: {}", mode_tabs),
-        format!(""),
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(format!("  名前: {}", app.add_worktree_name)),
+        Line::from(""),
+        Line::from(format!("  モード: {}", mode_tabs)),
+        Line::from(""),
     ];
 
     // フォーカス中のフィールドにのみカーソル `_` を表示
     let branch_cursor = if app.add_worktree_display_focus { "" } else { "_" };
-    let display_cursor = if app.add_worktree_display_focus { "_" } else { "" };
+
+    // 表示名行: 未入力時は placeholder を薄く表示し、入力があれば消える
+    let display_name_line = {
+        let mut spans = vec![Span::raw("  表示名: ")];
+        if app.add_worktree_display_input.is_empty() {
+            if app.add_worktree_display_focus {
+                spans.push(Span::raw("_"));
+            }
+            spans.push(Span::styled(
+                "(任意)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.push(Span::raw(app.add_worktree_display_input.clone()));
+            if app.add_worktree_display_focus {
+                spans.push(Span::raw("_"));
+            }
+        }
+        Line::from(spans)
+    };
 
     match app.add_worktree_mode {
         AddWorktreeMode::NewBranch => {
             // ブランチ一覧が下に並ぶため、表示名はブランチ名の上に置く
-            lines.push(format!(
-                "  表示名: {}{} (任意)",
-                app.add_worktree_display_input, display_cursor
-            ));
-            lines.push(format!(
+            lines.push(display_name_line);
+            lines.push(Line::from(format!(
                 "  ブランチ: {}{}",
                 app.add_worktree_input, branch_cursor
-            ));
+            )));
         }
         AddWorktreeMode::FromBase => {
             // 選択中のベースブランチを表示
@@ -505,22 +521,19 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
                 .get(app.add_worktree_base_cursor)
                 .map(|s| s.as_str())
                 .unwrap_or(&app.add_worktree_base_branch);
-            lines.push(format!("  ベース: {}", selected_base));
+            lines.push(Line::from(format!("  ベース: {}", selected_base)));
             // ブランチ一覧が下に並ぶため、表示名はブランチ名の上に置く
-            lines.push(format!(
-                "  表示名: {}{} (任意)",
-                app.add_worktree_display_input, display_cursor
-            ));
-            lines.push(format!(
+            lines.push(display_name_line);
+            lines.push(Line::from(format!(
                 "  ブランチ: {}{}",
                 app.add_worktree_input, branch_cursor
-            ));
+            )));
 
             if app.add_worktree_base_loading {
-                lines.push(format!(""));
-                lines.push(format!("  取得中..."));
+                lines.push(Line::from(""));
+                lines.push(Line::from("  取得中..."));
             } else if !app.add_worktree_all_branches.is_empty() {
-                lines.push(format!(""));
+                lines.push(Line::from(""));
 
                 let branches = &app.add_worktree_all_branches;
                 let max_display = (area.height as usize).saturating_sub(lines.len() + 4);
@@ -536,16 +549,19 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
                     } else {
                         " "
                     };
-                    lines.push(format!("  {} {}", marker, branch));
+                    lines.push(Line::from(format!("  {} {}", marker, branch)));
                 }
             }
         }
         AddWorktreeMode::FromRemote => {
             if app.add_worktree_loading {
-                lines.push(format!("  取得中..."));
+                lines.push(Line::from("  取得中..."));
             } else {
-                lines.push(format!("  フィルター: {}_", app.add_worktree_branch_filter));
-                lines.push(format!(""));
+                lines.push(Line::from(format!(
+                    "  フィルター: {}_",
+                    app.add_worktree_branch_filter
+                )));
+                lines.push(Line::from(""));
 
                 let filtered: Vec<&String> = app
                     .add_worktree_remote_branches
@@ -570,35 +586,29 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
                     } else {
                         " "
                     };
-                    lines.push(format!("  {} {}", marker, branch));
+                    lines.push(Line::from(format!("  {} {}", marker, branch)));
                 }
 
                 if filtered.is_empty() {
-                    lines.push(format!("  (リモートブランチなし)"));
+                    lines.push(Line::from("  (リモートブランチなし)"));
                 }
             }
         }
     }
 
-    lines.push(format!(""));
-    let enter_label = if app.add_worktree_mode != AddWorktreeMode::FromRemote
-        && !app.add_worktree_display_focus
-    {
-        "Enter: 次へ"
-    } else {
-        "Enter: 追加"
+    lines.push(Line::from(""));
+    let footer = match app.add_worktree_mode {
+        AddWorktreeMode::NewBranch => {
+            "  Enter: 追加  Shift+Tab: 表示名  Tab: モード  Esc: 閉じる"
+        }
+        AddWorktreeMode::FromBase => {
+            "  Enter: 追加  ↑↓: ベース選択  Shift+Tab: 表示名  Tab: モード  Esc: 閉じる"
+        }
+        AddWorktreeMode::FromRemote => "  Enter: 追加  Tab: モード  Esc: 閉じる",
     };
-    if app.add_worktree_mode == AddWorktreeMode::FromBase {
-        lines.push(format!(
-            "  {}  ↑↓: ベース選択  Tab: モード  Esc: 閉じる",
-            enter_label
-        ));
-    } else {
-        lines.push(format!("  {}  Tab: モード  Esc: 閉じる", enter_label));
-    }
+    lines.push(Line::from(footer));
 
-    let text = lines.join("\n");
-    let paragraph = Paragraph::new(text).block(block);
+    let paragraph = Paragraph::new(lines).block(block);
 
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);

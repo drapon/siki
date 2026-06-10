@@ -1879,7 +1879,13 @@ fn handle_add_worktree_popup_key(
             app.add_worktree_display_focus = false;
             app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
         }
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::BackTab => {
+            // NewBranch/FromBase: ブランチ入力と表示名入力のフォーカスを切り替え
+            if app.add_worktree_mode != app::AddWorktreeMode::FromRemote {
+                app.add_worktree_display_focus = !app.add_worktree_display_focus;
+            }
+        }
+        KeyCode::Tab => {
             app.add_worktree_mode = app.add_worktree_mode.next();
             app.add_worktree_display_focus = false;
             // FromBase に切り替えたとき、ブランチ一覧が未取得なら非同期取得
@@ -1934,11 +1940,6 @@ fn handle_add_worktree_popup_key(
                     if branch.is_empty() {
                         return;
                     }
-                    // 1回目の Enter: 表示名（任意）の入力へ進む
-                    if !app.add_worktree_display_focus {
-                        app.add_worktree_display_focus = true;
-                        return;
-                    }
                     let display_name = trimmed_or_none(&app.add_worktree_display_input);
                     finalize_add_worktree(
                         app, terminals, event_tx, shell,
@@ -1951,11 +1952,6 @@ fn handle_add_worktree_popup_key(
                 app::AddWorktreeMode::FromBase => {
                     let branch = app.add_worktree_input.trim().to_string();
                     if branch.is_empty() {
-                        return;
-                    }
-                    // 1回目の Enter: 表示名（任意）の入力へ進む
-                    if !app.add_worktree_display_focus {
-                        app.add_worktree_display_focus = true;
                         return;
                     }
                     let display_name = trimmed_or_none(&app.add_worktree_display_input);
@@ -6768,32 +6764,7 @@ mod tests {
         app.add_worktree_input = "feature/auth".to_string();
         let initial_count = app.projects[0].worktrees.len();
 
-        // 1回目の Enter: 表示名入力へフォーカス移動（まだ作成されない）
-        handle_event(
-            &mut app,
-            &mut left_panel,
-            &mut source_tree,
-            &mut diff_view,
-            &mut local_changes,
-            &mut history_view,
-            &mut sessions,
-            &mut terminals,
-            &mut claude_terms,
-            &mut siki_init_terminal,
-            &tx,
-            "/bin/sh",
-            event::AppEvent::Key(key(KeyCode::Enter)),
-            None,
-            &None,
-            &test_broker_db(),
-        )
-        .await;
-
-        assert!(app.show_add_worktree_popup);
-        assert!(app.add_worktree_display_focus);
-        assert_eq!(app.projects[0].worktrees.len(), initial_count);
-
-        // 2回目の Enter: 表示名は空のまま作成
+        // Enter 一発で作成（表示名は空のまま）
         handle_event(
             &mut app,
             &mut left_panel,
@@ -6845,7 +6816,7 @@ mod tests {
         app.show_add_worktree_popup = true;
         app.add_worktree_input = "feature/x".to_string();
 
-        // Enter で表示名フィールドにフォーカスが移る
+        // Shift+Tab で表示名フィールドにフォーカスが移る
         handle_event(
             &mut app,
             &mut left_panel,
@@ -6859,7 +6830,7 @@ mod tests {
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
-            event::AppEvent::Key(key(KeyCode::Enter)),
+            event::AppEvent::Key(key(KeyCode::BackTab)),
             None,
             &None,
             &test_broker_db(),
@@ -6913,7 +6884,30 @@ mod tests {
         assert_eq!(app.add_worktree_display_input, "");
         assert_eq!(app.add_worktree_input, "feature/x");
 
+        // もう一度 Shift+Tab でブランチ入力にフォーカスが戻る
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::BackTab)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert!(!app.add_worktree_display_focus);
+
         // Esc で表示名関連の状態もリセットされる
+        app.add_worktree_display_focus = true;
         handle_event(
             &mut app,
             &mut left_panel,
