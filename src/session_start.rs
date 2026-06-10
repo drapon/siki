@@ -17,7 +17,7 @@ use crate::db;
 /// stdio リダイレクト事故・Claude Code 側のバグ等で EOF が来ないとセッション開始が
 /// 止まる（過去 `33719cf` / `75415c9` で同種の hook ブロッキングを 2 回踏んだ実績あり）。
 /// 通常のペイロードは数 KB / 1ms 未満で読めるので、3 秒は余裕を持った打ち切り値。
-pub(crate) const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(3);
+const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// stdin から読み取る最大バイト数。
 ///

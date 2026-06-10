@@ -1,14 +1,28 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::Duration;
 
-use crate::session_start::{
-    read_stdin_with_timeout, send_line_to_broker, STDIN_READ_MAX, STDIN_READ_TIMEOUT,
-};
+use crate::session_start::{read_stdin_with_timeout, send_line_to_broker, STDIN_READ_MAX};
 
 /// Claude Code が hook 入力 JSON で渡してくる状態イベント。
 /// broker 側の `HookEvent`（serde tag = "event"）に対応する。
 const KNOWN_STATES: &[&str] = &["working", "waiting", "refresh", "idle", "dead"];
+
+/// 状態系 hook の stdin 読み取りタイムアウト。
+///
+/// 状態系 hook は `is_async=true` / hook timeout=5000ms（`hooks.rs`）で起動される。
+/// `run` は stdin 読み取り（このタイムアウト）→ broker 送信（`BROKER_CONNECT_TIMEOUT`=2s）を
+/// 直列に実行するため、両者の合計が hook timeout を超えると Claude Code がプロセスを
+/// 強制終了し、状態イベントを取りこぼす。1s なら最悪でも 1+2=3s に収まり、
+/// hook timeout(5s) に対して 2s のマージンを残せる。
+/// （SessionStart の `STDIN_READ_TIMEOUT`=3s は `is_async=false` で hook timeout を持たない
+/// 前提の値なので、状態系 hook には流用しない。）
+/// Claude Code は hook 起動と同時に stdin を書き込むため、通常は 1ms 未満で読み終わる。
+///
+/// このタイムアウトを変更する場合は `BROKER_CONNECT_TIMEOUT` との合計が hook timeout
+/// （`hooks.rs` の 5000ms）を下回ることを必ず確認すること。
+const HOOK_EVENT_STDIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 状態系 hook（PreToolUse / PermissionRequest / PostToolUse / Stop / SessionEnd）の実装。
 ///
@@ -30,7 +44,7 @@ pub fn run(sock_path: &Path, state: &str) -> Result<()> {
         return Ok(());
     }
 
-    let input = read_stdin_with_timeout(STDIN_READ_TIMEOUT, STDIN_READ_MAX);
+    let input = read_stdin_with_timeout(HOOK_EVENT_STDIN_TIMEOUT, STDIN_READ_MAX);
     let input_json: Value = serde_json::from_str(&input).unwrap_or_else(|_| json!({}));
 
     let session_id = input_json
