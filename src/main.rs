@@ -1871,10 +1871,13 @@ fn handle_add_worktree_popup_key(
             app.show_add_worktree_popup = false;
             app.add_worktree_input.clear();
             app.add_worktree_branch_filter.clear();
+            app.add_worktree_display_input.clear();
+            app.add_worktree_display_focus = false;
             app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
         }
         KeyCode::Tab | KeyCode::BackTab => {
             app.add_worktree_mode = app.add_worktree_mode.next();
+            app.add_worktree_display_focus = false;
             // FromBase に切り替えたとき、ブランチ一覧が未取得なら非同期取得
             if app.add_worktree_mode == app::AddWorktreeMode::FromBase
                 && app.add_worktree_all_branches.is_empty()
@@ -1927,11 +1930,18 @@ fn handle_add_worktree_popup_key(
                     if branch.is_empty() {
                         return;
                     }
+                    // 1回目の Enter: 表示名（任意）の入力へ進む
+                    if !app.add_worktree_display_focus {
+                        app.add_worktree_display_focus = true;
+                        return;
+                    }
+                    let display_name = trimmed_or_none(&app.add_worktree_display_input);
                     finalize_add_worktree(
                         app, terminals, event_tx, shell,
                         &branch,
                         None,
                         false,
+                        display_name.as_deref(),
                     );
                 }
                 app::AddWorktreeMode::FromBase => {
@@ -1939,6 +1949,12 @@ fn handle_add_worktree_popup_key(
                     if branch.is_empty() {
                         return;
                     }
+                    // 1回目の Enter: 表示名（任意）の入力へ進む
+                    if !app.add_worktree_display_focus {
+                        app.add_worktree_display_focus = true;
+                        return;
+                    }
+                    let display_name = trimmed_or_none(&app.add_worktree_display_input);
                     // カーソル位置のブランチを start_point にする
                     let start_point = app
                         .add_worktree_all_branches
@@ -1952,6 +1968,7 @@ fn handle_add_worktree_popup_key(
                         &branch,
                         Some(&start_point),
                         true,
+                        display_name.as_deref(),
                     );
                 }
                 app::AddWorktreeMode::FromRemote => {
@@ -1978,6 +1995,7 @@ fn handle_add_worktree_popup_key(
                             &local_branch,
                             Some(&start_point),
                             false,
+                            None,
                         );
                     }
                 }
@@ -2018,6 +2036,9 @@ fn handle_add_worktree_popup_key(
             if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
                 app.add_worktree_branch_filter.push(c);
                 app.add_worktree_branch_cursor = 0;
+            } else if app.add_worktree_display_focus {
+                // NewBranch / FromBase: 表示名入力
+                app.add_worktree_display_input.push(c);
             } else {
                 // NewBranch / FromBase: ブランチ名入力
                 app.add_worktree_input.push(c);
@@ -2027,11 +2048,23 @@ fn handle_add_worktree_popup_key(
             if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
                 app.add_worktree_branch_filter.pop();
                 app.add_worktree_branch_cursor = 0;
+            } else if app.add_worktree_display_focus {
+                app.add_worktree_display_input.pop();
             } else {
                 app.add_worktree_input.pop();
             }
         }
         _ => {}
+    }
+}
+
+/// trim して空なら None、それ以外は Some を返す
+fn trimmed_or_none(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -2044,6 +2077,7 @@ fn finalize_add_worktree(
     branch: &str,
     start_point: Option<&str>,
     no_track: bool,
+    display_name: Option<&str>,
 ) {
     let pi = app.add_worktree_project_index;
     let wt_name = app.add_worktree_name.clone();
@@ -2066,6 +2100,8 @@ fn finalize_add_worktree(
         app.show_add_worktree_popup = false;
         app.add_worktree_input.clear();
         app.add_worktree_branch_filter.clear();
+        app.add_worktree_display_input.clear();
+        app.add_worktree_display_focus = false;
         app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
         return;
     }
@@ -2073,7 +2109,7 @@ fn finalize_add_worktree(
     // メモリ上に worktree を追加
     app.projects[pi].worktrees.push(app::Worktree {
         name: wt_name.clone(),
-        display_name: None,
+        display_name: display_name.map(|s| s.to_string()),
         branch: branch.to_string(),
         path: wt_path.clone(),
         chat_history: Vec::new(),
@@ -2106,6 +2142,15 @@ fn finalize_add_worktree(
 
     app.show_info(format!("worktree 追加完了: {} ({})", wt_name, branch));
 
+    // 表示名が指定されていれば project.json に永続化
+    if let Some(name) = display_name {
+        if let Err(e) =
+            config::save_worktree_display_name(&project_name, &wt_name, Some(name))
+        {
+            app.show_error(format!("表示名の保存に失敗: {}", e));
+        }
+    }
+
     // setup スクリプトがあれば実行（siki.json 優先、なければ project.json）
     let wi = app.projects[pi].worktrees.len() - 1;
     let wt_id = (pi, wi);
@@ -2122,6 +2167,8 @@ fn finalize_add_worktree(
     app.show_add_worktree_popup = false;
     app.add_worktree_input.clear();
     app.add_worktree_branch_filter.clear();
+    app.add_worktree_display_input.clear();
+    app.add_worktree_display_focus = false;
     app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
 }
 
@@ -2637,6 +2684,8 @@ fn handle_left_panel_key(
                 app.add_worktree_all_branches.clear();
                 app.add_worktree_base_cursor = 0;
                 app.add_worktree_base_loading = false;
+                app.add_worktree_display_input.clear();
+                app.add_worktree_display_focus = false;
 
                 // base_branch を解決: siki.json > config.toml > "origin/main"
                 let project_name = &app.projects[pi].name;
@@ -6715,6 +6764,32 @@ mod tests {
         app.add_worktree_input = "feature/auth".to_string();
         let initial_count = app.projects[0].worktrees.len();
 
+        // 1回目の Enter: 表示名入力へフォーカス移動（まだ作成されない）
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        assert!(app.show_add_worktree_popup);
+        assert!(app.add_worktree_display_focus);
+        assert_eq!(app.projects[0].worktrees.len(), initial_count);
+
+        // 2回目の Enter: 表示名は空のまま作成
         handle_event(
             &mut app,
             &mut left_panel,
@@ -6740,10 +6815,123 @@ mod tests {
         let new_wt = app.projects[0].worktrees.last().unwrap();
         assert_eq!(new_wt.name, "tokyo");
         assert_eq!(new_wt.branch, "feature/auth");
+        // 表示名が空なら従来通り None（都市名表示にフォールバック）
+        assert_eq!(new_wt.display_name, None);
 
         // テスト後に作成された worktree をクリーンアップ
         let wt_path = config::worktree_path("test-project", "tokyo");
         let _ = git::WorktreeManager::remove_worktree(project_path, &wt_path);
+    }
+
+    #[tokio::test]
+    async fn test_add_worktree_popup_display_name_input() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_input = "feature/x".to_string();
+
+        // Enter で表示名フィールドにフォーカスが移る
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert!(app.add_worktree_display_focus);
+
+        // フォーカス中の文字入力は表示名に入る（ブランチ名は不変）
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Char('U'))),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert_eq!(app.add_worktree_display_input, "U");
+        assert_eq!(app.add_worktree_input, "feature/x");
+
+        // Backspace も表示名に効く
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Backspace)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert_eq!(app.add_worktree_display_input, "");
+        assert_eq!(app.add_worktree_input, "feature/x");
+
+        // Esc で表示名関連の状態もリセットされる
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Esc)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert!(!app.show_add_worktree_popup);
+        assert!(!app.add_worktree_display_focus);
+        assert_eq!(app.add_worktree_display_input, "");
     }
 
     // --- プロジェクト追加ポップアップのテスト ---

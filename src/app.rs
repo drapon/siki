@@ -269,6 +269,10 @@ pub struct App {
     pub add_worktree_base_cursor: usize,
     /// FromBase モード: ブランチ一覧読み込み中
     pub add_worktree_base_loading: bool,
+    /// NewBranch/FromBase モード: 表示名入力（任意。空なら従来通り都市名を表示）
+    pub add_worktree_display_input: String,
+    /// NewBranch/FromBase モード: 表示名フィールドにフォーカス中か
+    pub add_worktree_display_focus: bool,
     pub show_add_project_popup: bool,
     pub add_project_input: String,
     pub show_grep_popup: bool,
@@ -434,6 +438,8 @@ impl App {
             add_worktree_all_branches: Vec::new(),
             add_worktree_base_cursor: 0,
             add_worktree_base_loading: false,
+            add_worktree_display_input: String::new(),
+            add_worktree_display_focus: false,
             show_add_project_popup: false,
             add_project_input: String::new(),
             show_grep_popup: false,
