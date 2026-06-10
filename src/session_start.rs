@@ -1,9 +1,10 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use socket2::{Domain, SockAddr, Socket, Type};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -31,6 +32,13 @@ pub(crate) const STDIN_READ_MAX: usize = 256 * 1024;
 /// accept ループから抜けた場合、`UnixStream::connect` 自体がブロックし得るため、
 /// stdin 読み取りと別枠で短めに打ち切る。
 pub(crate) const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// broker への 1 行書き込みのタイムアウト。
+///
+/// connect 成功後の write 上限。送るのは数十バイトの 1 行 JSON なので、broker が
+/// 読んでいれば即時に返る。broker が読まずソケットバッファが詰まった異常時に
+/// ここで無限ブロックしないための保険。
+const BROKER_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SQLite の busy_timeout (ms)。
 ///
@@ -188,34 +196,24 @@ pub(crate) fn send_line_to_broker(sock_path: &Path, payload: String, context: &s
         // siki TUI が起動していないのは正常パス。サイレントに無視。
         return;
     }
-    let sock_path_owned: PathBuf = sock_path.to_path_buf();
-    let context = context.to_string();
-
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
-    thread::spawn(move || {
-        let result = (|| -> std::io::Result<()> {
-            let mut stream = UnixStream::connect(&sock_path_owned)?;
-            stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-            stream.write_all(payload.as_bytes())?;
-            stream.write_all(b"\n")?;
-            Ok(())
-        })()
-        .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(BROKER_CONNECT_TIMEOUT) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            let _ = writeln!(std::io::stderr(), "{}: broker send failed: {}", context, e);
-        }
-        Err(_) => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "{}: broker send timed out after {:?}",
-                context,
-                BROKER_CONNECT_TIMEOUT
-            );
-        }
+    // connect 自体にタイムアウトを設ける。`std::os::unix::net::UnixStream::connect` は
+    // connect が listen バックログ待ちでブロックしてもタイムアウトできず、別スレッドに
+    // 逃がしてもそのスレッドが connect で残留してリークする。socket2 の
+    // `connect_timeout` ならその経路自体が消えるので、別スレッドを使わず同期で送れる。
+    let result = (|| -> std::io::Result<()> {
+        let addr = SockAddr::unix(sock_path)?;
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        socket.connect_timeout(&addr, BROKER_CONNECT_TIMEOUT)?;
+        socket.set_write_timeout(Some(BROKER_WRITE_TIMEOUT))?;
+        // connect_timeout は成功時ソケットを blocking に戻すので、write は
+        // set_write_timeout 付き blocking で動く（要 socket2 features=["all"]）。
+        let mut stream: UnixStream = socket.into();
+        stream.write_all(payload.as_bytes())?;
+        stream.write_all(b"\n")?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = writeln!(std::io::stderr(), "{}: broker send failed: {}", context, e);
     }
 }
 

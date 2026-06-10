@@ -25,6 +25,7 @@ toml = "1.0.3"
 unicode-width = "0.2"
 tui-term = "0.3.1"
 vt100 = "0.16.2"
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"

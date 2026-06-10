@@ -9,15 +9,16 @@ use crate::session_start::{read_stdin_with_timeout, send_line_to_broker, STDIN_R
 /// 状態系 hook の stdin 読み取りタイムアウト。
 ///
 /// 状態系 hook は `is_async=true` / hook timeout=5000ms（`hooks.rs`）で起動される。
-/// `run` は stdin 読み取り（このタイムアウト）→ broker 送信（`BROKER_CONNECT_TIMEOUT`=2s）を
-/// 直列に実行するため、両者の合計が hook timeout を超えると Claude Code がプロセスを
-/// 強制終了し、状態イベントを取りこぼす。1s なら最悪でも 1+2=3s に収まり、
-/// hook timeout(5s) に対して 2s のマージンを残せる。
+/// `run` は stdin 読み取り（このタイムアウト）→ broker 送信（connect 最大
+/// `BROKER_CONNECT_TIMEOUT`=2s + write 最大 `BROKER_WRITE_TIMEOUT`=1s）を直列に実行する。
+/// これらの合計が hook timeout を超えると Claude Code がプロセスを強制終了し、状態イベントを
+/// 取りこぼす。1s なら最悪でも 1+2+1=4s に収まり hook timeout(5s) にマージンを残せる
+/// （write は数十バイトなので connect 成功後ほぼ即時で、現実的な所要は stdin+connect が支配的）。
 /// （SessionStart の `STDIN_READ_TIMEOUT`=3s は `is_async=false` で hook timeout を持たない
 /// 前提の値なので、状態系 hook には流用しない。）
 /// Claude Code は hook 起動と同時に stdin を書き込むため、通常は 1ms 未満で読み終わる。
 ///
-/// このタイムアウトを変更する場合は `BROKER_CONNECT_TIMEOUT` との合計が hook timeout
+/// このタイムアウトを変更する場合は broker 側タイムアウトとの合計が hook timeout
 /// （`hooks.rs` の 5000ms）を下回ることを必ず確認すること。
 const HOOK_EVENT_STDIN_TIMEOUT: Duration = Duration::from_secs(1);
 
