@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod event;
 mod git;
+mod hook_event;
 mod hooks;
 mod mcp;
 mod selection;
@@ -78,6 +79,7 @@ async fn main() -> Result<()> {
         println!("  list           List projects and worktrees");
         println!("  mcp            Start MCP stdio server");
         println!("  session-start  Internal: SessionStart hook (reads stdin, emits additionalContext)");
+        println!("  hook-event <s> Internal: state hook (reads stdin session_id, notifies broker)");
         println!();
         println!("Options:");
         println!("  -p <name>  Filter projects by name prefix");
@@ -115,6 +117,15 @@ async fn main() -> Result<()> {
         let sock_path = config::sock_path();
         let db_path = config::db_path();
         return session_start::run(&sock_path, &db_path);
+    }
+
+    // サブコマンド: siki hook-event <state> → 状態系 hook 用
+    // stdin の JSON から session_id を読み、broker へ {"event":<state>,...} を送る。
+    // 従来の `echo | nc -U` を置き換え、netcat 依存と sed 抽出の脆さを排除する。
+    if args.len() > 1 && args[1] == "hook-event" {
+        let state = args.get(2).map(|s| s.as_str()).unwrap_or("");
+        let sock_path = config::sock_path();
+        return hook_event::run(&sock_path, state);
     }
 
     // -p <prefix> オプションの取得
@@ -4644,8 +4655,7 @@ fn launch_llm_with_args(
 
     // Hook 注入は Claude の場合のみ
     if llm_command == "claude" {
-        let sock = config::sock_path();
-        if let Err(e) = hooks::ensure_hooks_configured(&project_path, &sock, &project_name) {
+        if let Err(e) = hooks::ensure_hooks_configured(&project_path, &project_name) {
             app.show_error(format!("hook 注入に失敗: {}", e));
         }
     }

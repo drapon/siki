@@ -17,20 +17,20 @@ use crate::db;
 /// stdio リダイレクト事故・Claude Code 側のバグ等で EOF が来ないとセッション開始が
 /// 止まる（過去 `33719cf` / `75415c9` で同種の hook ブロッキングを 2 回踏んだ実績あり）。
 /// 通常のペイロードは数 KB / 1ms 未満で読めるので、3 秒は余裕を持った打ち切り値。
-const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// stdin から読み取る最大バイト数。
 ///
 /// Claude Code の hook 入力 JSON は典型的に 1 KB 未満。256 KB は安全マージンとして
 /// 十分かつ、悪意ある巨大入力でも本プロセスの常駐メモリを 1 MB 以下に抑える。
-const STDIN_READ_MAX: usize = 256 * 1024;
+pub(crate) const STDIN_READ_MAX: usize = 256 * 1024;
 
 /// broker への connect + write を含む全体のタイムアウト。
 ///
 /// 通常 Unix socket への 1 行書き込みは数 ms。broker (siki TUI 内) が panic で
 /// accept ループから抜けた場合、`UnixStream::connect` 自体がブロックし得るため、
 /// stdin 読み取りと別枠で短めに打ち切る。
-const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// SQLite の busy_timeout (ms)。
 ///
@@ -130,7 +130,7 @@ pub fn run(sock_path: &Path, db_path: &Path) -> Result<()> {
 
 /// stdin を `timeout` 内に読み切る。タイムアウトした場合は空文字列を返す。
 /// 読み取り中の最大バイト数を `max_bytes` で制限する。
-fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize) -> String {
+pub(crate) fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize) -> String {
     let (tx, rx) = mpsc::channel::<String>();
     // 読み取りスレッド: タイムアウト後もメインは exit するので、スレッドのリーク
     // は許容する（プロセスが死ねば回収される）
@@ -164,7 +164,21 @@ fn register_with_broker(sock_path: &Path, session_id: &str, cwd: &str, role: &st
         "role": role,
     })
     .to_string();
+    send_line_to_broker(sock_path, payload, "register");
+}
+
+/// broker へ 1 行 JSON を送信する。
+///
+/// `BROKER_CONNECT_TIMEOUT` 内に完了しなければ諦める（broker が固まっている場合の保険）。
+/// ソケットが存在しない（siki TUI 未起動）場合はサイレントにスキップする。
+/// `kind` はタイムアウト/失敗時の診断メッセージ用ラベル。
+pub(crate) fn send_line_to_broker(sock_path: &Path, payload: String, kind: &str) {
+    if !sock_path.exists() {
+        // siki TUI が起動していないのは正常パス。サイレントに無視。
+        return;
+    }
     let sock_path_owned: PathBuf = sock_path.to_path_buf();
+    let kind = kind.to_string();
 
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
     thread::spawn(move || {
@@ -181,10 +195,10 @@ fn register_with_broker(sock_path: &Path, session_id: &str, cwd: &str, role: &st
     match rx.recv_timeout(BROKER_CONNECT_TIMEOUT) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            diag!("broker register failed: {}", e);
+            diag!("broker {} failed: {}", kind, e);
         }
         Err(_) => {
-            diag!("broker register timed out after {:?}", BROKER_CONNECT_TIMEOUT);
+            diag!("broker {} timed out after {:?}", kind, BROKER_CONNECT_TIMEOUT);
         }
     }
 }
