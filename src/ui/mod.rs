@@ -482,9 +482,21 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
         format!(""),
     ];
 
+    // フォーカス中のフィールドにのみカーソル `_` を表示
+    let branch_cursor = if app.add_worktree_display_focus { "" } else { "_" };
+    let display_cursor = if app.add_worktree_display_focus { "_" } else { "" };
+
     match app.add_worktree_mode {
         AddWorktreeMode::NewBranch => {
-            lines.push(format!("  ブランチ: {}_", app.add_worktree_input));
+            // ブランチ一覧が下に並ぶため、表示名はブランチ名の上に置く
+            lines.push(format!(
+                "  表示名: {}{} (任意)",
+                app.add_worktree_display_input, display_cursor
+            ));
+            lines.push(format!(
+                "  ブランチ: {}{}",
+                app.add_worktree_input, branch_cursor
+            ));
         }
         AddWorktreeMode::FromBase => {
             // 選択中のベースブランチを表示
@@ -494,7 +506,15 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
                 .map(|s| s.as_str())
                 .unwrap_or(&app.add_worktree_base_branch);
             lines.push(format!("  ベース: {}", selected_base));
-            lines.push(format!("  ブランチ: {}_", app.add_worktree_input));
+            // ブランチ一覧が下に並ぶため、表示名はブランチ名の上に置く
+            lines.push(format!(
+                "  表示名: {}{} (任意)",
+                app.add_worktree_display_input, display_cursor
+            ));
+            lines.push(format!(
+                "  ブランチ: {}{}",
+                app.add_worktree_input, branch_cursor
+            ));
 
             if app.add_worktree_base_loading {
                 lines.push(format!(""));
@@ -561,12 +581,20 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
     }
 
     lines.push(format!(""));
+    let enter_label = if app.add_worktree_mode != AddWorktreeMode::FromRemote
+        && !app.add_worktree_display_focus
+    {
+        "Enter: 次へ"
+    } else {
+        "Enter: 追加"
+    };
     if app.add_worktree_mode == AddWorktreeMode::FromBase {
         lines.push(format!(
-            "  Enter: 追加  ↑↓: ベース選択  Tab: モード  Esc: 閉じる"
+            "  {}  ↑↓: ベース選択  Tab: モード  Esc: 閉じる",
+            enter_label
         ));
     } else {
-        lines.push(format!("  Enter: 追加  Tab: モード  Esc: 閉じる"));
+        lines.push(format!("  {}  Tab: モード  Esc: 閉じる", enter_label));
     }
 
     let text = lines.join("\n");
