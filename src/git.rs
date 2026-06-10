@@ -16,18 +16,29 @@ impl WorktreeManager {
         branch: &str,
         shared_dirs: &[String],
     ) -> Result<PathBuf> {
-        Self::create_worktree_from_ref(project_path, worktree_path, branch, None, shared_dirs)
+        Self::create_worktree_from_ref(
+            project_path,
+            worktree_path,
+            branch,
+            None,
+            false,
+            shared_dirs,
+        )
     }
 
     /// start_point を指定して worktree を作成する
     ///
     /// `start_point` が Some の場合、そのリビジョンからブランチを作成する。
     /// None の場合は現在の HEAD からブランチを作成する（従来の動作）。
+    ///
+    /// `no_track` が true の場合、start_point がリモート追跡ブランチでも
+    /// upstream を設定しない（ベースブランチへの誤 push を防ぐ）。
     pub fn create_worktree_from_ref(
         project_path: &Path,
         worktree_path: &Path,
         branch: &str,
         start_point: Option<&str>,
+        no_track: bool,
         shared_dirs: &[String],
     ) -> Result<PathBuf> {
         // 親ディレクトリを作成
@@ -49,8 +60,13 @@ impl WorktreeManager {
             }
         }
 
-        // git worktree add -b <branch> <path> [<start_point>]
-        let mut args = vec!["worktree", "add", "-b", branch];
+        // git worktree add [--no-track] -b <branch> <path> [<start_point>]
+        let mut args = vec!["worktree", "add"];
+        if no_track {
+            args.push("--no-track");
+        }
+        args.push("-b");
+        args.push(branch);
         let wt_path_str = worktree_path.to_string_lossy().to_string();
         args.push(&wt_path_str);
         if let Some(sp) = start_point {

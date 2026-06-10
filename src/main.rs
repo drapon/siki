@@ -1931,6 +1931,7 @@ fn handle_add_worktree_popup_key(
                         app, terminals, event_tx, shell,
                         &branch,
                         None,
+                        false,
                     );
                 }
                 app::AddWorktreeMode::FromBase => {
@@ -1944,10 +1945,13 @@ fn handle_add_worktree_popup_key(
                         .get(app.add_worktree_base_cursor)
                         .cloned()
                         .unwrap_or_else(|| app.add_worktree_base_branch.clone());
+                    // ベースは branch を切る起点に過ぎないので upstream は設定しない
+                    // （origin/main 等への誤 push を防ぐ）
                     finalize_add_worktree(
                         app, terminals, event_tx, shell,
                         &branch,
                         Some(&start_point),
+                        true,
                     );
                 }
                 app::AddWorktreeMode::FromRemote => {
@@ -1968,10 +1972,12 @@ fn handle_add_worktree_popup_key(
                             .unwrap_or(remote_branch)
                             .to_string();
                         let start_point = remote_branch.clone();
+                        // 同名リモートブランチのチェックアウトなので upstream を設定する
                         finalize_add_worktree(
                             app, terminals, event_tx, shell,
                             &local_branch,
                             Some(&start_point),
+                            false,
                         );
                     }
                 }
@@ -2037,6 +2043,7 @@ fn finalize_add_worktree(
     shell: &str,
     branch: &str,
     start_point: Option<&str>,
+    no_track: bool,
 ) {
     let pi = app.add_worktree_project_index;
     let wt_name = app.add_worktree_name.clone();
@@ -2052,6 +2059,7 @@ fn finalize_add_worktree(
         &wt_path,
         branch,
         start_point,
+        no_track,
         &shared_dirs,
     ) {
         app.show_error(format!("worktree の作成に失敗: {}", e));
