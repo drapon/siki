@@ -489,13 +489,15 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
     let display_name_line = {
         let mut spans = vec![Span::raw("  表示名: ")];
         if app.add_worktree_display_input.is_empty() {
+            // フォーカス時はカーソルのみ、非フォーカス時は placeholder のみ（併置を避ける）
             if app.add_worktree_display_focus {
                 spans.push(Span::raw("_"));
+            } else {
+                spans.push(Span::styled(
+                    "(任意)",
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
-            spans.push(Span::styled(
-                "(任意)",
-                Style::default().fg(Color::DarkGray),
-            ));
         } else {
             spans.push(Span::raw(app.add_worktree_display_input.clone()));
             if app.add_worktree_display_focus {
@@ -554,6 +556,8 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
             }
         }
         AddWorktreeMode::FromRemote => {
+            // FromRemote は既存リモートブランチのチェックアウトのため表示名入力を提供しない
+            // （display_name_line は push せず、footer にも Shift+Tab: 表示名 を出さない）
             if app.add_worktree_loading {
                 lines.push(Line::from("  取得中..."));
             } else {
@@ -604,7 +608,9 @@ fn render_add_worktree_popup(frame: &mut Frame, app: &App) {
         AddWorktreeMode::FromBase => {
             "  Enter: 追加  ↑↓: ベース選択  Shift+Tab: 表示名  Tab: モード  Esc: 閉じる"
         }
-        AddWorktreeMode::FromRemote => "  Enter: 追加  Tab: モード  Esc: 閉じる",
+        AddWorktreeMode::FromRemote => {
+            "  Enter: 追加  ↑↓: 選択  文字: フィルタ  Tab: モード  Esc: 閉じる"
+        }
     };
     lines.push(Line::from(footer));
 
