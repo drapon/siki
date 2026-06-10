@@ -12,6 +12,22 @@ use crate::event::AppEvent;
 /// グローバルなターミナルID生成用カウンタ
 static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
 
+/// vt100 パーサーが検出した本物のベル (BEL) を数えるコールバック
+///
+/// 生バイト走査と異なり、OSC シーケンス終端の BEL（fish/zsh の
+/// ウィンドウタイトル設定 `ESC]0;...BEL` 等）はパーサーが OSC として
+/// 消費するため audible_bell は呼ばれず、誤検知しない。
+#[derive(Default)]
+struct BellCounter {
+    bells: usize,
+}
+
+impl vt100::Callbacks for BellCounter {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bells += 1;
+    }
+}
+
 /// PTY ベースのターミナルエミュレータ
 ///
 /// portable-pty でシェルを起動し、vt100 パーサーで画面状態を管理する。
@@ -19,7 +35,7 @@ pub struct TerminalEmulator {
     id: u64,
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    parser: vt100::Parser,
+    parser: vt100::Parser<BellCounter>,
     alive: bool,
     /// 子プロセスハンドル。Drop 時に kill + wait してリーダースレッドの停止と
     /// ゾンビプロセス化の防止を行う。
@@ -173,7 +189,12 @@ impl TerminalEmulator {
             }
         });
 
-        let parser = vt100::Parser::new(size.1, size.0, scrollback_lines);
+        let parser = vt100::Parser::new_with_callbacks(
+            size.1,
+            size.0,
+            scrollback_lines,
+            BellCounter::default(),
+        );
 
         Ok(Self {
             id,
@@ -234,8 +255,16 @@ impl TerminalEmulator {
     }
 
     /// PTY からのデータを VT100 パーサーに処理させる
+    ///
+    /// 子プロセス (claude や make 等) が通知用に出したベルは vt100 パーサーに
+    /// 吸収されて外側ターミナルに届かないため、検出したら siki 自身の stdout に
+    /// 書き戻して外側ターミナル (tmux / iTerm 等) の通知を発火させる。
     pub fn process(&mut self, data: &[u8]) {
+        let bells_before = self.parser.callbacks().bells;
         self.parser.process(data);
+        if self.parser.callbacks().bells > bells_before {
+            forward_bell();
+        }
     }
 
     /// VT100 パーサーの画面状態を取得する
@@ -257,6 +286,17 @@ impl TerminalEmulator {
     pub fn scrollback(&self) -> usize {
         self.parser.screen().scrollback()
     }
+}
+
+/// ベル (BEL) を siki 自身の stdout に書き戻し、外側ターミナルの通知を発火させる
+///
+/// BEL は表示にも端末状態にも影響しないため、ratatui の描画と交錯しても
+/// 画面は壊れない。stdout の内部ロックにより描画の write とは直列化される。
+fn forward_bell() {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let _ = handle.write_all(&[0x07]);
+    let _ = handle.flush();
 }
 
 /// crossterm の KeyEvent をターミナルバイト列に変換する
@@ -477,6 +517,43 @@ mod tests {
         let screen = parser.screen();
         let contents = screen.contents_between(0, 0, 0, 120);
         assert!(contents.contains("After resize"));
+    }
+
+    // --- BellCounter テスト ---
+
+    #[test]
+    fn test_bell_counter_counts_real_bell() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, BellCounter::default());
+        parser.process(b"hello\x07world");
+        assert_eq!(parser.callbacks().bells, 1);
+    }
+
+    #[test]
+    fn test_bell_counter_ignores_osc_terminator() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, BellCounter::default());
+        // fish/zsh のウィンドウタイトル設定 (OSC 0、BEL 終端) はベルではない
+        parser.process(b"\x1b]0;my title\x07");
+        assert_eq!(parser.callbacks().bells, 0);
+    }
+
+    #[test]
+    fn test_bell_counter_ignores_osc_split_across_chunks() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, BellCounter::default());
+        // OSC シーケンスが PTY 読み取りチャンク境界で分断されても誤検知しない
+        parser.process(b"\x1b]0;my ti");
+        parser.process(b"tle\x07");
+        assert_eq!(parser.callbacks().bells, 0);
+    }
+
+    #[test]
+    fn test_bell_counter_mixed_osc_and_real_bell() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, BellCounter::default());
+        parser.process(b"\x1b]0;title\x07done\x07");
+        assert_eq!(parser.callbacks().bells, 1);
     }
 
     // --- PTY 統合テスト ---
