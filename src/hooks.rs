@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 ///
 /// 既存の設定がある場合はマージし、siki の hook を追加・更新する。
 /// 既存の hook は保持される。
-pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_name: &str) -> Result<()> {
+pub fn ensure_hooks_configured(worktree_path: &Path, project_name: &str) -> Result<()> {
     let claude_dir = worktree_path.join(".claude");
     std::fs::create_dir_all(&claude_dir)
         .with_context(|| format!(".claude ディレクトリの作成に失敗: {}", claude_dir.display()))?;
@@ -20,44 +20,31 @@ pub fn ensure_hooks_configured(worktree_path: &Path, sock_path: &Path, project_n
         .entry("hooks")
         .or_insert_with(|| json!({}));
 
-    let sock = sock_path.to_string_lossy();
-
-    // stdin の JSON から session_id を抽出する共通スクリプト
-    // Claude Code はすべての hook に {"session_id": "...", ...} を stdin で渡す
-    // ソケットが存在しない場合はサイレントにスキップ（siki 未起動時のエラー抑止）
-    let read_sid = format!(
-        r#"SID=$(head -1 | sed -n 's/.*"session_id" *: *"\([^"]*\)".*/\1/p'); [ -z "$SID" ] && SID="siki-$$"; [ -S {sock} ] || exit 0"#
-    );
-
-    // SessionStart は siki バイナリのサブコマンド経由で実行する。
-    // - broker への register イベント送信
-    // - DB から pending_messages / 利用可能な背景情報を取得して additionalContext を返す
-    // これにより、最初のメッセージで `list_sessions` MCP を呼ばせる必要がなくなる。
+    // siki バイナリのフルパス。全 hook を `echo | nc -U` ではなく siki サブコマンド経由で
+    // 実行する。これにより以下の環境依存の不安定要因を排除する:
+    // - `nc`(netcat) 不在 / `-U` 非対応の変種だと全状態イベントが無言で消える問題
+    // - session_id を `sed` 正規表現で抜くため payload 整形差異で抽出失敗し、
+    //   フォールバックの `siki-$$` 幽霊セッションを更新してしまう問題
+    // siki 自身が stdin の JSON を serde で解釈し、broker へ送る（socket 不在時は
+    // サイレントスキップ）。
     let siki_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "siki".to_string());
+
+    // SessionStart: broker への register + DB から additionalContext を返す。
+    // これにより最初のメッセージで `list_sessions` MCP を呼ばせる必要がなくなる。
     inject_hook(hooks, "SessionStart", &format!(r#"{siki_path} session-start"#), false);
 
-    inject_hook(hooks, "PreToolUse", &format!(
-        r#"{read_sid}; echo '{{"event":"working","session_id":"'"$SID"'"}}' | nc -U {sock}"#
-    ), true);
+    inject_hook(hooks, "PreToolUse", &format!(r#"{siki_path} hook-event working"#), true);
 
-    inject_hook(hooks, "PermissionRequest", &format!(
-        r#"{read_sid}; echo '{{"event":"waiting","session_id":"'"$SID"'"}}' | nc -U {sock}"#
-    ), true);
+    inject_hook(hooks, "PermissionRequest", &format!(r#"{siki_path} hook-event waiting"#), true);
 
     // PostToolUse で Changes の再読み込みをトリガーする
-    inject_hook(hooks, "PostToolUse", &format!(
-        r#"{read_sid}; echo '{{"event":"refresh","session_id":"'"$SID"'"}}' | nc -U {sock}"#
-    ), true);
+    inject_hook(hooks, "PostToolUse", &format!(r#"{siki_path} hook-event refresh"#), true);
 
-    inject_hook(hooks, "Stop", &format!(
-        r#"{read_sid}; echo '{{"event":"idle","session_id":"'"$SID"'"}}' | nc -U {sock}"#
-    ), true);
+    inject_hook(hooks, "Stop", &format!(r#"{siki_path} hook-event idle"#), true);
 
-    inject_hook(hooks, "SessionEnd", &format!(
-        r#"{read_sid}; echo '{{"event":"dead","session_id":"'"$SID"'"}}' | nc -U {sock}"#
-    ), true);
+    inject_hook(hooks, "SessionEnd", &format!(r#"{siki_path} hook-event dead"#), true);
 
     // worktree ルートに .mcp.json を作成して siki MCP サーバーを登録
     inject_mcp_json(worktree_path);
@@ -299,6 +286,24 @@ fn load_or_default(path: &Path) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// コマンド文字列が siki の生成した hook かどうかを判定する。
+///
+/// 再注入時に古い siki hook だけを置き換えるための識別に使う。ユーザが独自に登録した
+/// 無関係な hook を巻き込んで削除しないよう、サブコマンドは部分一致ではなく空白区切りの
+/// 独立トークンとして照合する（例: `my-tool hook-event-logger` の `hook-event-logger` は
+/// 1 トークンなので `hook-event` には一致しない）。
+fn is_siki_managed_command(command: &str) -> bool {
+    // 旧形式: `... | nc -U <.siki ソケット>` で状態を送るシェルコマンド
+    if command.contains("nc -U") && command.contains(".siki") {
+        return true;
+    }
+    // 新形式: `<path>/siki session-start` または `<path>/siki hook-event <state>`
+    // サブコマンド名を独立トークンとして含むかで判定する。
+    command
+        .split_whitespace()
+        .any(|tok| tok == "session-start" || tok == "hook-event")
+}
+
 /// hook イベントに siki 用コマンドを注入する
 ///
 /// 既存の hook 配列がある場合、siki のコマンドが含まれていなければ追加する。
@@ -315,9 +320,7 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
         None => return,
     };
 
-    // 既存の siki hook を削除して最新版に置き換える
-    // - 旧形式: `nc -U .../.siki/sock` を含むコマンド
-    // - 新形式: `siki ... session-start` のように `session-start` サブコマンドを呼ぶコマンド
+    // 既存の siki hook を削除して最新版に置き換える（再実行時の重複・旧形式の残存を防ぐ）
     arr.retain(|entry| {
         !entry
             .get("hooks")
@@ -326,10 +329,7 @@ fn inject_hook(hooks: &mut Value, event: &str, command: &str, is_async: bool) {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| {
-                            (c.contains("nc -U") && c.contains(".siki"))
-                                || c.contains("session-start")
-                        })
+                        .is_some_and(is_siki_managed_command)
                 })
             })
             .unwrap_or(false)
@@ -435,6 +435,73 @@ mod tests {
     }
 
     #[test]
+    fn test_inject_hook_replaces_old_nc_with_hook_event_subcommand() {
+        // 旧 PreToolUse (nc -U + .siki) を新形式 (hook-event サブコマンド) に置き換える
+        let mut hooks = json!({
+            "PreToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": r#"SID=$(...); echo '{"event":"working",...}' | nc -U /home/user/.siki/sock"#
+                }]
+            }]
+        });
+        inject_hook(&mut hooks, "PreToolUse", "/usr/local/bin/siki hook-event working", true);
+
+        let arr = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "old nc hook should be replaced, not appended");
+        assert_eq!(
+            arr[0]["hooks"][0]["command"],
+            "/usr/local/bin/siki hook-event working"
+        );
+    }
+
+    #[test]
+    fn test_inject_hook_event_is_idempotent() {
+        // 再実行しても hook-event コマンドが重複しない（パス更新は反映される）
+        let mut hooks = json!({});
+        inject_hook(&mut hooks, "PreToolUse", "/old/siki hook-event working", true);
+        inject_hook(&mut hooks, "PreToolUse", "/new/siki hook-event working", true);
+
+        let arr = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "re-running must not duplicate hook-event hooks");
+        assert_eq!(arr[0]["hooks"][0]["command"], "/new/siki hook-event working");
+    }
+
+    #[test]
+    fn test_is_siki_managed_command() {
+        // 新形式 siki サブコマンド
+        assert!(is_siki_managed_command("/usr/local/bin/siki session-start"));
+        assert!(is_siki_managed_command("/usr/local/bin/siki hook-event working"));
+        assert!(is_siki_managed_command("siki hook-event dead"));
+        // 旧形式 nc
+        assert!(is_siki_managed_command(
+            r#"SID=$(...); echo '...' | nc -U /home/user/.siki/sock"#
+        ));
+        // ユーザの無関係 hook は誤検出しない（部分一致ではなくトークン照合のため）
+        assert!(!is_siki_managed_command("my-tool hook-event-logger --json"));
+        assert!(!is_siki_managed_command("./session-start.sh deploy"));
+        assert!(!is_siki_managed_command("echo my-session-started"));
+        assert!(!is_siki_managed_command("nc -U /tmp/other.sock")); // .siki を含まない
+    }
+
+    #[test]
+    fn test_inject_hook_preserves_user_hook_with_similar_name() {
+        // `hook-event-logger` のような siki 無関係コマンドは置換で消えてはならない
+        let mut hooks = json!({
+            "PreToolUse": [{
+                "hooks": [{"type": "command", "command": "my-tool hook-event-logger --json"}]
+            }]
+        });
+        inject_hook(&mut hooks, "PreToolUse", "/usr/local/bin/siki hook-event working", true);
+
+        let arr = hooks["PreToolUse"].as_array().unwrap();
+        // ユーザ hook(0) は残り、siki hook(1) が追加される
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["hooks"][0]["command"], "my-tool hook-event-logger --json");
+        assert_eq!(arr[1]["hooks"][0]["command"], "/usr/local/bin/siki hook-event working");
+    }
+
+    #[test]
     fn test_inject_hook_async_has_timeout() {
         let mut hooks = json!({});
         inject_hook(&mut hooks, "PreToolUse", "echo test", true);
@@ -455,9 +522,8 @@ mod tests {
     #[test]
     fn test_ensure_hooks_configured() {
         let dir = tempfile::TempDir::new().unwrap();
-        let sock_path = dir.path().join("test.sock");
 
-        ensure_hooks_configured(dir.path(), &sock_path, "test-project").unwrap();
+        ensure_hooks_configured(dir.path(), "test-project").unwrap();
 
         let settings_path = dir.path().join(".claude/settings.json");
         assert!(settings_path.exists());
@@ -614,8 +680,7 @@ mod tests {
         )
         .unwrap();
 
-        let sock_path = dir.path().join("test.sock");
-        ensure_hooks_configured(dir.path(), &sock_path, "test-project").unwrap();
+        ensure_hooks_configured(dir.path(), "test-project").unwrap();
 
         let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
         let settings: Value = serde_json::from_str(&content).unwrap();

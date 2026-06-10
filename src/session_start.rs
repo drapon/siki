@@ -1,9 +1,10 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use socket2::{Domain, SockAddr, Socket, Type};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -23,14 +24,21 @@ const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Claude Code の hook 入力 JSON は典型的に 1 KB 未満。256 KB は安全マージンとして
 /// 十分かつ、悪意ある巨大入力でも本プロセスの常駐メモリを 1 MB 以下に抑える。
-const STDIN_READ_MAX: usize = 256 * 1024;
+pub(crate) const STDIN_READ_MAX: usize = 256 * 1024;
 
 /// broker への connect + write を含む全体のタイムアウト。
 ///
 /// 通常 Unix socket への 1 行書き込みは数 ms。broker (siki TUI 内) が panic で
 /// accept ループから抜けた場合、`UnixStream::connect` 自体がブロックし得るため、
 /// stdin 読み取りと別枠で短めに打ち切る。
-const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// broker への 1 行書き込みのタイムアウト。
+///
+/// connect 成功後の write 上限。送るのは数十バイトの 1 行 JSON なので、broker が
+/// 読んでいれば即時に返る。broker が読まずソケットバッファが詰まった異常時に
+/// ここで無限ブロックしないための保険。
+const BROKER_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SQLite の busy_timeout (ms)。
 ///
@@ -58,7 +66,7 @@ pub fn run(sock_path: &Path, db_path: &Path) -> Result<()> {
     // Claude Code は SessionStart hook に {"session_id": "...", "cwd": "...", ...} を
     // stdin で渡す。EOF が来ない事故（Claude Code バグ・リダイレクト事故）でも
     // hook 全体を止めないよう、別スレッド + channel でタイムアウトを設ける。
-    let input = read_stdin_with_timeout(STDIN_READ_TIMEOUT, STDIN_READ_MAX);
+    let input = read_stdin_with_timeout(STDIN_READ_TIMEOUT, STDIN_READ_MAX, "siki session-start");
     let input_json: Value = serde_json::from_str(&input).unwrap_or_else(|_| json!({}));
 
     let session_id = input_json
@@ -130,7 +138,11 @@ pub fn run(sock_path: &Path, db_path: &Path) -> Result<()> {
 
 /// stdin を `timeout` 内に読み切る。タイムアウトした場合は空文字列を返す。
 /// 読み取り中の最大バイト数を `max_bytes` で制限する。
-fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize) -> String {
+///
+/// `context` はタイムアウト診断のプレフィックス（例: `"siki session-start"` /
+/// `"siki hook-event"`）。この関数は複数のサブコマンドから共有されるため、
+/// モジュール固定の `diag!`（`siki session-start:`）ではなく呼び出し側のラベルで出力する。
+pub(crate) fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize, context: &str) -> String {
     let (tx, rx) = mpsc::channel::<String>();
     // 読み取りスレッド: タイムアウト後もメインは exit するので、スレッドのリーク
     // は許容する（プロセスが死ねば回収される）
@@ -144,7 +156,12 @@ fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize) -> String {
     match rx.recv_timeout(timeout) {
         Ok(s) => s,
         Err(_) => {
-            diag!("stdin read timed out after {:?}", timeout);
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}: stdin read timed out after {:?}",
+                context,
+                timeout
+            );
             String::new()
         }
     }
@@ -164,28 +181,39 @@ fn register_with_broker(sock_path: &Path, session_id: &str, cwd: &str, role: &st
         "role": role,
     })
     .to_string();
-    let sock_path_owned: PathBuf = sock_path.to_path_buf();
+    send_line_to_broker(sock_path, payload, "siki session-start (register)");
+}
 
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
-    thread::spawn(move || {
-        let result = (|| -> std::io::Result<()> {
-            let mut stream = UnixStream::connect(&sock_path_owned)?;
-            stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-            stream.write_all(payload.as_bytes())?;
-            stream.write_all(b"\n")?;
-            Ok(())
-        })()
-        .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(BROKER_CONNECT_TIMEOUT) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            diag!("broker register failed: {}", e);
-        }
-        Err(_) => {
-            diag!("broker register timed out after {:?}", BROKER_CONNECT_TIMEOUT);
-        }
+/// broker へ 1 行 JSON を送信する。
+///
+/// `BROKER_CONNECT_TIMEOUT` 内に完了しなければ諦める（broker が固まっている場合の保険）。
+/// ソケットが存在しない（siki TUI 未起動）場合はサイレントにスキップする。
+/// `context` は失敗/タイムアウト時の診断プレフィックス（例: `"siki session-start (register)"`
+/// / `"siki hook-event (working)"`）。複数サブコマンドから共有されるため、モジュール固定の
+/// `diag!` ではなく呼び出し側のラベルで出力する。
+pub(crate) fn send_line_to_broker(sock_path: &Path, payload: String, context: &str) {
+    if !sock_path.exists() {
+        // siki TUI が起動していないのは正常パス。サイレントに無視。
+        return;
+    }
+    // connect 自体にタイムアウトを設ける。`std::os::unix::net::UnixStream::connect` は
+    // connect が listen バックログ待ちでブロックしてもタイムアウトできず、別スレッドに
+    // 逃がしてもそのスレッドが connect で残留してリークする。socket2 の
+    // `connect_timeout` ならその経路自体が消えるので、別スレッドを使わず同期で送れる。
+    let result = (|| -> std::io::Result<()> {
+        let addr = SockAddr::unix(sock_path)?;
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        socket.connect_timeout(&addr, BROKER_CONNECT_TIMEOUT)?;
+        socket.set_write_timeout(Some(BROKER_WRITE_TIMEOUT))?;
+        // connect_timeout は成功時ソケットを blocking に戻すので、write は
+        // set_write_timeout 付き blocking で動く（要 socket2 features=["all"]）。
+        let mut stream: UnixStream = socket.into();
+        stream.write_all(payload.as_bytes())?;
+        stream.write_all(b"\n")?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = writeln!(std::io::stderr(), "{}: broker send failed: {}", context, e);
     }
 }
 

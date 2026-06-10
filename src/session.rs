@@ -66,6 +66,14 @@ pub struct Session {
     pub alert_message: Option<String>,
 }
 
+/// `hook-event` サブコマンドが broker に送れる状態イベント名（単一の真実源）。
+///
+/// 下の `HookEvent` の状態系バリアント（serde の `rename_all = "lowercase"` 後の名前）と
+/// 一致させること。`register` はセッション登録専用で `session-start` サブコマンドが
+/// 担当するため含まない。`HookEvent` に状態を追加したらこの配列にも追記する
+/// （整合は `test_valid_hook_states_deserialize` で担保）。
+pub const VALID_HOOK_STATES: &[&str] = &["working", "waiting", "refresh", "idle", "dead"];
+
 /// Hook から送信されるイベント
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
@@ -586,6 +594,20 @@ mod tests {
         ];
         let ids: Vec<&str> = events.iter().map(|e| e.session_id()).collect();
         assert_eq!(ids, vec!["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn test_valid_hook_states_deserialize() {
+        // VALID_HOOK_STATES の各文字列が HookEvent にデシリアライズできること
+        // （送信側 hook_event.rs と broker 側 HookEvent の整合を担保する）。
+        for state in VALID_HOOK_STATES {
+            let json = format!(r#"{{"event":"{}","session_id":"x"}}"#, state);
+            let ev: HookEvent = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("state {:?} must deserialize into HookEvent: {}", state, e));
+            assert_eq!(ev.session_id(), "x");
+        }
+        // register は状態系ではないので含まれない（session-start 専用）
+        assert!(!VALID_HOOK_STATES.contains(&"register"));
     }
 
     #[test]
