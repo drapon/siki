@@ -3,16 +3,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::session::VALID_HOOK_STATES;
 use crate::session_start::{read_stdin_with_timeout, send_line_to_broker, STDIN_READ_MAX};
-
-/// Claude Code が hook 入力 JSON で渡してくる状態イベント。
-/// broker 側の `HookEvent`（serde tag = "event"）に対応する。
-///
-/// `register` は含まない。セッション登録は `siki session-start` サブコマンドが
-/// 専用経路で担当するため（broker の `HookEvent::Register` はそちらから送られる）。
-/// broker 側の `HookEvent` に状態を追加した場合は、この配列にも追記すること
-/// （未追記だと送信側でここで弾かれ、状態イベントが取りこぼされる）。
-const KNOWN_STATES: &[&str] = &["working", "waiting", "refresh", "idle", "dead"];
 
 /// 状態系 hook の stdin 読み取りタイムアウト。
 ///
@@ -43,7 +35,7 @@ const HOOK_EVENT_STDIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// siki バイナリ自身が stdin の JSON を serde で解釈し、broker に 1 行 JSON を送ることで
 /// 両方を解消する（`session-start` hook と同じ堅牢な経路を使う）。
 pub fn run(sock_path: &Path, state: &str) -> Result<()> {
-    if !KNOWN_STATES.contains(&state) {
+    if !VALID_HOOK_STATES.contains(&state) {
         // 未知の状態は broker 側でも捨てられるが、ここで弾いて送信自体を避ける。
         eprintln!(
             "siki hook-event: unknown state {:?}; for session registration use `siki session-start`",
@@ -52,7 +44,7 @@ pub fn run(sock_path: &Path, state: &str) -> Result<()> {
         return Ok(());
     }
 
-    let input = read_stdin_with_timeout(HOOK_EVENT_STDIN_TIMEOUT, STDIN_READ_MAX);
+    let input = read_stdin_with_timeout(HOOK_EVENT_STDIN_TIMEOUT, STDIN_READ_MAX, "siki hook-event");
     let input_json: Value = serde_json::from_str(&input).unwrap_or_else(|_| json!({}));
 
     let session_id = input_json
@@ -77,6 +69,6 @@ pub fn run(sock_path: &Path, state: &str) -> Result<()> {
         "session_id": session_id,
     })
     .to_string();
-    send_line_to_broker(sock_path, payload, state);
+    send_line_to_broker(sock_path, payload, &format!("siki hook-event ({state})"));
     Ok(())
 }

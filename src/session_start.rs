@@ -58,7 +58,7 @@ pub fn run(sock_path: &Path, db_path: &Path) -> Result<()> {
     // Claude Code は SessionStart hook に {"session_id": "...", "cwd": "...", ...} を
     // stdin で渡す。EOF が来ない事故（Claude Code バグ・リダイレクト事故）でも
     // hook 全体を止めないよう、別スレッド + channel でタイムアウトを設ける。
-    let input = read_stdin_with_timeout(STDIN_READ_TIMEOUT, STDIN_READ_MAX);
+    let input = read_stdin_with_timeout(STDIN_READ_TIMEOUT, STDIN_READ_MAX, "siki session-start");
     let input_json: Value = serde_json::from_str(&input).unwrap_or_else(|_| json!({}));
 
     let session_id = input_json
@@ -130,7 +130,11 @@ pub fn run(sock_path: &Path, db_path: &Path) -> Result<()> {
 
 /// stdin を `timeout` 内に読み切る。タイムアウトした場合は空文字列を返す。
 /// 読み取り中の最大バイト数を `max_bytes` で制限する。
-pub(crate) fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize) -> String {
+///
+/// `context` はタイムアウト診断のプレフィックス（例: `"siki session-start"` /
+/// `"siki hook-event"`）。この関数は複数のサブコマンドから共有されるため、
+/// モジュール固定の `diag!`（`siki session-start:`）ではなく呼び出し側のラベルで出力する。
+pub(crate) fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize, context: &str) -> String {
     let (tx, rx) = mpsc::channel::<String>();
     // 読み取りスレッド: タイムアウト後もメインは exit するので、スレッドのリーク
     // は許容する（プロセスが死ねば回収される）
@@ -144,7 +148,12 @@ pub(crate) fn read_stdin_with_timeout(timeout: Duration, max_bytes: usize) -> St
     match rx.recv_timeout(timeout) {
         Ok(s) => s,
         Err(_) => {
-            diag!("stdin read timed out after {:?}", timeout);
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}: stdin read timed out after {:?}",
+                context,
+                timeout
+            );
             String::new()
         }
     }
@@ -164,21 +173,23 @@ fn register_with_broker(sock_path: &Path, session_id: &str, cwd: &str, role: &st
         "role": role,
     })
     .to_string();
-    send_line_to_broker(sock_path, payload, "register");
+    send_line_to_broker(sock_path, payload, "siki session-start (register)");
 }
 
 /// broker へ 1 行 JSON を送信する。
 ///
 /// `BROKER_CONNECT_TIMEOUT` 内に完了しなければ諦める（broker が固まっている場合の保険）。
 /// ソケットが存在しない（siki TUI 未起動）場合はサイレントにスキップする。
-/// `kind` はタイムアウト/失敗時の診断メッセージ用ラベル。
-pub(crate) fn send_line_to_broker(sock_path: &Path, payload: String, kind: &str) {
+/// `context` は失敗/タイムアウト時の診断プレフィックス（例: `"siki session-start (register)"`
+/// / `"siki hook-event (working)"`）。複数サブコマンドから共有されるため、モジュール固定の
+/// `diag!` ではなく呼び出し側のラベルで出力する。
+pub(crate) fn send_line_to_broker(sock_path: &Path, payload: String, context: &str) {
     if !sock_path.exists() {
         // siki TUI が起動していないのは正常パス。サイレントに無視。
         return;
     }
     let sock_path_owned: PathBuf = sock_path.to_path_buf();
-    let kind = kind.to_string();
+    let context = context.to_string();
 
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
     thread::spawn(move || {
@@ -195,10 +206,15 @@ pub(crate) fn send_line_to_broker(sock_path: &Path, payload: String, kind: &str)
     match rx.recv_timeout(BROKER_CONNECT_TIMEOUT) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            diag!("broker {} failed: {}", kind, e);
+            let _ = writeln!(std::io::stderr(), "{}: broker send failed: {}", context, e);
         }
         Err(_) => {
-            diag!("broker {} timed out after {:?}", kind, BROKER_CONNECT_TIMEOUT);
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}: broker send timed out after {:?}",
+                context,
+                BROKER_CONNECT_TIMEOUT
+            );
         }
     }
 }
