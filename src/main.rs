@@ -1868,7 +1868,21 @@ fn handle_add_worktree_popup_key(
     shell: &str,
     key: crossterm::event::KeyEvent,
 ) {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // 表示名フォーカスの切替（NewBranch/FromBase のみ）。
+    // BackTab を送らず Shift+Tab を Tab+SHIFT として送る端末にも対応する。
+    let toggle_display_focus = matches!(key.code, KeyCode::BackTab)
+        || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT));
+
+    // Shift+Tab（端末により BackTab または Tab+SHIFT）:
+    // NewBranch/FromBase でブランチ入力と表示名入力のフォーカスを切り替え
+    if toggle_display_focus {
+        if app.add_worktree_mode != app::AddWorktreeMode::FromRemote {
+            app.add_worktree_display_focus = !app.add_worktree_display_focus;
+        }
+        return;
+    }
 
     match key.code {
         KeyCode::Esc => {
@@ -1879,9 +1893,14 @@ fn handle_add_worktree_popup_key(
             app.add_worktree_display_focus = false;
             app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
         }
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             app.add_worktree_mode = app.add_worktree_mode.next();
             app.add_worktree_display_focus = false;
+            // FromRemote は表示名入力を持たないため、他モードで入力した表示名を破棄する
+            // （持ち越した値が Enter 時に無言で無視されるのを防ぐ）
+            if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
+                app.add_worktree_display_input.clear();
+            }
             // FromBase に切り替えたとき、ブランチ一覧が未取得なら非同期取得
             if app.add_worktree_mode == app::AddWorktreeMode::FromBase
                 && app.add_worktree_all_branches.is_empty()
@@ -1934,11 +1953,6 @@ fn handle_add_worktree_popup_key(
                     if branch.is_empty() {
                         return;
                     }
-                    // 1回目の Enter: 表示名（任意）の入力へ進む
-                    if !app.add_worktree_display_focus {
-                        app.add_worktree_display_focus = true;
-                        return;
-                    }
                     let display_name = trimmed_or_none(&app.add_worktree_display_input);
                     finalize_add_worktree(
                         app, terminals, event_tx, shell,
@@ -1951,11 +1965,6 @@ fn handle_add_worktree_popup_key(
                 app::AddWorktreeMode::FromBase => {
                     let branch = app.add_worktree_input.trim().to_string();
                     if branch.is_empty() {
-                        return;
-                    }
-                    // 1回目の Enter: 表示名（任意）の入力へ進む
-                    if !app.add_worktree_display_focus {
-                        app.add_worktree_display_focus = true;
                         return;
                     }
                     let display_name = trimmed_or_none(&app.add_worktree_display_input);
@@ -2009,7 +2018,10 @@ fn handle_add_worktree_popup_key(
             if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
                 app.add_worktree_branch_cursor =
                     app.add_worktree_branch_cursor.saturating_sub(1);
-            } else if app.add_worktree_mode == app::AddWorktreeMode::FromBase {
+            } else if app.add_worktree_mode == app::AddWorktreeMode::FromBase
+                && !app.add_worktree_display_focus
+            {
+                // 表示名フォーカス中は ↑↓ でベース選択が動かないようにする
                 app.add_worktree_base_cursor =
                     app.add_worktree_base_cursor.saturating_sub(1);
             }
@@ -2028,7 +2040,10 @@ fn handle_add_worktree_popup_key(
                     app.add_worktree_branch_cursor =
                         (app.add_worktree_branch_cursor + 1).min(filtered_count - 1);
                 }
-            } else if app.add_worktree_mode == app::AddWorktreeMode::FromBase {
+            } else if app.add_worktree_mode == app::AddWorktreeMode::FromBase
+                && !app.add_worktree_display_focus
+            {
+                // 表示名フォーカス中は ↑↓ でベース選択が動かないようにする
                 let count = app.add_worktree_all_branches.len();
                 if count > 0 {
                     app.add_worktree_base_cursor =
@@ -6768,32 +6783,7 @@ mod tests {
         app.add_worktree_input = "feature/auth".to_string();
         let initial_count = app.projects[0].worktrees.len();
 
-        // 1回目の Enter: 表示名入力へフォーカス移動（まだ作成されない）
-        handle_event(
-            &mut app,
-            &mut left_panel,
-            &mut source_tree,
-            &mut diff_view,
-            &mut local_changes,
-            &mut history_view,
-            &mut sessions,
-            &mut terminals,
-            &mut claude_terms,
-            &mut siki_init_terminal,
-            &tx,
-            "/bin/sh",
-            event::AppEvent::Key(key(KeyCode::Enter)),
-            None,
-            &None,
-            &test_broker_db(),
-        )
-        .await;
-
-        assert!(app.show_add_worktree_popup);
-        assert!(app.add_worktree_display_focus);
-        assert_eq!(app.projects[0].worktrees.len(), initial_count);
-
-        // 2回目の Enter: 表示名は空のまま作成
+        // Enter 一発で作成（表示名は空のまま）
         handle_event(
             &mut app,
             &mut left_panel,
@@ -6845,7 +6835,7 @@ mod tests {
         app.show_add_worktree_popup = true;
         app.add_worktree_input = "feature/x".to_string();
 
-        // Enter で表示名フィールドにフォーカスが移る
+        // Shift+Tab で表示名フィールドにフォーカスが移る
         handle_event(
             &mut app,
             &mut left_panel,
@@ -6859,7 +6849,7 @@ mod tests {
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
-            event::AppEvent::Key(key(KeyCode::Enter)),
+            event::AppEvent::Key(key(KeyCode::BackTab)),
             None,
             &None,
             &test_broker_db(),
@@ -6913,7 +6903,32 @@ mod tests {
         assert_eq!(app.add_worktree_display_input, "");
         assert_eq!(app.add_worktree_input, "feature/x");
 
-        // Esc で表示名関連の状態もリセットされる
+        // もう一度 Shift+Tab でブランチ入力にフォーカスが戻る
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::BackTab)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert!(!app.add_worktree_display_focus);
+
+        // Esc で表示名関連の状態もリセットされる。
+        // 直前の往復で focus は false に戻っているため、ここで明示的に true に戻し、
+        // 「表示名フォーカス中に Esc を押しても focus が確実に解除される」ことを検証する。
+        app.add_worktree_display_focus = true;
         handle_event(
             &mut app,
             &mut left_panel,
@@ -6936,6 +6951,388 @@ mod tests {
         assert!(!app.show_add_worktree_popup);
         assert!(!app.add_worktree_display_focus);
         assert_eq!(app.add_worktree_display_input, "");
+    }
+
+    /// FromBase で表示名を入力後 Tab で FromRemote に移ると、
+    /// 表示名を持たない FromRemote 側で無言破棄されないよう display_input がクリアされる
+    #[tokio::test]
+    async fn test_add_worktree_popup_display_input_cleared_on_from_remote() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        // FromBase で表示名を入力済みの状態を作る
+        app.add_worktree_mode = app::AddWorktreeMode::FromBase;
+        app.add_worktree_display_input = "my-display".to_string();
+
+        // Tab で FromRemote へ切り替え
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Tab)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        assert_eq!(app.add_worktree_mode, app::AddWorktreeMode::FromRemote);
+        // FromRemote は表示名を扱わないため持ち越した値は破棄される
+        assert_eq!(app.add_worktree_display_input, "");
+    }
+
+    /// NewBranch ⇄ FromBase 間の Tab 切替では表示名が保持される（両モードとも表示名対応）
+    #[tokio::test]
+    async fn test_add_worktree_popup_display_input_kept_new_to_base() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
+        app.add_worktree_display_input = "keep-me".to_string();
+
+        // Tab で NewBranch → FromBase（どちらも表示名対応なので保持）
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Tab)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        assert_eq!(app.add_worktree_mode, app::AddWorktreeMode::FromBase);
+        assert_eq!(app.add_worktree_display_input, "keep-me");
+    }
+
+    /// Shift+Tab を BackTab ではなく Tab+SHIFT として送る端末でも表示名フォーカスが切り替わる
+    #[tokio::test]
+    async fn test_add_worktree_popup_shift_tab_toggles_focus() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
+        assert!(!app.add_worktree_display_focus);
+
+        // Tab+SHIFT で表示名フォーカスへ
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(shift_key(KeyCode::Tab)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert!(app.add_worktree_display_focus);
+        // モードは変わらない（素の Tab とは別扱い）
+        assert_eq!(app.add_worktree_mode, app::AddWorktreeMode::NewBranch);
+    }
+
+    /// FromBase で表示名フォーカス中は ↑↓ でベース選択が動かない
+    #[tokio::test]
+    async fn test_add_worktree_popup_arrows_ignored_when_display_focus() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_mode = app::AddWorktreeMode::FromBase;
+        app.add_worktree_all_branches =
+            vec!["main".to_string(), "develop".to_string(), "release".to_string()];
+        app.add_worktree_base_cursor = 0;
+        app.add_worktree_display_focus = true;
+
+        // 表示名フォーカス中の Down はベース選択を動かさない
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Down)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert_eq!(app.add_worktree_base_cursor, 0);
+
+        // フォーカスを外すと Down が効く
+        app.add_worktree_display_focus = false;
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Down)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert_eq!(app.add_worktree_base_cursor, 1);
+    }
+
+    /// FromRemote では Shift+Tab（BackTab / Tab+SHIFT）が no-op で display_focus は変わらない
+    #[tokio::test]
+    async fn test_add_worktree_popup_shift_tab_noop_in_from_remote() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_mode = app::AddWorktreeMode::FromRemote;
+        assert!(!app.add_worktree_display_focus);
+
+        for code in [KeyCode::BackTab, KeyCode::Tab] {
+            let ev = if code == KeyCode::BackTab {
+                key(KeyCode::BackTab)
+            } else {
+                shift_key(KeyCode::Tab)
+            };
+            handle_event(
+                &mut app,
+                &mut left_panel,
+                &mut source_tree,
+                &mut diff_view,
+                &mut local_changes,
+                &mut history_view,
+                &mut sessions,
+                &mut terminals,
+                &mut claude_terms,
+                &mut siki_init_terminal,
+                &tx,
+                "/bin/sh",
+                event::AppEvent::Key(ev),
+                None,
+                &None,
+                &test_broker_db(),
+            )
+            .await;
+            // FromRemote では表示名フォーカスへ入らない
+            assert!(!app.add_worktree_display_focus);
+            assert_eq!(app.add_worktree_mode, app::AddWorktreeMode::FromRemote);
+        }
+    }
+
+    /// Tab でモード切替すると display_focus が false にリセットされる
+    #[tokio::test]
+    async fn test_add_worktree_popup_tab_resets_display_focus() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
+        app.add_worktree_display_focus = true;
+
+        // 素の Tab はモード切替＋display_focus リセット
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Tab)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+        assert_eq!(app.add_worktree_mode, app::AddWorktreeMode::FromBase);
+        assert!(!app.add_worktree_display_focus);
+    }
+
+    /// 表示名フォーカス中でも Enter で即作成される（Enter は focus 状態に依存しない）
+    #[tokio::test]
+    async fn test_add_worktree_popup_enter_adds_even_when_display_focus() {
+        // git worktree add を実行するため、実際の git リポジトリが必要
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+
+        std::process::Command::new("git").args(["init"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.name", "Test"]).current_dir(project_path).output().unwrap();
+        std::fs::write(project_path.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git").args(["add", "."]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["commit", "-m", "initial"]).current_dir(project_path).output().unwrap();
+
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![ProjectConfig {
+                name: "test-project".to_string(),
+                path: project_path.to_string_lossy().to_string(),
+                display_name: None,
+                worktrees: vec![WorktreeConfig {
+                    name: "feature".to_string(),
+                    branch: "feature/test".to_string(),
+                }],
+            }],
+        };
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.show_add_worktree_popup = true;
+        app.add_worktree_project_index = 0;
+        app.add_worktree_name = "berlin".to_string();
+        app.add_worktree_input = "feature/focus".to_string();
+        app.add_worktree_display_input = "ベルリン".to_string();
+        app.add_worktree_display_focus = true; // 表示名フォーカス中
+        let initial_count = app.projects[0].worktrees.len();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::Key(key(KeyCode::Enter)),
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        assert!(!app.show_add_worktree_popup);
+        assert_eq!(app.projects[0].worktrees.len(), initial_count + 1);
+        let new_wt = app.projects[0].worktrees.last().unwrap();
+        assert_eq!(new_wt.name, "berlin");
+        assert_eq!(new_wt.display_name, Some("ベルリン".to_string()));
+
+        // クリーンアップ
+        let wt_path = config::worktree_path("test-project", "berlin");
+        let _ = git::WorktreeManager::remove_worktree(project_path, &wt_path);
     }
 
     #[tokio::test]
