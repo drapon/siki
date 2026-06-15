@@ -2616,13 +2616,16 @@ fn spawn_terminal(
     wt_id: app::WorktreeId,
     tab_index: usize,
 ) {
-    let path = app.worktree_by_id(wt_id).unwrap().path.clone();
+    let wt = app.worktree_by_id(wt_id).unwrap();
+    let path = wt.path.clone();
+    let label = wt.display_name.clone().unwrap_or_else(|| wt.name.clone());
 
     // デフォルトサイズ（描画時にリサイズされる）
     let size = (80, 24);
 
     match terminal::TerminalEmulator::new(shell, &path, size, event_tx.clone(), wt_id, tab_index) {
-        Ok(emu) => {
+        Ok(mut emu) => {
+            emu.set_notify_label(label);
             terminals.insert((wt_id, tab_index), emu);
             if let Some(wt) = app.worktree_by_id_mut(wt_id) {
                 wt.active_terminal = tab_index;
@@ -4735,10 +4738,15 @@ fn launch_llm_with_args(
             app.show_error(format!("hook 注入に失敗: {}", e));
         }
     }
-    let claude_idx = app
+    let (claude_idx, label) = app
         .worktree_by_id(wt_id)
-        .map(|wt| wt.claude_tabs)
-        .unwrap_or(0);
+        .map(|wt| {
+            (
+                wt.claude_tabs,
+                wt.display_name.clone().unwrap_or_else(|| wt.name.clone()),
+            )
+        })
+        .unwrap_or((0, project_name.clone()));
     let size = (80, 24);
 
     let result = terminal::TerminalEmulator::with_args(
@@ -4752,7 +4760,8 @@ fn launch_llm_with_args(
     );
 
     match result {
-        Ok(emu) => {
+        Ok(mut emu) => {
+            emu.set_notify_label(label);
             claude_terms.insert((wt_id, claude_idx), emu);
             if let Some(wt) = app.worktree_by_id_mut(wt_id) {
                 wt.active_tab = wt.claude_tabs;

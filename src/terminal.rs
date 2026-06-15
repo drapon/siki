@@ -44,6 +44,9 @@ pub struct TerminalEmulator {
     writer: Box<dyn Write + Send>,
     parser: vt100::Parser<BellCounter>,
     alive: bool,
+    /// ベル検出時に外側ターミナルへ送る通知本文（発火元 worktree 名等）。
+    /// 未設定ならデフォルト文言を使う。
+    notify_label: Option<String>,
     /// 子プロセスハンドル。Drop 時に kill + wait してリーダースレッドの停止と
     /// ゾンビプロセス化の防止を行う。
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
@@ -209,6 +212,7 @@ impl TerminalEmulator {
             writer,
             parser,
             alive: true,
+            notify_label: None,
             child: Some(child),
         })
     }
@@ -216,6 +220,11 @@ impl TerminalEmulator {
     /// このターミナルエミュレータのユニーク ID を返す
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// ベル検出時に外側ターミナルへ送る通知本文を設定する
+    pub fn set_notify_label(&mut self, label: impl Into<String>) {
+        self.notify_label = Some(label.into());
     }
 
     /// PTY にデータを書き込む（大きなデータはチャンク分割）
@@ -270,7 +279,7 @@ impl TerminalEmulator {
         self.parser.process(data);
         let bells = self.parser.callbacks_mut().take();
         if bells > 0 {
-            forward_bell(bells);
+            forward_notification(bells, self.notify_label.as_deref());
         }
     }
 
@@ -295,13 +304,37 @@ impl TerminalEmulator {
     }
 }
 
-/// ベル (BEL) を siki 自身の stdout に書き戻し、外側ターミナルの通知を発火させる
+/// ベル検出時に外側ターミナルへ送るバイト列を組み立てる。
 ///
-/// BEL は表示にも端末状態にも影響しないため、ratatui の描画と交錯しても
+/// cmux は素の BEL ではデスクトップ通知を出さず OSC 777 を要求するため、
+/// OSC 777 通知シーケンスを先頭に置き、iTerm / tmux 等の後方互換のため
+/// 末尾に BEL を併用する。未知の OSC は対応しない端末では無視されるため安全。
+fn notification_bytes(count: usize, label: Option<&str>) -> Vec<u8> {
+    let title = "siki";
+    // body は OSC のフィールド区切り `;` と制御文字を除去してから使う
+    let body = label
+        .map(sanitize_osc_field)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "セッションが通知を発しました".to_string());
+    let mut out = format!("\x1b]777;notify;{title};{body}\x07").into_bytes();
+    out.extend(std::iter::repeat_n(0x07, count)); // iTerm/tmux 互換の BEL
+    out
+}
+
+/// OSC フィールドに混ぜても安全なように `;` と制御文字（ESC/BEL 等）を除去する。
+fn sanitize_osc_field(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && *c != ';')
+        .collect()
+}
+
+/// ベル通知を siki 自身の stdout に書き出し、外側ターミナルの通知を発火させる
+///
+/// OSC / BEL は表示にも端末状態にも影響しないため、ratatui の描画と交錯しても
 /// 画面は壊れない。stdout の内部ロックにより描画の write とは直列化される。
 /// stdout が端末でない場合（パイプ・リダイレクト時）は出力を汚染しないため
 /// 転送しない。
-fn forward_bell(count: usize) {
+fn forward_notification(count: usize, label: Option<&str>) {
     use std::io::IsTerminal;
 
     let stdout = std::io::stdout();
@@ -309,7 +342,7 @@ fn forward_bell(count: usize) {
         return;
     }
     let mut handle = stdout.lock();
-    let _ = handle.write_all(&vec![0x07; count]);
+    let _ = handle.write_all(&notification_bytes(count, label));
     let _ = handle.flush();
 }
 
@@ -588,6 +621,57 @@ mod tests {
         assert_eq!(parser.callbacks_mut().take(), 0);
         parser.process(b"\x07");
         assert_eq!(parser.callbacks_mut().take(), 1);
+    }
+
+    // --- 通知バイト列テスト ---
+
+    #[test]
+    fn test_notification_bytes_includes_osc777_and_bel() {
+        let bytes = notification_bytes(1, Some("foo"));
+        let s = String::from_utf8_lossy(&bytes);
+        // cmux 向けの OSC 777 通知（タイトル siki、本文 foo、BEL 終端）
+        assert!(s.starts_with("\x1b]777;notify;siki;foo\x07"));
+        // 末尾に iTerm/tmux 互換の BEL が count 個付く
+        assert!(s.ends_with('\x07'));
+        // OSC 終端の BEL(1) + 末尾 BEL(1) = 計 2
+        assert_eq!(bytes.iter().filter(|&&b| b == 0x07).count(), 2);
+    }
+
+    #[test]
+    fn test_notification_bytes_default_body_when_none() {
+        let bytes = notification_bytes(1, None);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\x1b]777;notify;siki;セッションが通知を発しました\x07"));
+    }
+
+    #[test]
+    fn test_notification_bytes_default_body_when_empty_after_sanitize() {
+        // サニタイズで空になるラベルはデフォルト文言にフォールバック
+        let bytes = notification_bytes(1, Some(";;;"));
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("siki;セッションが通知を発しました\x07"));
+    }
+
+    #[test]
+    fn test_notification_bytes_appends_count_bels() {
+        let bytes = notification_bytes(3, Some("bar"));
+        // OSC 終端の BEL(1) + 末尾 BEL(3) = 計 4
+        assert_eq!(bytes.iter().filter(|&&b| b == 0x07).count(), 4);
+    }
+
+    #[test]
+    fn test_sanitize_osc_field_strips_separators_and_control() {
+        // `;`・ESC・BEL・改行などの制御文字を除去して OSC を壊さない
+        assert_eq!(sanitize_osc_field("a;b\x1bc\x07d\ne"), "abcde");
+    }
+
+    #[test]
+    fn test_notification_bytes_label_with_control_chars_is_safe() {
+        let bytes = notification_bytes(0, Some("my;\x1bwt\x07"));
+        let s = String::from_utf8_lossy(&bytes);
+        // OSC は title;body の 1 通知として閉じる（区切り `;` は 3 個のみ）
+        assert_eq!(s, "\x1b]777;notify;siki;mywt\x07");
+        assert_eq!(s.matches(';').count(), 3);
     }
 
     // --- PTY 統合テスト ---
