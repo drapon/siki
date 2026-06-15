@@ -13,6 +13,7 @@ mod selection;
 mod session;
 mod session_start;
 mod terminal;
+mod text;
 mod tui;
 mod ui;
 
@@ -1544,8 +1545,8 @@ async fn handle_event(
             }
             // ワークツリー追加ポップアップ
             if app.show_add_worktree_popup {
-                // 単一行入力のため改行などの制御文字を除去
-                let sanitized: String = text.chars().filter(|c| !c.is_control()).collect();
+                // 単一行入力のため制御文字・行/段落区切りを除去
+                let sanitized: String = crate::text::sanitize_text(&text);
                 if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
                     app.add_worktree_branch_filter.push_str(&sanitized);
                     app.add_worktree_branch_cursor = 0;
@@ -1851,7 +1852,10 @@ fn handle_rename_project_popup_key(app: &mut app::App, key: crossterm::event::Ke
             app.rename_project_name = None;
             app.rename_worktree_target = None;
         }
-        KeyCode::Char(c) if !c.is_control() && app.rename_project_input.chars().count() < 100 => {
+        KeyCode::Char(c)
+            if !crate::text::is_unsafe_text_char(c)
+                && app.rename_project_input.chars().count() < 100 =>
+        {
             app.rename_project_input.push(c);
         }
         KeyCode::Backspace => {
@@ -2051,13 +2055,15 @@ fn handle_add_worktree_popup_key(
                 }
             }
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if !crate::text::is_unsafe_text_char(c) => {
             if app.add_worktree_mode == app::AddWorktreeMode::FromRemote {
                 app.add_worktree_branch_filter.push(c);
                 app.add_worktree_branch_cursor = 0;
             } else if app.add_worktree_display_focus {
-                // NewBranch / FromBase: 表示名入力
-                app.add_worktree_display_input.push(c);
+                // NewBranch / FromBase: 表示名入力（rename ポップアップと同じく 100 文字上限）
+                if app.add_worktree_display_input.chars().count() < 100 {
+                    app.add_worktree_display_input.push(c);
+                }
             } else {
                 // NewBranch / FromBase: ブランチ名入力
                 app.add_worktree_input.push(c);
@@ -4729,7 +4735,15 @@ fn launch_llm_with_args(
     llm_command: &str,
     args: &[&str],
 ) {
-    let project_path = app.worktree_by_id(wt_id).unwrap().path.clone();
+    // worktree 由来の値は 1 回の取得でまとめて確定させる（2 回取得すると
+    // 間に状態が変わった場合に claude_idx とラベルが不整合になりうるため）。
+    let Some(wt) = app.worktree_by_id(wt_id) else {
+        app.show_error(format!("{} 起動失敗: worktree が見つかりません", llm_command));
+        return;
+    };
+    let project_path = wt.path.clone();
+    let claude_idx = wt.claude_tabs;
+    let label = wt.display_name.clone().unwrap_or_else(|| wt.name.clone());
     let project_name = app.projects[wt_id.0].name.clone();
 
     // Hook 注入は Claude の場合のみ
@@ -4738,15 +4752,6 @@ fn launch_llm_with_args(
             app.show_error(format!("hook 注入に失敗: {}", e));
         }
     }
-    let (claude_idx, label) = app
-        .worktree_by_id(wt_id)
-        .map(|wt| {
-            (
-                wt.claude_tabs,
-                wt.display_name.clone().unwrap_or_else(|| wt.name.clone()),
-            )
-        })
-        .unwrap_or((0, project_name.clone()));
     let size = (80, 24);
 
     let result = terminal::TerminalEmulator::with_args(

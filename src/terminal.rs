@@ -307,8 +307,11 @@ impl TerminalEmulator {
 /// ベル検出時に外側ターミナルへ送るバイト列を組み立てる。
 ///
 /// cmux は素の BEL ではデスクトップ通知を出さず OSC 777 を要求するため、
-/// OSC 777 通知シーケンスを先頭に置き、iTerm / tmux 等の後方互換のため
-/// 末尾に BEL を併用する。未知の OSC は対応しない端末では無視されるため安全。
+/// OSC 777 通知シーケンスを先頭に置く。OSC の終端には ST (ESC `\`) を用いる。
+/// BEL 終端にすると終端 BEL が後続の互換用 BEL と区別できず、外側端末
+/// (iTerm / tmux 等) で audible bell が 1 回余計に鳴るため。終端後に
+/// 後方互換用の BEL を `count` 個だけ付与する。未知の OSC は対応しない端末では
+/// 無視されるため安全。
 fn notification_bytes(count: usize, label: Option<&str>) -> Vec<u8> {
     let title = "siki";
     // body は OSC のフィールド区切り `;` と制御文字を除去してから使う
@@ -316,15 +319,23 @@ fn notification_bytes(count: usize, label: Option<&str>) -> Vec<u8> {
         .map(sanitize_osc_field)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "セッションが通知を発しました".to_string());
-    let mut out = format!("\x1b]777;notify;{title};{body}\x07").into_bytes();
-    out.extend(std::iter::repeat_n(0x07, count)); // iTerm/tmux 互換の BEL
+    // OSC 777 通知本体（ST 終端）。body は ESC を除去済みのため、途中で ST を
+    // 偽装して打ち切られることはない。
+    let mut out = format!("\x1b]777;notify;{title};{body}\x1b\\").into_bytes();
+    // iTerm/tmux 等は OSC 777 を解釈しないため、互換用に BEL を count 個送る。
+    out.extend(std::iter::repeat_n(0x07, count));
     out
 }
 
-/// OSC フィールドに混ぜても安全なように `;` と制御文字（ESC/BEL 等）を除去する。
+/// OSC フィールドに混ぜても安全なように、制御文字・行/段落区切り（[`crate::text`]
+/// で共通化）に加え、OSC のフィールド区切り `;` も除去する。
+///
+/// ESC (0x1B) は制御文字として除去されるため、サニタイズ後の文字列で ST
+/// (ESC `\`) を組み立てて OSC を途中終端することはできない（バックスラッシュ単体
+/// が残っても ESC を伴わないため無害）。
 fn sanitize_osc_field(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() && *c != ';')
+        .filter(|c| !crate::text::is_unsafe_text_char(*c) && *c != ';')
         .collect()
 }
 
@@ -626,22 +637,21 @@ mod tests {
     // --- 通知バイト列テスト ---
 
     #[test]
-    fn test_notification_bytes_includes_osc777_and_bel() {
+    fn test_notification_bytes_includes_osc777_st_and_bel() {
         let bytes = notification_bytes(1, Some("foo"));
         let s = String::from_utf8_lossy(&bytes);
-        // cmux 向けの OSC 777 通知（タイトル siki、本文 foo、BEL 終端）
-        assert!(s.starts_with("\x1b]777;notify;siki;foo\x07"));
-        // 末尾に iTerm/tmux 互換の BEL が count 個付く
+        // cmux 向けの OSC 777 通知（タイトル siki、本文 foo、ST 終端 ESC \）
+        assert!(s.starts_with("\x1b]777;notify;siki;foo\x1b\\"));
+        // ST 終端後に iTerm/tmux 互換の BEL が count 個だけ付く（OSC 終端 BEL は無い）
         assert!(s.ends_with('\x07'));
-        // OSC 終端の BEL(1) + 末尾 BEL(1) = 計 2
-        assert_eq!(bytes.iter().filter(|&&b| b == 0x07).count(), 2);
+        assert_eq!(bytes.iter().filter(|&&b| b == 0x07).count(), 1);
     }
 
     #[test]
     fn test_notification_bytes_default_body_when_none() {
         let bytes = notification_bytes(1, None);
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("\x1b]777;notify;siki;セッションが通知を発しました\x07"));
+        assert!(s.contains("\x1b]777;notify;siki;セッションが通知を発しました\x1b\\"));
     }
 
     #[test]
@@ -649,29 +659,53 @@ mod tests {
         // サニタイズで空になるラベルはデフォルト文言にフォールバック
         let bytes = notification_bytes(1, Some(";;;"));
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("siki;セッションが通知を発しました\x07"));
+        assert!(s.contains("siki;セッションが通知を発しました\x1b\\"));
     }
 
     #[test]
-    fn test_notification_bytes_appends_count_bels() {
-        let bytes = notification_bytes(3, Some("bar"));
-        // OSC 終端の BEL(1) + 末尾 BEL(3) = 計 4
-        assert_eq!(bytes.iter().filter(|&&b| b == 0x07).count(), 4);
+    fn test_notification_bytes_appends_exactly_count_bels() {
+        // BEL は互換用の count 個のみ（OSC は ST 終端のため終端 BEL は無い）
+        assert_eq!(
+            notification_bytes(3, Some("bar"))
+                .iter()
+                .filter(|&&b| b == 0x07)
+                .count(),
+            3
+        );
+        // count=0 のときは BEL を一切付けない
+        assert_eq!(
+            notification_bytes(0, Some("bar"))
+                .iter()
+                .filter(|&&b| b == 0x07)
+                .count(),
+            0
+        );
     }
 
     #[test]
     fn test_sanitize_osc_field_strips_separators_and_control() {
-        // `;`・ESC・BEL・改行などの制御文字を除去して OSC を壊さない
-        assert_eq!(sanitize_osc_field("a;b\x1bc\x07d\ne"), "abcde");
+        // `;`・ESC・BEL・LF・CR・U+2028(行区切り) を除去して OSC を壊さない
+        assert_eq!(sanitize_osc_field("a;b\x1bc\x07d\ne\rf\u{2028}g"), "abcdefg");
+    }
+
+    #[test]
+    fn test_notification_bytes_strips_line_separator_in_label() {
+        // U+2028 を含むラベルでも OSC body に混入しない
+        let bytes = notification_bytes(0, Some("wt\u{2028}name"));
+        let s = String::from_utf8_lossy(&bytes);
+        assert_eq!(s, "\x1b]777;notify;siki;wtname\x1b\\");
     }
 
     #[test]
     fn test_notification_bytes_label_with_control_chars_is_safe() {
         let bytes = notification_bytes(0, Some("my;\x1bwt\x07"));
         let s = String::from_utf8_lossy(&bytes);
-        // OSC は title;body の 1 通知として閉じる（区切り `;` は 3 個のみ）
-        assert_eq!(s, "\x1b]777;notify;siki;mywt\x07");
+        // OSC は title;body の 1 通知として ST 終端で閉じる（区切り `;` は 3 個のみ）
+        assert_eq!(s, "\x1b]777;notify;siki;mywt\x1b\\");
         assert_eq!(s.matches(';').count(), 3);
+        // 構造上の ESC は OSC 開始(1) と ST 終端(1) の計 2 個のみ。body から ESC が
+        // 除去されるため、body 由来の ST 偽装による途中終端は成立しない。
+        assert_eq!(bytes.iter().filter(|&&b| b == 0x1b).count(), 2);
     }
 
     // --- PTY 統合テスト ---

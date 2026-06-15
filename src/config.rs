@@ -270,7 +270,10 @@ pub fn save_project_display_name(project_name: &str, display_name: Option<&str>)
     let meta_path = project_meta_path(project_name);
     let mut meta = load_project_meta(project_name)
         .ok_or_else(|| anyhow::anyhow!("project.json が見つかりません: {}", project_name))?;
-    meta.display_name = display_name.map(|s| s.to_string());
+    // 表示名は通知の OSC シーケンスにも流れ込むため、保存前にサニタイズする。
+    meta.display_name = display_name
+        .map(crate::text::sanitize_text)
+        .filter(|s| !s.is_empty());
     let content =
         serde_json::to_string_pretty(&meta).context("project.json のシリアライズに失敗")?;
     std::fs::write(&meta_path, content)
@@ -357,11 +360,16 @@ pub fn save_worktree_display_name(
     let meta_path = project_meta_path(project_name);
     let mut meta = load_project_meta(project_name)
         .ok_or_else(|| anyhow::anyhow!("project.json が見つかりません: {}", project_name))?;
-    if let Some(name) = display_name {
+    // 表示名は通知の OSC シーケンスにも流れ込むため、保存前に制御文字・
+    // 行/段落区切りを除去する。除去後に空なら未設定扱い（削除）にする。
+    let clean = display_name
+        .map(crate::text::sanitize_text)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = clean {
         meta.worktrees.insert(
             worktree_name.to_string(),
             WorktreeMeta {
-                display_name: Some(name.to_string()),
+                display_name: Some(name),
             },
         );
     } else {
