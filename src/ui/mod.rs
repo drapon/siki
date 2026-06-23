@@ -201,6 +201,16 @@ pub fn render(
         render_symlink_settings_popup(frame, app);
     }
 
+    // エージェント監視ビュー（プロジェクト別 / 全体）。ライブ Registry を参照する。
+    if let Some(registry) = session_registry {
+        if app.show_agent_popup {
+            render_agent_popup(frame, app, registry);
+        }
+        if app.show_agent_dashboard {
+            render_agent_dashboard(frame, app, registry);
+        }
+    }
+
     areas
 }
 
@@ -293,6 +303,8 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  a          : worktree 追加",
         "  A          : プロジェクト追加",
         "  R          : プロジェクト表示名変更",
+        "  m          : このプロジェクトのエージェント一覧",
+        "  M          : 全エージェント ダッシュボード",
         "  S          : siki.json 作成",
         "  r          : run スクリプト実行",
         "  K          : スキル管理",
@@ -335,6 +347,10 @@ fn render_help_popup(frame: &mut Frame, app: &App) {
         "  Ctrl+]     : 次のタブへ循環",
         "  Ctrl+g     : grep 検索",
         "  Ctrl+\\     : ターミナルから離脱",
+        "",
+        "[エージェント監視ビュー (m/M)]",
+        "  j/k/↑/↓    : スクロール",
+        "  Esc        : 閉じる",
         "",
         "j/k でスクロール  Esc で閉じる",
     ];
@@ -1397,8 +1413,7 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
 /// alert または Waiting の行は赤系で強調（REQ-104）、長文は `…` で省略（EDGE-102）、
 /// `agent_popup_scroll` でスクロール（REQ-301）、対象が無ければ空表示（REQ-202）。
 ///
-/// TASK-0008 で `m` キーの render 分岐から呼ばれる。
-#[allow(dead_code)]
+/// `m` キーの render 分岐（render() 内）から呼ばれる。
 pub fn render_agent_popup(frame: &mut Frame, app: &App, registry: &SessionRegistry) {
     let area = centered_rect(60, 50, frame.area());
     frame.render_widget(ratatui::widgets::Clear, area);
@@ -1489,8 +1504,7 @@ fn build_dashboard_rows(registry: &SessionRegistry) -> Vec<AgentRow> {
 /// （Waiting→Working→Done→Idle, 同状態は project→worktree 名順, REQ-006）に並べ、
 /// 赤強調・省略・経過時間・スクロールは TASK-0006 の共通ヘルパで描画する。
 ///
-/// TASK-0008 で `M` キーの render 分岐から呼ばれる。
-#[allow(dead_code)]
+/// `M` キーの render 分岐（render() 内）から呼ばれる。
 pub fn render_agent_dashboard(frame: &mut Frame, app: &App, registry: &SessionRegistry) {
     let area = centered_rect(80, 80, frame.area());
     frame.render_widget(ratatui::widgets::Clear, area);

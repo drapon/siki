@@ -578,6 +578,35 @@ async fn handle_event(
                 return;
             }
 
+            // エージェント監視ビュー表示中はキーを横取り（REQ-201）
+            // Esc で閉じ、j/k（↑/↓）でスクロール
+            if app.show_agent_popup {
+                match key.code {
+                    KeyCode::Esc => app.show_agent_popup = false,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.agent_popup_scroll = app.agent_popup_scroll.saturating_add(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.agent_popup_scroll = app.agent_popup_scroll.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            if app.show_agent_dashboard {
+                match key.code {
+                    KeyCode::Esc => app.show_agent_dashboard = false,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.agent_dashboard_scroll = app.agent_dashboard_scroll.saturating_add(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.agent_dashboard_scroll = app.agent_dashboard_scroll.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             // 選択中の y / Ctrl+C でコピー、Esc で選択解除
             if app.text_selection.is_some() {
                 let is_copy = key.code == KeyCode::Char('y')
@@ -2928,6 +2957,19 @@ fn handle_left_panel_key(
                 .unwrap_or_default();
             app.add_project_input = cwd;
             app.show_add_project_popup = true;
+        }
+        KeyCode::Char('m') => {
+            // カーソル位置のプロジェクトのエージェント一覧ポップアップを開く（REQ-003/106）
+            if let Some(idx) = left_panel.resolve_project_index(&entries) {
+                app.agent_popup_project_index = idx;
+                app.agent_popup_scroll = 0;
+                app.show_agent_popup = true;
+            }
+        }
+        KeyCode::Char('M') => {
+            // 全プロジェクト横断のエージェント ダッシュボードを開く（REQ-004）
+            app.agent_dashboard_scroll = 0;
+            app.show_agent_dashboard = true;
         }
         KeyCode::Enter => {
             if let Some(wt_id) = left_panel.select_worktree(&entries) {
