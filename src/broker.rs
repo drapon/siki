@@ -146,8 +146,12 @@ impl Broker {
                 let (project, worktree) = crate::session::guess_names_from_cwd(cwd);
                 let _ = db::upsert_session(&conn, session_id, role, &worktree, &project, cwd, "idle");
             }
-            HookEvent::Working { session_id, .. } => {
+            HookEvent::Working { session_id, activity } => {
                 let _ = db::update_session_state(&conn, session_id, "working");
+                // activity が同梱されていれば永続化（来ない場合は直前の値を保持）
+                if let Some(act) = activity {
+                    let _ = db::update_session_activity(&conn, session_id, act);
+                }
             }
             HookEvent::Waiting { session_id } => {
                 let _ = db::update_session_state(&conn, session_id, "waiting");
@@ -512,6 +516,66 @@ mod tests {
             }
             _ => panic!("expected SessionUpdate with Working state"),
         }
+
+        broker_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_broker_persists_activity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("test_act.sock");
+        let registry = Arc::new(Mutex::new(SessionRegistry::new()));
+        let db = test_db();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        // 事前にセッションを registry / DB に登録（SessionStart 相当）
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register("sess-x".into(), "/tmp".into(), "default".into());
+        }
+        {
+            let conn = db.lock().unwrap();
+            db::upsert_session(&conn, "sess-x", "default", "wt", "proj", "/tmp", "idle").unwrap();
+        }
+
+        let broker =
+            Broker::new(&sock_path, Arc::clone(&registry), Arc::clone(&db), event_tx).unwrap();
+        let broker_handle = tokio::spawn(broker.run());
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // activity 付き working を送信
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (_, mut writer) = tokio::io::split(stream);
+        use tokio::io::AsyncWriteExt;
+        let msg = r#"{"event":"working","session_id":"sess-x","activity":"Edit: a.rs"}"#;
+        writer.write_all(msg.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        // SessionUpdate 受信 = registry/DB 更新完了
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // registry に activity が反映されている
+        assert_eq!(
+            registry.lock().unwrap().get("sess-x").unwrap().activity.as_deref(),
+            Some("Edit: a.rs")
+        );
+
+        // DB の activity 列にも永続化されている
+        let act: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT activity FROM sessions WHERE session_id = ?1",
+                rusqlite::params!["sess-x"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(act.as_deref(), Some("Edit: a.rs"));
 
         broker_handle.abort();
     }
