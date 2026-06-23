@@ -900,16 +900,16 @@ async fn handle_event(
             match mouse.kind {
                 MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                     if let Some(layout) = last_layout {
-                        if let Some(panel) = layout.hit_test(mouse.column, mouse.row) {
-                            app.focused_panel = panel;
-                        }
-                        let hit_panel = layout.hit_test(mouse.column, mouse.row);
-                        // 中央ペインヘッダーの PR 部分クリック → PR ページをブラウザで開く
-                        if hit_panel == Some(app::Panel::Main) && mouse.row == layout.main.y {
+                        // 中央ペインヘッダーの PR 部分クリック → ブラウザで開くだけ。
+                        // フォーカス変更・テキスト選択などの副作用を起こさないよう、ここで処理を打ち切る
+                        if layout.hit_test(mouse.column, mouse.row) == Some(app::Panel::Main)
+                            && mouse.row == layout.main.y
+                        {
                             let pr_url = app.pr_link_area.and_then(|rect| {
-                                let in_x = mouse.column >= rect.x
-                                    && mouse.column < rect.x.saturating_add(rect.width);
-                                if in_x && mouse.row == rect.y {
+                                if mouse.column >= rect.x
+                                    && mouse.column < rect.x.saturating_add(rect.width)
+                                    && mouse.row == rect.y
+                                {
                                     app.selected_worktree()
                                         .and_then(|wt| wt.pr.as_ref().map(|p| p.url.clone()))
                                 } else {
@@ -920,8 +920,13 @@ async fn handle_event(
                                 if let Err(e) = open_in_browser(&url) {
                                     app.show_info(format!("ブラウザを開けませんでした: {e}"));
                                 }
+                                return;
                             }
                         }
+                        if let Some(panel) = layout.hit_test(mouse.column, mouse.row) {
+                            app.focused_panel = panel;
+                        }
+                        let hit_panel = layout.hit_test(mouse.column, mouse.row);
                         // ターミナルタブのクリック → タブ切替
                         if hit_panel == Some(app::Panel::Terminal)
                             && mouse.row == layout.right_bottom.y
