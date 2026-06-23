@@ -943,6 +943,88 @@ mod tests {
     use super::*;
     use crate::config::{Config, SikiConfig, ProjectConfig, WorktreeConfig};
     use std::path::PathBuf;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    // --- render_branch_header（PR 番号・状態色・クリック領域）の検証 ---
+
+    /// branch="feat" (4幅) + " " (1) + " | " (3) → PR 開始 x = 8
+    const PR_START_X: u16 = 8;
+
+    fn render_header(pr: Option<&PrInfo>, focused: bool) -> (Buffer, Option<Rect>) {
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut link = None;
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                link = render_branch_header(f, area, "feat", pr, focused);
+            })
+            .unwrap();
+        (terminal.backend().buffer().clone(), link)
+    }
+
+    fn row_text(buf: &Buffer, w: u16) -> String {
+        (0..w)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol()).unwrap_or(""))
+            .collect()
+    }
+
+    fn sample_pr(status: PrStatus) -> PrInfo {
+        PrInfo {
+            number: 123,
+            title: "Fix bug".to_string(),
+            url: "https://example.com/pr/123".to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn header_shows_title_then_number() {
+        let pr = sample_pr(PrStatus::Ready);
+        let (buf, link) = render_header(Some(&pr), true);
+        let text = row_text(&buf, 40);
+        assert!(text.contains("Fix bug #123"), "got: {text:?}");
+        // クリック領域は PR 文字列（"Fix bug #123" = 12幅）を覆う
+        let rect = link.expect("PR ありなら領域が返る");
+        assert_eq!(rect.x, PR_START_X);
+        assert_eq!(rect.width, 12);
+        assert_eq!(rect.height, 1);
+    }
+
+    #[test]
+    fn header_status_colors_when_focused() {
+        let cases = [
+            (PrStatus::CiError, Color::Red),
+            (PrStatus::Approved, Color::Green),
+            (PrStatus::Draft, Color::DarkGray),
+            (PrStatus::Ready, Color::Yellow),
+        ];
+        for (status, expected) in cases {
+            let pr = sample_pr(status);
+            let (buf, _) = render_header(Some(&pr), true);
+            let fg = buf.cell((PR_START_X, 0)).unwrap().fg;
+            assert_eq!(fg, expected, "status={status:?}");
+        }
+    }
+
+    #[test]
+    fn header_pr_is_gray_when_not_focused() {
+        // 非フォーカス時は状態に関わらず DarkGray（REQ-402）
+        let pr = sample_pr(PrStatus::CiError);
+        let (buf, _) = render_header(Some(&pr), false);
+        let fg = buf.cell((PR_START_X, 0)).unwrap().fg;
+        assert_eq!(fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn header_no_link_area_without_pr() {
+        let (buf, link) = render_header(None, true);
+        assert!(link.is_none());
+        let text = row_text(&buf, 40);
+        assert!(!text.contains('#'), "PR 無しなら番号は出ない: {text:?}");
+    }
 
     fn app_with_worktree() -> App {
         let config = Config {
