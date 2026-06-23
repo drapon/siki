@@ -5328,11 +5328,171 @@ async fn fetch_pr_title(wt_path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// `gh` の statusCheckRollup 要素が失敗を示すか判定する
+fn check_is_failed(check: &serde_json::Value) -> bool {
+    // CheckRun は conclusion、StatusContext は state を持つ
+    let conclusion = check
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let state = check.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    matches!(
+        conclusion,
+        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+    ) || matches!(state, "FAILURE" | "ERROR")
+}
+
+/// PR の各フィールドから表示用ステータスを決定する純粋関数
+///
+/// 優先順位（厳守）: CiError > Approved > Draft > Ready
+/// - CI 失敗（statusCheckRollup に失敗系）が1件でもあれば CiError（pending/running は対象外）
+/// - reviewDecision == "APPROVED" なら Approved
+/// - isDraft == true なら Draft
+/// - それ以外は Ready
+fn classify_pr_status(
+    is_draft: bool,
+    review_decision: &str,
+    status_check_rollup: &[serde_json::Value],
+) -> app::PrStatus {
+    if status_check_rollup.iter().any(check_is_failed) {
+        return app::PrStatus::CiError;
+    }
+    if review_decision == "APPROVED" {
+        return app::PrStatus::Approved;
+    }
+    if is_draft {
+        return app::PrStatus::Draft;
+    }
+    app::PrStatus::Ready
+}
+
+/// worktree のパスで `gh pr view` を実行し、PR の番号・タイトル・URL・状態を取得する
+// NOTE: 呼び出し配線は次タスクで行うため、それまで未使用警告を抑制する
+#[allow(dead_code)]
+async fn fetch_pr_info(wt_path: &std::path::Path) -> Option<app::PrInfo> {
+    let output = tokio::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            "--json",
+            "number,title,url,isDraft,reviewDecision,statusCheckRollup",
+        ])
+        .current_dir(wt_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let number = json.get("number")?.as_u64()? as u32;
+    let title = json.get("title")?.as_str()?.to_string();
+    let url = json.get("url")?.as_str()?.to_string();
+    if title.is_empty() || url.is_empty() {
+        return None;
+    }
+    let is_draft = json
+        .get("isDraft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let review_decision = json
+        .get("reviewDecision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let empty = Vec::new();
+    let checks = json
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let status = classify_pr_status(is_draft, review_decision, checks);
+    Some(app::PrInfo {
+        number,
+        title,
+        url,
+        status,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, ProjectConfig, SikiConfig, WorktreeConfig};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // --- classify_pr_status の検証 ---
+
+    fn check_run(conclusion: &str) -> serde_json::Value {
+        serde_json::json!({ "__typename": "CheckRun", "conclusion": conclusion })
+    }
+    fn status_ctx(state: &str) -> serde_json::Value {
+        serde_json::json!({ "__typename": "StatusContext", "state": state })
+    }
+
+    #[test]
+    fn pr_status_ci_failure_beats_approved() {
+        let checks = vec![check_run("SUCCESS"), check_run("FAILURE")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::CiError
+        );
+    }
+
+    #[test]
+    fn pr_status_ci_failure_beats_draft() {
+        let checks = vec![check_run("FAILURE")];
+        assert_eq!(
+            classify_pr_status(true, "", &checks),
+            app::PrStatus::CiError
+        );
+    }
+
+    #[test]
+    fn pr_status_pending_ci_is_ignored() {
+        // pending/running は失敗系でないので通常判定（approved）にフォールバック
+        let checks = vec![serde_json::json!({
+            "__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": null
+        })];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::Approved
+        );
+    }
+
+    #[test]
+    fn pr_status_approved_with_passing_ci() {
+        let checks = vec![check_run("SUCCESS"), status_ctx("SUCCESS")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::Approved
+        );
+    }
+
+    #[test]
+    fn pr_status_draft_without_failure_or_approval() {
+        let checks = vec![check_run("SUCCESS")];
+        assert_eq!(
+            classify_pr_status(true, "REVIEW_REQUIRED", &checks),
+            app::PrStatus::Draft
+        );
+    }
+
+    #[test]
+    fn pr_status_ready_is_default() {
+        let checks: Vec<serde_json::Value> = vec![];
+        assert_eq!(
+            classify_pr_status(false, "REVIEW_REQUIRED", &checks),
+            app::PrStatus::Ready
+        );
+    }
+
+    #[test]
+    fn pr_status_status_context_error_is_failure() {
+        let checks = vec![status_ctx("ERROR")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::CiError
+        );
+    }
 
     fn sample_config() -> Config {
         Config {
