@@ -1009,7 +1009,9 @@ async fn handle_event(
                             .unwrap_or(false);
                         if on_claude_tab
                             && hit_panel == Some(app::Panel::Main)
-                            && app.claude_content_area.is_some()
+                            && app
+                                .claude_content_area
+                                .is_some_and(|a| a.contains((mouse.column, mouse.row).into()))
                         {
                             let content_area = app.claude_content_area.unwrap();
                             let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
