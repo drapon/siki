@@ -10,7 +10,7 @@ pub mod syntax;
 
 use crate::app::{App, Panel};
 use crate::selection::SelectionPanel;
-use crate::session::SessionRegistry;
+use crate::session::{SessionRegistry, SessionState};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -1342,6 +1342,146 @@ fn render_symlink_settings_popup(frame: &mut Frame, app: &App) {
     }
 }
 
+/// エージェント監視ビューの 1 行分の表示データ。
+///
+/// プロジェクト別ポップアップ（TASK-0006）と全体ダッシュボード（TASK-0007）で共有する。
+/// `SessionRegistry` のライブ参照からクローンで構築し、`Session` はミューテートしない。
+/// `summary` はインメモリ Registry が保持しないため現状は常に `None`（DB 由来の summary は
+/// UI のライブ参照経路には乗らない）。
+pub struct AgentRow {
+    pub project_name: String,
+    pub worktree_name: String,
+    pub role: String,
+    pub state: SessionState,
+    pub activity: Option<String>,
+    pub summary: Option<String>,
+    pub elapsed_secs: u64,
+    pub alert: bool,
+}
+
+/// 経過秒数を人間可読の短い文字列（`12s` / `3m` / `2h`）に整形する（REQ-005）。
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+/// 人間の対応が必要な行か（alert あり、または許可入力待ち）を判定する（REQ-104）。
+fn is_attention(row: &AgentRow) -> bool {
+    row.alert || matches!(row.state, SessionState::Waiting)
+}
+
+/// 文字列を最大 `max` 文字に収め、超過時は末尾を `…` で省略する（EDGE-102）。
+///
+/// 文字（char）単位で数えるためマルチバイト文字でもパニックしない。
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let head: String = chars[..max.saturating_sub(1)].iter().collect();
+    format!("{head}…")
+}
+
+/// 対象プロジェクト配下のエージェント活動をポップアップ表示する（REQ-003）。
+///
+/// `app.agent_popup_project_index` のプロジェクトに属する全 worktree のライブセッションを
+/// `registry.by_worktree` で取得し、role / 状態 / activity / 経過時間 / alert を 1 行ずつ表示する。
+/// alert または Waiting の行は赤系で強調（REQ-104）、長文は `…` で省略（EDGE-102）、
+/// `agent_popup_scroll` でスクロール（REQ-301）、対象が無ければ空表示（REQ-202）。
+///
+/// TASK-0008 で `m` キーの render 分岐から呼ばれる。
+#[allow(dead_code)]
+pub fn render_agent_popup(frame: &mut Frame, app: &App, registry: &SessionRegistry) {
+    let area = centered_rect(60, 50, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let project_name = app
+        .projects
+        .get(app.agent_popup_project_index)
+        .map(|p| p.name.as_str())
+        .unwrap_or("???");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Agents: {} ", project_name))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // 対象プロジェクトの worktree からライブセッションを AgentRow に整形
+    let now = std::time::Instant::now();
+    let mut rows: Vec<AgentRow> = Vec::new();
+    if let Some(project) = app.projects.get(app.agent_popup_project_index) {
+        for wt in &project.worktrees {
+            for s in registry.by_worktree(&project.name, &wt.name) {
+                rows.push(AgentRow {
+                    project_name: s.project_name.clone(),
+                    worktree_name: s.worktree_name.clone(),
+                    role: s.role.clone(),
+                    state: s.state,
+                    activity: s.activity.clone(),
+                    summary: None,
+                    elapsed_secs: now.saturating_duration_since(s.last_seen).as_secs(),
+                    alert: s.alert,
+                });
+            }
+        }
+    }
+
+    // 空表示（REQ-202）
+    if rows.is_empty() {
+        let p = Paragraph::new("アクティブなエージェントなし").alignment(Alignment::Center);
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    let lines = agent_rows_to_lines(&rows, inner.width as usize);
+
+    // スクロール窓（REQ-301）
+    let visible = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    let start = app.agent_popup_scroll.min(max_scroll);
+    let window: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
+
+    frame.render_widget(Paragraph::new(window), inner);
+}
+
+/// AgentRow 群を描画用の `Line` 群へ整形する（赤強調・省略を適用）。
+///
+/// `width` は描画可能な内側の幅（文字数の目安）。ポップアップ／ダッシュボード共通。
+fn agent_rows_to_lines(rows: &[AgentRow], width: usize) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| {
+            let badge = row.state.badge_char(true);
+            // 「worktree(role)」のラベル部
+            let label = format!("{} {}({})", badge, row.worktree_name, row.role);
+            let elapsed = format_elapsed(row.elapsed_secs);
+            // 活動内容（None は "-"）
+            let activity = row.activity.as_deref().unwrap_or("-");
+            // 残り幅に応じて活動内容を省略（ラベル・経過時間・区切りを差し引く）
+            let reserved = label.chars().count() + elapsed.chars().count() + 4;
+            let avail = width.saturating_sub(reserved);
+            let activity = truncate_ellipsis(activity, avail);
+            let text = format!("{label}  {activity}  {elapsed}");
+
+            let style = if is_attention(row) {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(row.state.badge_color())
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect()
+}
+
 pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::vertical([
         Constraint::Percentage((100 - percent_y) / 2),
@@ -1356,4 +1496,55 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionState;
+
+    fn row(state: SessionState, alert: bool) -> AgentRow {
+        AgentRow {
+            project_name: "proj".into(),
+            worktree_name: "wt".into(),
+            role: "main".into(),
+            state,
+            activity: None,
+            summary: None,
+            elapsed_secs: 0,
+            alert,
+        }
+    }
+
+    #[test]
+    fn elapsed_formats() {
+        assert_eq!(format_elapsed(12), "12s");
+        assert_eq!(format_elapsed(180), "3m");
+        assert_eq!(format_elapsed(7200), "2h");
+        // 境界値
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(60), "1m");
+        assert_eq!(format_elapsed(3599), "59m");
+        assert_eq!(format_elapsed(3600), "1h");
+    }
+
+    #[test]
+    fn attention_for_alert_and_waiting() {
+        assert!(is_attention(&row(SessionState::Working, true)));
+        assert!(is_attention(&row(SessionState::Waiting, false)));
+        assert!(!is_attention(&row(SessionState::Working, false)));
+        assert!(!is_attention(&row(SessionState::Idle, false)));
+        assert!(!is_attention(&row(SessionState::Done, false)));
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis() {
+        assert_eq!(truncate_ellipsis("abcdef", 4), "abc…");
+        assert_eq!(truncate_ellipsis("abcdef", 10), "abcdef");
+        assert_eq!(truncate_ellipsis("abcdef", 6), "abcdef");
+        assert_eq!(truncate_ellipsis("abcdef", 0), "");
+        assert_eq!(truncate_ellipsis("abcdef", 1), "…");
+        // マルチバイト（日本語）でもパニックしない
+        assert_eq!(truncate_ellipsis("あいうえお", 3), "あい…");
+    }
 }
