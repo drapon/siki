@@ -146,7 +146,7 @@ impl Broker {
                 let (project, worktree) = crate::session::guess_names_from_cwd(cwd);
                 let _ = db::upsert_session(&conn, session_id, role, &worktree, &project, cwd, "idle");
             }
-            HookEvent::Working { session_id } => {
+            HookEvent::Working { session_id, .. } => {
                 let _ = db::update_session_state(&conn, session_id, "working");
             }
             HookEvent::Waiting { session_id } => {

@@ -64,6 +64,9 @@ pub struct Session {
     pub alert: bool,
     /// アラートの理由メッセージ
     pub alert_message: Option<String>,
+    /// 現在/直前に実行中のツール活動（PreToolUse から抽出した人間可読の1行）。
+    /// working 受信時のみ更新し、それ以外の遷移では直前を保持する。
+    pub activity: Option<String>,
 }
 
 /// `hook-event` サブコマンドが broker に送れる状態イベント名（単一の真実源）。
@@ -85,6 +88,10 @@ pub enum HookEvent {
     },
     Working {
         session_id: String,
+        /// 現在実行を開始したツール活動（PreToolUse 由来）。
+        /// 後方互換のため Optional（従来の activity 無し payload も受理する）。
+        #[serde(default)]
+        activity: Option<String>,
     },
     Waiting {
         session_id: String,
@@ -104,7 +111,7 @@ impl HookEvent {
     pub fn session_id(&self) -> &str {
         match self {
             Self::Register { session_id, .. }
-            | Self::Working { session_id }
+            | Self::Working { session_id, .. }
             | Self::Waiting { session_id }
             | Self::Idle { session_id }
             | Self::Dead { session_id }
@@ -153,6 +160,7 @@ impl SessionRegistry {
                     idle_pending_since: None,
                     alert: false,
                     alert_message: None,
+                    activity: None,
                 },
             );
         }
@@ -349,10 +357,17 @@ impl SessionRegistry {
                 self.register(session_id, cwd, role);
                 true
             }
-            HookEvent::Working { session_id } => {
+            HookEvent::Working { session_id, activity } => {
                 // 未登録セッションは自動登録（レースコンディション対策）
                 if !self.sessions.contains_key(&session_id) {
                     self.register(session_id.clone(), String::new(), "default".into());
+                }
+                // activity が来ていれば更新する。来ない遷移（waiting/idle/refresh）では
+                // 直前の activity を保持する（REQ-103）。
+                if let (Some(act), Some(session)) =
+                    (activity, self.sessions.get_mut(&session_id))
+                {
+                    session.activity = Some(act);
                 }
                 self.update_state(&session_id, SessionState::Working);
                 true
@@ -527,6 +542,7 @@ mod tests {
         // 未登録セッションでも自動登録される
         let changed = reg.handle_event(HookEvent::Working {
             session_id: "unknown".into(),
+            activity: None,
         });
         assert!(changed);
         assert_eq!(reg.get("unknown").unwrap().state, SessionState::Working);
@@ -583,10 +599,82 @@ mod tests {
     }
 
     #[test]
+    fn test_working_deserialize_backward_compat_no_activity() {
+        // 従来形式（activity 無し）でも Working{activity: None} にデシリアライズできること
+        let json = r#"{"event":"working","session_id":"abc"}"#;
+        let ev: HookEvent = serde_json::from_str(json).unwrap();
+        match ev {
+            HookEvent::Working { session_id, activity } => {
+                assert_eq!(session_id, "abc");
+                assert!(activity.is_none());
+            }
+            _ => panic!("expected Working"),
+        }
+    }
+
+    #[test]
+    fn test_working_deserialize_with_activity() {
+        let json = r#"{"event":"working","session_id":"abc","activity":"Edit: a.rs"}"#;
+        let ev: HookEvent = serde_json::from_str(json).unwrap();
+        match ev {
+            HookEvent::Working { activity, .. } => {
+                assert_eq!(activity.as_deref(), Some("Edit: a.rs"));
+            }
+            _ => panic!("expected Working"),
+        }
+    }
+
+    #[test]
+    fn test_handle_event_working_sets_activity() {
+        let mut reg = SessionRegistry::new();
+        reg.handle_event(HookEvent::Working {
+            session_id: "s1".into(),
+            activity: Some("Bash: テスト実行".into()),
+        });
+        assert_eq!(
+            reg.get("s1").unwrap().activity.as_deref(),
+            Some("Bash: テスト実行")
+        );
+    }
+
+    #[test]
+    fn test_activity_retained_through_idle() {
+        // working で activity 設定 → idle(Stop) が来ても activity は保持される（REQ-103）
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.handle_event(HookEvent::Working {
+            session_id: "s1".into(),
+            activity: Some("Edit: session.rs".into()),
+        });
+        // idle イベントは activity を持たない
+        reg.handle_event(HookEvent::Idle { session_id: "s1".into() });
+        assert_eq!(
+            reg.get("s1").unwrap().activity.as_deref(),
+            Some("Edit: session.rs"),
+            "idle 遷移後も直前の activity を保持すること"
+        );
+    }
+
+    #[test]
+    fn test_working_without_activity_keeps_previous() {
+        // activity 付き working の後、activity 無しの working が来ても直前を保持する
+        let mut reg = SessionRegistry::new();
+        reg.handle_event(HookEvent::Working {
+            session_id: "s1".into(),
+            activity: Some("Read: a.rs".into()),
+        });
+        reg.handle_event(HookEvent::Working {
+            session_id: "s1".into(),
+            activity: None,
+        });
+        assert_eq!(reg.get("s1").unwrap().activity.as_deref(), Some("Read: a.rs"));
+    }
+
+    #[test]
     fn test_hook_event_session_id() {
         let events = vec![
             HookEvent::Register { session_id: "a".into(), cwd: "/tmp".into(), role: "x".into() },
-            HookEvent::Working { session_id: "b".into() },
+            HookEvent::Working { session_id: "b".into(), activity: None },
             HookEvent::Waiting { session_id: "c".into() },
             HookEvent::Idle { session_id: "d".into() },
             HookEvent::Dead { session_id: "e".into() },
@@ -695,7 +783,7 @@ mod tests {
         assert_eq!(reg.get("s1").unwrap().state, SessionState::Done);
 
         // 再開: Working イベントが来たら復帰する
-        reg.handle_event(HookEvent::Working { session_id: "s1".into() });
+        reg.handle_event(HookEvent::Working { session_id: "s1".into(), activity: None });
         assert_eq!(reg.get("s1").unwrap().state, SessionState::Working);
     }
 
@@ -720,6 +808,7 @@ mod tests {
                 idle_pending_since: None,
                 alert: false,
                 alert_message: None,
+                activity: None,
             },
         );
     }
