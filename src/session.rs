@@ -656,6 +656,35 @@ mod tests {
     }
 
     #[test]
+    fn test_activity_retained_through_refresh_then_idle() {
+        // REQ-103: working(activity)→refresh(PostToolUse)→idle(Stop) の順でも
+        // state は遷移するが activity は直前値を保持し続ける
+        let mut reg = SessionRegistry::new();
+        reg.register("s1".into(), "/tmp".into(), "default".into());
+        reg.handle_event(HookEvent::Working {
+            session_id: "s1".into(),
+            activity: Some("Bash: bun test".into()),
+        });
+        assert_eq!(reg.get("s1").unwrap().state, SessionState::Working);
+
+        // refresh は heartbeat のみ（activity 不変）
+        reg.handle_event(HookEvent::Refresh { session_id: "s1".into() });
+        assert_eq!(
+            reg.get("s1").unwrap().activity.as_deref(),
+            Some("Bash: bun test"),
+            "refresh 後も activity を保持すること"
+        );
+
+        // idle(Stop) で状態は Done へ遷移するが activity は据え置き
+        reg.handle_event(HookEvent::Idle { session_id: "s1".into() });
+        assert_eq!(
+            reg.get("s1").unwrap().activity.as_deref(),
+            Some("Bash: bun test"),
+            "idle 遷移後も activity を保持すること"
+        );
+    }
+
+    #[test]
     fn test_working_without_activity_keeps_previous() {
         // activity 付き working の後、activity 無しの working が来ても直前を保持する
         let mut reg = SessionRegistry::new();

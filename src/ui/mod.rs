@@ -1460,13 +1460,21 @@ pub fn render_agent_popup(frame: &mut Frame, app: &App, registry: &SessionRegist
 
     let lines = agent_rows_to_lines(&rows, inner.width as usize, false);
 
-    // スクロール窓（REQ-301）
+    // スクロール窓（REQ-301 / EDGE-103）
     let visible = inner.height as usize;
-    let max_scroll = lines.len().saturating_sub(visible);
-    let start = app.agent_popup_scroll.min(max_scroll);
+    let start = clamp_scroll(app.agent_popup_scroll, lines.len(), visible);
     let window: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
 
     frame.render_widget(Paragraph::new(window), inner);
+}
+
+/// スクロールオフセットを有効範囲 `[0, total - visible]` にクランプする（EDGE-103 / REQ-301）。
+///
+/// 表示窓（`visible` 行）に全行（`total` 行）が収まる場合は 0 を返す。
+/// キー操作側は `saturating_*` で下限のみ担保し、上限は描画時にここで丸める。
+fn clamp_scroll(scroll: usize, total: usize, visible: usize) -> usize {
+    let max_scroll = total.saturating_sub(visible);
+    scroll.min(max_scroll)
 }
 
 /// ダッシュボードのソートキー: 状態優先度の降順 → プロジェクト名 → worktree 名（REQ-006）。
@@ -1527,8 +1535,7 @@ pub fn render_agent_dashboard(frame: &mut Frame, app: &App, registry: &SessionRe
     let lines = agent_rows_to_lines(&rows, inner.width as usize, true);
 
     let visible = inner.height as usize;
-    let max_scroll = lines.len().saturating_sub(visible);
-    let start = app.agent_dashboard_scroll.min(max_scroll);
+    let start = clamp_scroll(app.agent_dashboard_scroll, lines.len(), visible);
     let window: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
 
     frame.render_widget(Paragraph::new(window), inner);
@@ -1684,5 +1691,41 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project_name, "unknown");
         assert_eq!(rows[0].worktree_name, "unknown");
+    }
+
+    #[test]
+    fn clamp_scroll_bounds() {
+        // 全行が窓に収まる場合は常に 0（EDGE-103）
+        assert_eq!(clamp_scroll(0, 3, 10), 0);
+        assert_eq!(clamp_scroll(5, 3, 10), 0);
+        // 行数 > 窓: 上限は total - visible にクランプ
+        assert_eq!(clamp_scroll(0, 20, 10), 0); // 先頭
+        assert_eq!(clamp_scroll(5, 20, 10), 5); // 範囲内
+        assert_eq!(clamp_scroll(10, 20, 10), 10); // ちょうど末尾
+        assert_eq!(clamp_scroll(999, 20, 10), 10); // 超過は末尾にクランプ
+        // visible が 0 でもパニックしない
+        assert_eq!(clamp_scroll(3, 5, 0), 3);
+    }
+
+    #[test]
+    fn dashboard_rows_reflect_live_registry_update() {
+        // REQ-101: ライブ参照のため Registry 更新が次の行生成に反映される
+        // （描画関数がスナップショットをキャッシュしないことの担保）
+        let mut registry = SessionRegistry::new();
+        registry.register("s1".into(), "/tmp".into(), "main".into());
+
+        let before = build_dashboard_rows(&registry);
+        assert_eq!(before[0].state, SessionState::Idle);
+        assert_eq!(before[0].activity, None);
+
+        // working + activity を反映
+        registry.handle_event(crate::session::HookEvent::Working {
+            session_id: "s1".into(),
+            activity: Some("Bash: bun test".into()),
+        });
+
+        let after = build_dashboard_rows(&registry);
+        assert_eq!(after[0].state, SessionState::Working);
+        assert_eq!(after[0].activity.as_deref(), Some("Bash: bun test"));
     }
 }
