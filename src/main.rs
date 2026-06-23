@@ -904,6 +904,24 @@ async fn handle_event(
                             app.focused_panel = panel;
                         }
                         let hit_panel = layout.hit_test(mouse.column, mouse.row);
+                        // 中央ペインヘッダーの PR 部分クリック → PR ページをブラウザで開く
+                        if hit_panel == Some(app::Panel::Main) && mouse.row == layout.main.y {
+                            let pr_url = app.pr_link_area.and_then(|rect| {
+                                let in_x = mouse.column >= rect.x
+                                    && mouse.column < rect.x.saturating_add(rect.width);
+                                if in_x && mouse.row == rect.y {
+                                    app.selected_worktree()
+                                        .and_then(|wt| wt.pr.as_ref().map(|p| p.url.clone()))
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(url) = pr_url {
+                                if let Err(e) = open_in_browser(&url) {
+                                    app.show_info(format!("ブラウザを開けませんでした: {e}"));
+                                }
+                            }
+                        }
                         // ターミナルタブのクリック → タブ切替
                         if hit_panel == Some(app::Panel::Terminal)
                             && mouse.row == layout.right_bottom.y
@@ -5390,6 +5408,18 @@ async fn fetch_pr_info(wt_path: &std::path::Path) -> Option<app::PrInfo> {
         url,
         status,
     })
+}
+
+/// URL を OS の既定ブラウザで開く（非ブロッキング）
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+    #[cfg(target_os = "windows")]
+    let cmd = "start";
+    std::process::Command::new(cmd).arg(url).spawn()?;
+    Ok(())
 }
 
 #[cfg(test)]
