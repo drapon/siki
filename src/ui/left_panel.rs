@@ -167,9 +167,9 @@ impl LeftPanel {
                             Span::styled(name_part, Style::default().fg(name_fg)),
                             Span::styled(branch_part, Style::default().fg(branch_fg).dim()),
                         ];
-                        if let Some(ref pr_title) = wt.pr_title {
+                        if let Some(ref pr) = wt.pr {
                             spans.push(Span::styled(
-                                format!(" ({})", pr_title),
+                                format!(" ({})", pr.title),
                                 Style::default().fg(Color::Yellow).dim(),
                             ));
                         }
@@ -237,7 +237,7 @@ mod tests {
                         active_terminal: 0,
                         chat_scroll_offset: 0,
                         claude_scroll_offsets: std::collections::HashMap::new(),
-                        pr_title: None,
+                        pr: None,
                         claude_session_id: None,
                         context_items: Vec::new(),
                         context_cursor: 0,
@@ -258,7 +258,7 @@ mod tests {
                         active_terminal: 0,
                         chat_scroll_offset: 0,
                         claude_scroll_offsets: std::collections::HashMap::new(),
-                        pr_title: None,
+                        pr: None,
                         claude_session_id: None,
                         context_items: Vec::new(),
                         context_cursor: 0,
@@ -286,7 +286,7 @@ mod tests {
                     active_terminal: 0,
                     chat_scroll_offset: 0,
                     claude_scroll_offsets: std::collections::HashMap::new(),
-                    pr_title: None,
+                    pr: None,
                     claude_session_id: None,
                     context_items: Vec::new(),
                     context_cursor: 0,

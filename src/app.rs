@@ -244,8 +244,8 @@ pub struct Worktree {
     pub chat_scroll_offset: usize,
     /// Claude ターミナルのスクロールバックオフセット（タブごと）
     pub claude_scroll_offsets: HashMap<usize, usize>,
-    /// GitHub PR タイトル（ブランチに紐づく PR がある場合）
-    pub pr_title: Option<String>,
+    /// ブランチに紐づく GitHub PR の情報（番号・タイトル・URL・状態）
+    pub pr: Option<PrInfo>,
     /// Claude Code のセッション ID（`-r` による再開用）
     pub claude_session_id: Option<String>,
     /// Context タブ用: コンテキスト一覧 (name, content)
@@ -717,7 +717,7 @@ impl Project {
                 active_terminal: 0,
                 chat_scroll_offset: 0,
                 claude_scroll_offsets: HashMap::new(),
-                pr_title: None,
+                pr: None,
                 claude_session_id: None,
                 context_items: Vec::new(),
                 context_cursor: 0,

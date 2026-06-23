@@ -57,7 +57,7 @@ pub fn render(
 
     // ブランチ / PR タイトル描画
     if let Some(wt) = app.selected_worktree() {
-        render_branch_header(frame, chunks[0], &wt.branch, wt.pr_title.as_deref(), focused);
+        render_branch_header(frame, chunks[0], &wt.branch, wt.pr.as_ref().map(|p| p.title.as_str()), focused);
     }
 
     // タブバー描画（Search タブを含む）

@@ -246,10 +246,10 @@ async fn main() -> Result<()> {
             let wt_id = (pi, wi);
             let wt_path = wt.path.clone();
             tokio::spawn(async move {
-                let title = fetch_pr_title(&wt_path).await;
+                let info = fetch_pr_info(&wt_path).await;
                 let _ = tx.send(event::AppEvent::PrInfo {
                     worktree_id: wt_id,
-                    title,
+                    info,
                 });
             });
         }
@@ -699,10 +699,10 @@ async fn handle_event(
                 let wt_path = wt.path.clone();
                 let wt_id = worktree_id;
                 tokio::spawn(async move {
-                    let title = fetch_pr_title(&wt_path).await;
+                    let info = fetch_pr_info(&wt_path).await;
                     let _ = tx.send(event::AppEvent::PrInfo {
                         worktree_id: wt_id,
-                        title,
+                        info,
                     });
                 });
             }
@@ -1403,9 +1403,9 @@ async fn handle_event(
                 _ => {}
             }
         }
-        AppEvent::PrInfo { worktree_id, title } => {
+        AppEvent::PrInfo { worktree_id, info } => {
             if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
-                wt.pr_title = title;
+                wt.pr = info;
             }
         }
         AppEvent::Resize(_w, _h) => {
@@ -2147,7 +2147,7 @@ fn finalize_add_worktree(
         active_terminal: 0,
         chat_scroll_offset: 0,
         claude_scroll_offsets: HashMap::new(),
-        pr_title: None,
+        pr: None,
         claude_session_id: None,
         context_items: Vec::new(),
         context_cursor: 0,
@@ -2158,10 +2158,10 @@ fn finalize_add_worktree(
     let tx = event_tx.clone();
     let pr_path = wt_path.clone();
     tokio::spawn(async move {
-        let title = fetch_pr_title(&pr_path).await;
+        let info = fetch_pr_info(&pr_path).await;
         let _ = tx.send(event::AppEvent::PrInfo {
             worktree_id: (pi, wi),
-            title,
+            info,
         });
     });
 
@@ -5309,25 +5309,6 @@ fn resolve_base_branch(project_path: &std::path::Path, project_name: &str) -> St
         .unwrap_or_else(|| "origin/main".to_string())
 }
 
-/// worktree のパスで `gh pr view` を実行し、PR タイトルを取得する
-async fn fetch_pr_title(wt_path: &std::path::Path) -> Option<String> {
-    let output = tokio::process::Command::new("gh")
-        .args(["pr", "view", "--json", "title", "--jq", ".title"])
-        .current_dir(wt_path)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if title.is_empty() {
-        None
-    } else {
-        Some(title)
-    }
-}
-
 /// `gh` の statusCheckRollup 要素が失敗を示すか判定する
 fn check_is_failed(check: &serde_json::Value) -> bool {
     // CheckRun は conclusion、StatusContext は state を持つ
@@ -5367,8 +5348,6 @@ fn classify_pr_status(
 }
 
 /// worktree のパスで `gh pr view` を実行し、PR の番号・タイトル・URL・状態を取得する
-// NOTE: 呼び出し配線は次タスクで行うため、それまで未使用警告を抑制する
-#[allow(dead_code)]
 async fn fetch_pr_info(wt_path: &std::path::Path) -> Option<app::PrInfo> {
     let output = tokio::process::Command::new("gh")
         .args([
