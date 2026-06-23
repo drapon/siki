@@ -59,6 +59,11 @@ pub fn init(db_path: &Path) -> Result<Connection> {
         "ALTER TABLE sessions ADD COLUMN alert_message TEXT;",
     );
 
+    // マイグレーション: activity カラムが無ければ追加（現在/直前のツール活動）
+    let _ = conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN activity TEXT;",
+    );
+
     // サマライズ済みセッション追跡テーブル
     conn.execute_batch(
         "
@@ -177,6 +182,19 @@ pub fn update_session_summary(
     conn.execute(
         "UPDATE sessions SET summary = ?1 WHERE session_id = ?2",
         rusqlite::params![summary, session_id],
+    )?;
+    Ok(())
+}
+
+/// セッションの activity（現在/直前のツール活動）を更新する
+pub fn update_session_activity(
+    conn: &Connection,
+    session_id: &str,
+    activity: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET activity = ?1 WHERE session_id = ?2",
+        rusqlite::params![activity, session_id],
     )?;
     Ok(())
 }
@@ -592,6 +610,33 @@ mod tests {
 
         let sessions = list_sessions(&conn).unwrap();
         assert_eq!(sessions[0].summary.as_deref(), Some("認証フロー実装中"));
+    }
+
+    #[test]
+    fn test_migration_adds_activity_column() {
+        // init は activity カラム追加を含むマイグレーションを行う。
+        // activity 列が存在すれば prepare が成功する（無ければ "no such column" で Err）。
+        let conn = test_db();
+        assert!(
+            conn.prepare("SELECT activity FROM sessions").is_ok(),
+            "activity 列が存在しない（マイグレーション未適用）"
+        );
+    }
+
+    #[test]
+    fn test_update_session_activity() {
+        let conn = test_db();
+        upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "working").unwrap();
+        update_session_activity(&conn, "s1", "Edit: session.rs").unwrap();
+
+        let activity: Option<String> = conn
+            .query_row(
+                "SELECT activity FROM sessions WHERE session_id = ?1",
+                rusqlite::params!["s1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(activity.as_deref(), Some("Edit: session.rs"));
     }
 
     #[test]
