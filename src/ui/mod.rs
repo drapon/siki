@@ -1443,7 +1443,7 @@ pub fn render_agent_popup(frame: &mut Frame, app: &App, registry: &SessionRegist
         return;
     }
 
-    let lines = agent_rows_to_lines(&rows, inner.width as usize);
+    let lines = agent_rows_to_lines(&rows, inner.width as usize, false);
 
     // スクロール窓（REQ-301）
     let visible = inner.height as usize;
@@ -1454,15 +1454,86 @@ pub fn render_agent_popup(frame: &mut Frame, app: &App, registry: &SessionRegist
     frame.render_widget(Paragraph::new(window), inner);
 }
 
+/// ダッシュボードのソートキー: 状態優先度の降順 → プロジェクト名 → worktree 名（REQ-006）。
+fn dashboard_sort_key(row: &AgentRow) -> (std::cmp::Reverse<u8>, String, String) {
+    (
+        std::cmp::Reverse(row.state.priority()),
+        row.project_name.clone(),
+        row.worktree_name.clone(),
+    )
+}
+
+/// 全セッションを `AgentRow` 化し状態優先順にソートして返す（unknown も除外しない, EDGE-003）。
+fn build_dashboard_rows(registry: &SessionRegistry) -> Vec<AgentRow> {
+    let now = std::time::Instant::now();
+    let mut rows: Vec<AgentRow> = registry
+        .all()
+        .map(|s| AgentRow {
+            project_name: s.project_name.clone(),
+            worktree_name: s.worktree_name.clone(),
+            role: s.role.clone(),
+            state: s.state,
+            activity: s.activity.clone(),
+            summary: None,
+            elapsed_secs: now.saturating_duration_since(s.last_seen).as_secs(),
+            alert: s.alert,
+        })
+        .collect();
+    rows.sort_by_key(dashboard_sort_key);
+    rows
+}
+
+/// 全プロジェクト横断のエージェント活動をダッシュボード表示する（REQ-004）。
+///
+/// `registry.all()` の全セッション（unknown/unknown 含む, EDGE-003）を状態優先順
+/// （Waiting→Working→Done→Idle, 同状態は project→worktree 名順, REQ-006）に並べ、
+/// 赤強調・省略・経過時間・スクロールは TASK-0006 の共通ヘルパで描画する。
+///
+/// TASK-0008 で `M` キーの render 分岐から呼ばれる。
+#[allow(dead_code)]
+pub fn render_agent_dashboard(frame: &mut Frame, app: &App, registry: &SessionRegistry) {
+    let area = centered_rect(80, 80, frame.area());
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Agents: all ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = build_dashboard_rows(registry);
+
+    if rows.is_empty() {
+        let p = Paragraph::new("アクティブなエージェントなし").alignment(Alignment::Center);
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    let lines = agent_rows_to_lines(&rows, inner.width as usize, true);
+
+    let visible = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    let start = app.agent_dashboard_scroll.min(max_scroll);
+    let window: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
+
+    frame.render_widget(Paragraph::new(window), inner);
+}
+
 /// AgentRow 群を描画用の `Line` 群へ整形する（赤強調・省略を適用）。
 ///
 /// `width` は描画可能な内側の幅（文字数の目安）。ポップアップ／ダッシュボード共通。
-fn agent_rows_to_lines(rows: &[AgentRow], width: usize) -> Vec<Line<'static>> {
+/// `show_project` が true のときはラベルに `project/` を前置する（ダッシュボード用）。
+fn agent_rows_to_lines(rows: &[AgentRow], width: usize, show_project: bool) -> Vec<Line<'static>> {
     rows.iter()
         .map(|row| {
             let badge = row.state.badge_char(true);
-            // 「worktree(role)」のラベル部
-            let label = format!("{} {}({})", badge, row.worktree_name, row.role);
+            // 「[project/]worktree(role)」のラベル部
+            let label = if show_project {
+                format!("{} {}/{}({})", badge, row.project_name, row.worktree_name, row.role)
+            } else {
+                format!("{} {}({})", badge, row.worktree_name, row.role)
+            };
             let elapsed = format_elapsed(row.elapsed_secs);
             // 活動内容（None は "-"）
             let activity = row.activity.as_deref().unwrap_or("-");
@@ -1546,5 +1617,58 @@ mod tests {
         assert_eq!(truncate_ellipsis("abcdef", 1), "…");
         // マルチバイト（日本語）でもパニックしない
         assert_eq!(truncate_ellipsis("あいうえお", 3), "あい…");
+    }
+
+    fn named_row(state: SessionState, project: &str, worktree: &str) -> AgentRow {
+        AgentRow {
+            project_name: project.into(),
+            worktree_name: worktree.into(),
+            role: "main".into(),
+            state,
+            activity: None,
+            summary: None,
+            elapsed_secs: 0,
+            alert: false,
+        }
+    }
+
+    #[test]
+    fn sort_orders_by_state_then_names() {
+        let mut rows = vec![
+            named_row(SessionState::Idle, "z", "a"),
+            named_row(SessionState::Working, "b", "y"),
+            named_row(SessionState::Waiting, "m", "n"),
+            named_row(SessionState::Done, "a", "a"),
+            named_row(SessionState::Working, "b", "x"),
+            named_row(SessionState::Working, "a", "a"),
+        ];
+        rows.sort_by_key(dashboard_sort_key);
+        let order: Vec<(SessionState, &str, &str)> = rows
+            .iter()
+            .map(|r| (r.state, r.project_name.as_str(), r.worktree_name.as_str()))
+            .collect();
+        // waiting → working(同状態は project 昇順→worktree 昇順) → done → idle
+        assert_eq!(
+            order,
+            vec![
+                (SessionState::Waiting, "m", "n"),
+                (SessionState::Working, "a", "a"),
+                (SessionState::Working, "b", "x"),
+                (SessionState::Working, "b", "y"),
+                (SessionState::Done, "a", "a"),
+                (SessionState::Idle, "z", "a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_rows_not_filtered_out() {
+        let mut registry = SessionRegistry::new();
+        // cwd が workspaces 配下でないため unknown/unknown になる
+        registry.register("sess-unknown".into(), "/tmp".into(), "main".into());
+        let rows = build_dashboard_rows(&registry);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project_name, "unknown");
+        assert_eq!(rows[0].worktree_name, "unknown");
     }
 }
