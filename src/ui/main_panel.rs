@@ -1,8 +1,8 @@
-use crate::app::{App, OpenFile};
+use crate::app::{App, OpenFile, PrInfo, PrStatus};
 use super::grep_view;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// コマンド名の先頭を大文字にする
 fn capitalize_first(s: &str) -> String {
@@ -36,6 +36,7 @@ pub fn render(
 
     let Some((active_tab, claude_tabs, _open_file_count, current_llm_name)) = wt_info else {
         app.claude_content_area = None;
+        app.pr_link_area = None;
         // worktree 未選択時
         let block = panel_block("Main", focused);
         frame.render_widget(
@@ -56,8 +57,12 @@ pub fn render(
     .split(area);
 
     // ブランチ / PR タイトル描画
-    if let Some(wt) = app.selected_worktree() {
-        render_branch_header(frame, chunks[0], &wt.branch, wt.pr.as_ref().map(|p| p.title.as_str()), focused);
+    app.pr_link_area = None;
+    let header_data = app
+        .selected_worktree()
+        .map(|wt| (wt.branch.clone(), wt.pr.clone()));
+    if let Some((branch, pr)) = header_data {
+        app.pr_link_area = render_branch_header(frame, chunks[0], &branch, pr.as_ref(), focused);
     }
 
     // タブバー描画（Search タブを含む）
@@ -114,35 +119,67 @@ pub fn render(
     }
 }
 
-/// ブランチ名 / PR タイトルのヘッダーを描画
+/// PR の状態に対応する表示色を返す
+fn pr_status_color(status: PrStatus) -> Color {
+    match status {
+        PrStatus::CiError => Color::Red,
+        PrStatus::Approved => Color::Green,
+        PrStatus::Draft => Color::DarkGray,
+        PrStatus::Ready => Color::Yellow,
+    }
+}
+
+/// ブランチ名 / PR（番号・状態色）のヘッダーを描画する。
+/// PR を表示した場合、その文字範囲の矩形（クリック判定用）を返す。
 fn render_branch_header(
     frame: &mut Frame,
     area: Rect,
     branch: &str,
-    pr_title: Option<&str>,
+    pr: Option<&PrInfo>,
     focused: bool,
-) {
+) -> Option<Rect> {
     let branch_style = Style::default()
         .fg(if focused { Color::Green } else { Color::DarkGray })
         .add_modifier(Modifier::BOLD);
 
+    let prefix = " ";
+    let sep = " | ";
     let mut spans = vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(branch, branch_style),
+        Span::styled(prefix.to_string(), Style::default()),
+        Span::styled(branch.to_string(), branch_style),
     ];
 
-    if let Some(title) = pr_title {
-        spans.push(Span::styled(
-            " | ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            title,
-            Style::default().fg(if focused { Color::Yellow } else { Color::DarkGray }),
-        ));
+    let mut link_area = None;
+    if let Some(pr) = pr {
+        spans.push(Span::styled(sep.to_string(), Style::default().fg(Color::DarkGray)));
+
+        // タイトルの後ろに番号を表示（例: "バグ修正 #123"）
+        let pr_text = format!("{} #{}", pr.title, pr.number);
+        let pr_color = if focused {
+            pr_status_color(pr.status)
+        } else {
+            Color::DarkGray
+        };
+
+        // PR 部分の矩形を算出（クリック判定用）。エリア右端を超えないようクランプする
+        let offset = (prefix.width() + branch.width() + sep.width()) as u16;
+        let start_x = area.x.saturating_add(offset);
+        let area_right = area.x.saturating_add(area.width);
+        if start_x < area_right {
+            let max_width = area_right - start_x;
+            link_area = Some(Rect {
+                x: start_x,
+                y: area.y,
+                width: (pr_text.width() as u16).min(max_width),
+                height: 1,
+            });
+        }
+
+        spans.push(Span::styled(pr_text, Style::default().fg(pr_color)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    link_area
 }
 
 /// タブバーを描画
