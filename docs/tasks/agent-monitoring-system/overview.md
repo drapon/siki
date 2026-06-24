@@ -33,9 +33,9 @@
 
 ## 全体進捗
 
-- [ ] Phase 1: hook 拡張・データ層
-- [ ] Phase 2: UI 実装
-- [ ] Phase 3: リアルタイム確認・仕上げ・検証
+- [x] Phase 1: hook 拡張・データ層
+- [x] Phase 2: UI 実装
+- [x] Phase 3: リアルタイム確認・仕上げ・検証（自動検証完了。実機目視は TASK-0010-verification.md のチェックリスト参照）
 
 ## マイルストーン
 
@@ -53,10 +53,10 @@
 
 ### タスク一覧
 
-- [ ] [TASK-0001: DB層 activity 列追加と update_session_activity](TASK-0001.md) - 2h (TDD) 🔵
-- [ ] [TASK-0002: 状態モデル HookEvent.activity / Session.activity と Registry 反映](TASK-0002.md) - 3h (TDD) 🔵
-- [ ] [TASK-0003: hook 抽出 format_activity と working 拡張](TASK-0003.md) - 3h (TDD) 🔵
-- [ ] [TASK-0004: broker 連携 activity の DB 永続と Registry 反映](TASK-0004.md) - 2h (TDD) 🔵
+- [x] [TASK-0001: DB層 activity 列追加と update_session_activity](TASK-0001.md) - 2h (TDD) 🔵
+- [x] [TASK-0002: 状態モデル HookEvent.activity / Session.activity と Registry 反映](TASK-0002.md) - 3h (TDD) 🔵
+- [x] [TASK-0003: hook 抽出 format_activity と working 拡張](TASK-0003.md) - 3h (TDD) 🔵
+- [x] [TASK-0004: broker 連携 activity の DB 永続と Registry 反映](TASK-0004.md) - 2h (TDD) 🔵
 
 ### 依存関係
 
@@ -78,10 +78,10 @@ TASK-0002 → TASK-0003 → TASK-0004
 
 ### タスク一覧
 
-- [ ] [TASK-0005: app 状態 ポップアップ状態フィールド追加](TASK-0005.md) - 1h (DIRECT) 🔵
-- [ ] [TASK-0006: プロジェクト別ポップアップ描画 render_agent_popup](TASK-0006.md) - 4h (TDD) 🔵
-- [ ] [TASK-0007: 全体ダッシュボード描画 render_agent_dashboard と状態優先ソート](TASK-0007.md) - 3h (TDD) 🔵
-- [ ] [TASK-0008: キー操作 m/M・Esc・j/k・help・render 分岐](TASK-0008.md) - 3h (TDD) 🔵
+- [x] [TASK-0005: app 状態 ポップアップ状態フィールド追加](TASK-0005.md) - 1h (DIRECT) 🔵
+- [x] [TASK-0006: プロジェクト別ポップアップ描画 render_agent_popup](TASK-0006.md) - 4h (TDD) 🔵
+- [x] [TASK-0007: 全体ダッシュボード描画 render_agent_dashboard と状態優先ソート](TASK-0007.md) - 3h (TDD) 🔵
+- [x] [TASK-0008: キー操作 m/M・Esc・j/k・help・render 分岐](TASK-0008.md) - 3h (TDD) 🔵
 
 ### 依存関係
 
@@ -103,8 +103,8 @@ TASK-0005 ┴→ TASK-0007 ┼→ TASK-0008
 
 ### タスク一覧
 
-- [ ] [TASK-0009: リアルタイム更新・エッジ整形の検証とテスト](TASK-0009.md) - 3h (TDD) 🔵
-- [ ] [TASK-0010: 実機検証 複数 worktree での反映と全体ビルド/テスト](TASK-0010.md) - 2h (DIRECT) 🔵
+- [x] [TASK-0009: リアルタイム更新・エッジ整形の検証とテスト](TASK-0009.md) - 3h (TDD) 🔵
+- [x] [TASK-0010: 実機検証 複数 worktree での反映と全体ビルド/テスト](TASK-0010.md) - 2h (DIRECT) 🔵 ※自動検証完了 / 実機目視は要端末
 
 ### 依存関係
 
