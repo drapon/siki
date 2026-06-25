@@ -153,8 +153,9 @@ fn render_branch_header(
     if let Some(pr) = pr {
         spans.push(Span::styled(sep.to_string(), Style::default().fg(Color::DarkGray)));
 
-        // タイトルの後ろに番号を表示（例: "バグ修正 #123"）
-        let pr_text = format!("{} #{}", pr.title, pr.number);
+        // 番号をタイトルの前に表示（例: "#123 バグ修正"）。
+        // タイトルが長くヘッダーで途切れても番号は残るようにするため、番号を先頭に置く。
+        let pr_text = format!("#{} {}", pr.number, pr.title);
         let pr_color = if focused {
             pr_status_color(pr.status)
         } else {
@@ -983,16 +984,35 @@ mod tests {
     }
 
     #[test]
-    fn header_shows_title_then_number() {
+    fn header_shows_number_then_title() {
         let pr = sample_pr(PrStatus::Ready);
         let (buf, link) = render_header(Some(&pr), true);
         let text = row_text(&buf, 40);
-        assert!(text.contains("Fix bug #123"), "got: {text:?}");
-        // クリック領域は PR 文字列（"Fix bug #123" = 12幅）を覆う
+        // 番号がタイトルの前に出る（途切れても番号が残る）
+        assert!(text.contains("#123 Fix bug"), "got: {text:?}");
+        // クリック領域は PR 文字列（"#123 Fix bug" = 12幅）を覆う
         let rect = link.expect("PR ありなら領域が返る");
         assert_eq!(rect.x, PR_START_X);
         assert_eq!(rect.width, 12);
         assert_eq!(rect.height, 1);
+    }
+
+    #[test]
+    fn header_keeps_number_when_title_truncated() {
+        // 幅が狭くタイトルが途切れても、先頭の番号は残る
+        let backend = TestBackend::new(13, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let pr = sample_pr(PrStatus::Ready);
+                render_branch_header(f, f.area(), "feat", Some(&pr), true);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text = row_text(&buf, 13);
+        // "feat | #123" まで描画され、タイトル "Fix bug" は途切れて出ない
+        assert!(text.contains("#123"), "番号は残るべき: {text:?}");
+        assert!(!text.contains("Fix bug"), "タイトルは途切れる: {text:?}");
     }
 
     #[test]
