@@ -5342,9 +5342,11 @@ fn check_is_failed(check: &serde_json::Value) -> bool {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let state = check.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    // CANCELLED は gh CLI 同様に失敗扱い。STARTUP_FAILURE は gh CLI では pending 扱いだが、
+    // siki では起動失敗を可視化したいため意図的に失敗系に含める（gh CLI と異なる）。
     matches!(
         conclusion,
-        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "CANCELLED"
     ) || matches!(state, "FAILURE" | "ERROR")
 }
 
@@ -5392,7 +5394,7 @@ async fn fetch_pr_info(wt_path: &std::path::Path) -> Option<app::PrInfo> {
     let number = json.get("number")?.as_u64()? as u32;
     let title = json.get("title")?.as_str()?.to_string();
     let url = json.get("url")?.as_str()?.to_string();
-    if title.is_empty() || url.is_empty() {
+    if number == 0 || title.is_empty() || url.is_empty() {
         return None;
     }
     let is_draft = json
@@ -5418,15 +5420,42 @@ async fn fetch_pr_info(wt_path: &std::path::Path) -> Option<app::PrInfo> {
 }
 
 /// URL を OS の既定ブラウザで開く（非ブロッキング）
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn open_in_browser(url: &str) -> std::io::Result<()> {
+    let mut command;
     #[cfg(target_os = "macos")]
-    let cmd = "open";
+    {
+        command = std::process::Command::new("open");
+        command.arg(url);
+    }
     #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
+    {
+        command = std::process::Command::new("xdg-open");
+        command.arg(url);
+    }
     #[cfg(target_os = "windows")]
-    let cmd = "start";
-    std::process::Command::new(cmd).arg(url).spawn()?;
+    {
+        // `start` は cmd.exe の組み込みコマンドのため `cmd /C start` 経由で起動する。
+        // 第1引数（空文字列）は `start` がウィンドウタイトルとして解釈するためのダミー。
+        command = std::process::Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+    }
+    let mut child = command.spawn()?;
+    // ブラウザ起動プロセスはすぐ終了する。UI をブロックせず、かつゾンビを残さないよう
+    // 別スレッドで回収する。
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
+}
+
+/// サポート外 OS では起動手段が無いことを明示する
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn open_in_browser(_url: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "このOSではブラウザ起動に対応していません",
+    ))
 }
 
 #[cfg(test)]
@@ -5504,6 +5533,16 @@ mod tests {
     #[test]
     fn pr_status_status_context_error_is_failure() {
         let checks = vec![status_ctx("ERROR")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::CiError
+        );
+    }
+
+    #[test]
+    fn pr_status_cancelled_ci_is_failure() {
+        // CANCELLED は失敗系として扱い、approved でも CiError を優先する
+        let checks = vec![check_run("CANCELLED")];
         assert_eq!(
             classify_pr_status(false, "APPROVED", &checks),
             app::PrStatus::CiError

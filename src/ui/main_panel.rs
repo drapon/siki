@@ -161,11 +161,13 @@ fn render_branch_header(
             Color::DarkGray
         };
 
-        // PR 部分の矩形を算出（クリック判定用）。エリア右端を超えないようクランプする
-        let offset = (prefix.width() + branch.width() + sep.width()) as u16;
+        // PR 部分の矩形を算出（クリック判定用）。エリア右端を超えないようクランプする。
+        // ブランチ名だけでヘッダー幅を使い切る場合は PR 文字列が描画されないため矩形を作らない。
+        let branch_end = prefix.width() + branch.width() + sep.width();
+        let offset = branch_end as u16;
         let start_x = area.x.saturating_add(offset);
         let area_right = area.x.saturating_add(area.width);
-        if start_x < area_right {
+        if branch_end < area.width as usize && start_x < area_right {
             let max_width = area_right - start_x;
             link_area = Some(Rect {
                 x: start_x,
