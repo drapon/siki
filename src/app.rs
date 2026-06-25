@@ -200,6 +200,29 @@ impl AddWorktreeMode {
     }
 }
 
+/// PR の表示用状態（色分けの優先順位順に判定する）
+/// 優先順位: CiError > Approved > Draft > Ready
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrStatus {
+    /// CI 失敗（赤）— 最優先
+    CiError,
+    /// レビュー承認済み（緑）
+    Approved,
+    /// ドラフト（グレー）
+    Draft,
+    /// オープン / レビュー待ち（イエロー）
+    Ready,
+}
+
+/// ブランチに紐づく GitHub PR の表示情報
+#[derive(Debug, Clone)]
+pub struct PrInfo {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    pub status: PrStatus,
+}
+
 /// Worktree の状態
 #[derive(Debug)]
 pub struct Worktree {
@@ -221,8 +244,8 @@ pub struct Worktree {
     pub chat_scroll_offset: usize,
     /// Claude ターミナルのスクロールバックオフセット（タブごと）
     pub claude_scroll_offsets: HashMap<usize, usize>,
-    /// GitHub PR タイトル（ブランチに紐づく PR がある場合）
-    pub pr_title: Option<String>,
+    /// ブランチに紐づく GitHub PR の情報（番号・タイトル・URL・状態）
+    pub pr: Option<PrInfo>,
     /// Claude Code のセッション ID（`-r` による再開用）
     pub claude_session_id: Option<String>,
     /// Context タブ用: コンテキスト一覧 (name, content)
@@ -393,6 +416,8 @@ pub struct App {
     pub terminal_content_area: Option<Rect>,
     /// ファイルビューのコンテンツ領域（レンダリング時に計算）
     pub file_content_area: Option<Rect>,
+    /// 中央ペインヘッダーの PR 部分の領域（クリック判定用、レンダリング時に計算）
+    pub pr_link_area: Option<Rect>,
     /// grep 検索結果を中央ペインに表示中か
     pub show_grep_results_view: bool,
     /// grep 結果ビューのカーソル位置
@@ -507,6 +532,7 @@ impl App {
             claude_content_area: None,
             terminal_content_area: None,
             file_content_area: None,
+            pr_link_area: None,
             show_grep_results_view: false,
             grep_view_cursor: 0,
             grep_view_scroll: 0,
@@ -691,7 +717,7 @@ impl Project {
                 active_terminal: 0,
                 chat_scroll_offset: 0,
                 claude_scroll_offsets: HashMap::new(),
-                pr_title: None,
+                pr: None,
                 claude_session_id: None,
                 context_items: Vec::new(),
                 context_cursor: 0,

@@ -40,7 +40,7 @@ pub enum AppEvent {
     /// GitHub PR 情報取得完了
     PrInfo {
         worktree_id: WorktreeId,
-        title: Option<String>,
+        info: Option<crate::app::PrInfo>,
     },
     /// 定期 tick（UI リフレッシュ）
     Tick,

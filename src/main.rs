@@ -246,10 +246,10 @@ async fn main() -> Result<()> {
             let wt_id = (pi, wi);
             let wt_path = wt.path.clone();
             tokio::spawn(async move {
-                let title = fetch_pr_title(&wt_path).await;
+                let info = fetch_pr_info(&wt_path).await;
                 let _ = tx.send(event::AppEvent::PrInfo {
                     worktree_id: wt_id,
-                    title,
+                    info,
                 });
             });
         }
@@ -699,10 +699,10 @@ async fn handle_event(
                 let wt_path = wt.path.clone();
                 let wt_id = worktree_id;
                 tokio::spawn(async move {
-                    let title = fetch_pr_title(&wt_path).await;
+                    let info = fetch_pr_info(&wt_path).await;
                     let _ = tx.send(event::AppEvent::PrInfo {
                         worktree_id: wt_id,
-                        title,
+                        info,
                     });
                 });
             }
@@ -900,6 +900,29 @@ async fn handle_event(
             match mouse.kind {
                 MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                     if let Some(layout) = last_layout {
+                        // 中央ペインヘッダーの PR 部分クリック → ブラウザで開くだけ。
+                        // フォーカス変更・テキスト選択などの副作用を起こさないよう、ここで処理を打ち切る
+                        if layout.hit_test(mouse.column, mouse.row) == Some(app::Panel::Main)
+                            && mouse.row == layout.main.y
+                        {
+                            let pr_url = app.pr_link_area.and_then(|rect| {
+                                if mouse.column >= rect.x
+                                    && mouse.column < rect.x.saturating_add(rect.width)
+                                    && mouse.row == rect.y
+                                {
+                                    app.selected_worktree()
+                                        .and_then(|wt| wt.pr.as_ref().map(|p| p.url.clone()))
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(url) = pr_url {
+                                if let Err(e) = open_in_browser(&url) {
+                                    app.show_info(format!("ブラウザを開けませんでした: {e}"));
+                                }
+                                return;
+                            }
+                        }
                         if let Some(panel) = layout.hit_test(mouse.column, mouse.row) {
                             app.focused_panel = panel;
                         }
@@ -991,7 +1014,9 @@ async fn handle_event(
                             .unwrap_or(false);
                         if on_claude_tab
                             && hit_panel == Some(app::Panel::Main)
-                            && app.claude_content_area.is_some()
+                            && app
+                                .claude_content_area
+                                .is_some_and(|a| a.contains((mouse.column, mouse.row).into()))
                         {
                             let content_area = app.claude_content_area.unwrap();
                             let pos = selection::screen_to_term(mouse.column, mouse.row, &content_area);
@@ -1403,9 +1428,9 @@ async fn handle_event(
                 _ => {}
             }
         }
-        AppEvent::PrInfo { worktree_id, title } => {
+        AppEvent::PrInfo { worktree_id, info } => {
             if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
-                wt.pr_title = title;
+                wt.pr = info;
             }
         }
         AppEvent::Resize(_w, _h) => {
@@ -2147,7 +2172,7 @@ fn finalize_add_worktree(
         active_terminal: 0,
         chat_scroll_offset: 0,
         claude_scroll_offsets: HashMap::new(),
-        pr_title: None,
+        pr: None,
         claude_session_id: None,
         context_items: Vec::new(),
         context_cursor: 0,
@@ -2158,10 +2183,10 @@ fn finalize_add_worktree(
     let tx = event_tx.clone();
     let pr_path = wt_path.clone();
     tokio::spawn(async move {
-        let title = fetch_pr_title(&pr_path).await;
+        let info = fetch_pr_info(&pr_path).await;
         let _ = tx.send(event::AppEvent::PrInfo {
             worktree_id: (pi, wi),
-            title,
+            info,
         });
     });
 
@@ -5309,10 +5334,55 @@ fn resolve_base_branch(project_path: &std::path::Path, project_name: &str) -> St
         .unwrap_or_else(|| "origin/main".to_string())
 }
 
-/// worktree のパスで `gh pr view` を実行し、PR タイトルを取得する
-async fn fetch_pr_title(wt_path: &std::path::Path) -> Option<String> {
+/// `gh` の statusCheckRollup 要素が失敗を示すか判定する
+fn check_is_failed(check: &serde_json::Value) -> bool {
+    // CheckRun は conclusion、StatusContext は state を持つ
+    let conclusion = check
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let state = check.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    // CANCELLED は gh CLI 同様に失敗扱い。STARTUP_FAILURE は gh CLI では pending 扱いだが、
+    // siki では起動失敗を可視化したいため意図的に失敗系に含める（gh CLI と異なる）。
+    matches!(
+        conclusion,
+        "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "CANCELLED"
+    ) || matches!(state, "FAILURE" | "ERROR")
+}
+
+/// PR の各フィールドから表示用ステータスを決定する純粋関数
+///
+/// 優先順位（厳守）: CiError > Approved > Draft > Ready
+/// - CI 失敗（statusCheckRollup に失敗系）が1件でもあれば CiError（pending/running は対象外）
+/// - reviewDecision == "APPROVED" なら Approved
+/// - isDraft == true なら Draft
+/// - それ以外は Ready
+fn classify_pr_status(
+    is_draft: bool,
+    review_decision: &str,
+    status_check_rollup: &[serde_json::Value],
+) -> app::PrStatus {
+    if status_check_rollup.iter().any(check_is_failed) {
+        return app::PrStatus::CiError;
+    }
+    if review_decision == "APPROVED" {
+        return app::PrStatus::Approved;
+    }
+    if is_draft {
+        return app::PrStatus::Draft;
+    }
+    app::PrStatus::Ready
+}
+
+/// worktree のパスで `gh pr view` を実行し、PR の番号・タイトル・URL・状態を取得する
+async fn fetch_pr_info(wt_path: &std::path::Path) -> Option<app::PrInfo> {
     let output = tokio::process::Command::new("gh")
-        .args(["pr", "view", "--json", "title", "--jq", ".title"])
+        .args([
+            "pr",
+            "view",
+            "--json",
+            "number,title,url,isDraft,reviewDecision,statusCheckRollup",
+        ])
         .current_dir(wt_path)
         .output()
         .await
@@ -5320,12 +5390,72 @@ async fn fetch_pr_title(wt_path: &std::path::Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if title.is_empty() {
-        None
-    } else {
-        Some(title)
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let number = json.get("number")?.as_u64()? as u32;
+    let title = json.get("title")?.as_str()?.to_string();
+    let url = json.get("url")?.as_str()?.to_string();
+    if number == 0 || title.is_empty() || url.is_empty() {
+        return None;
     }
+    let is_draft = json
+        .get("isDraft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let review_decision = json
+        .get("reviewDecision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let empty = Vec::new();
+    let checks = json
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let status = classify_pr_status(is_draft, review_decision, checks);
+    Some(app::PrInfo {
+        number,
+        title,
+        url,
+        status,
+    })
+}
+
+/// URL を OS の既定ブラウザで開く（非ブロッキング）
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    let mut command;
+    #[cfg(target_os = "macos")]
+    {
+        command = std::process::Command::new("open");
+        command.arg(url);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        command = std::process::Command::new("xdg-open");
+        command.arg(url);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` は cmd.exe の組み込みコマンドのため `cmd /C start` 経由で起動する。
+        // 第1引数（空文字列）は `start` がウィンドウタイトルとして解釈するためのダミー。
+        command = std::process::Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+    }
+    let mut child = command.spawn()?;
+    // ブラウザ起動プロセスはすぐ終了する。UI をブロックせず、かつゾンビを残さないよう
+    // 別スレッドで回収する。
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// サポート外 OS では起動手段が無いことを明示する
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn open_in_browser(_url: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "このOSではブラウザ起動に対応していません",
+    ))
 }
 
 #[cfg(test)]
@@ -5333,6 +5463,91 @@ mod tests {
     use super::*;
     use crate::config::{Config, ProjectConfig, SikiConfig, WorktreeConfig};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // --- classify_pr_status の検証 ---
+
+    fn check_run(conclusion: &str) -> serde_json::Value {
+        serde_json::json!({ "__typename": "CheckRun", "conclusion": conclusion })
+    }
+    fn status_ctx(state: &str) -> serde_json::Value {
+        serde_json::json!({ "__typename": "StatusContext", "state": state })
+    }
+
+    #[test]
+    fn pr_status_ci_failure_beats_approved() {
+        let checks = vec![check_run("SUCCESS"), check_run("FAILURE")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::CiError
+        );
+    }
+
+    #[test]
+    fn pr_status_ci_failure_beats_draft() {
+        let checks = vec![check_run("FAILURE")];
+        assert_eq!(
+            classify_pr_status(true, "", &checks),
+            app::PrStatus::CiError
+        );
+    }
+
+    #[test]
+    fn pr_status_pending_ci_is_ignored() {
+        // pending/running は失敗系でないので通常判定（approved）にフォールバック
+        let checks = vec![serde_json::json!({
+            "__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": null
+        })];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::Approved
+        );
+    }
+
+    #[test]
+    fn pr_status_approved_with_passing_ci() {
+        let checks = vec![check_run("SUCCESS"), status_ctx("SUCCESS")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::Approved
+        );
+    }
+
+    #[test]
+    fn pr_status_draft_without_failure_or_approval() {
+        let checks = vec![check_run("SUCCESS")];
+        assert_eq!(
+            classify_pr_status(true, "REVIEW_REQUIRED", &checks),
+            app::PrStatus::Draft
+        );
+    }
+
+    #[test]
+    fn pr_status_ready_is_default() {
+        let checks: Vec<serde_json::Value> = vec![];
+        assert_eq!(
+            classify_pr_status(false, "REVIEW_REQUIRED", &checks),
+            app::PrStatus::Ready
+        );
+    }
+
+    #[test]
+    fn pr_status_status_context_error_is_failure() {
+        let checks = vec![status_ctx("ERROR")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::CiError
+        );
+    }
+
+    #[test]
+    fn pr_status_cancelled_ci_is_failure() {
+        // CANCELLED は失敗系として扱い、approved でも CiError を優先する
+        let checks = vec![check_run("CANCELLED")];
+        assert_eq!(
+            classify_pr_status(false, "APPROVED", &checks),
+            app::PrStatus::CiError
+        );
+    }
 
     fn sample_config() -> Config {
         Config {

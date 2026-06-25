@@ -1,8 +1,8 @@
-use crate::app::{App, OpenFile};
+use crate::app::{App, OpenFile, PrInfo, PrStatus};
 use super::grep_view;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// コマンド名の先頭を大文字にする
 fn capitalize_first(s: &str) -> String {
@@ -36,6 +36,7 @@ pub fn render(
 
     let Some((active_tab, claude_tabs, _open_file_count, current_llm_name)) = wt_info else {
         app.claude_content_area = None;
+        app.pr_link_area = None;
         // worktree 未選択時
         let block = panel_block("Main", focused);
         frame.render_widget(
@@ -56,8 +57,12 @@ pub fn render(
     .split(area);
 
     // ブランチ / PR タイトル描画
-    if let Some(wt) = app.selected_worktree() {
-        render_branch_header(frame, chunks[0], &wt.branch, wt.pr_title.as_deref(), focused);
+    app.pr_link_area = None;
+    let header_data = app
+        .selected_worktree()
+        .map(|wt| (wt.branch.clone(), wt.pr.clone()));
+    if let Some((branch, pr)) = header_data {
+        app.pr_link_area = render_branch_header(frame, chunks[0], &branch, pr.as_ref(), focused);
     }
 
     // タブバー描画（Search タブを含む）
@@ -114,35 +119,70 @@ pub fn render(
     }
 }
 
-/// ブランチ名 / PR タイトルのヘッダーを描画
+/// PR の状態に対応する表示色を返す
+fn pr_status_color(status: PrStatus) -> Color {
+    match status {
+        PrStatus::CiError => Color::Red,
+        PrStatus::Approved => Color::Green,
+        PrStatus::Draft => Color::DarkGray,
+        PrStatus::Ready => Color::Yellow,
+    }
+}
+
+/// ブランチ名 / PR（番号・状態色）のヘッダーを描画する。
+/// PR を表示した場合、その文字範囲の矩形（クリック判定用）を返す。
 fn render_branch_header(
     frame: &mut Frame,
     area: Rect,
     branch: &str,
-    pr_title: Option<&str>,
+    pr: Option<&PrInfo>,
     focused: bool,
-) {
+) -> Option<Rect> {
     let branch_style = Style::default()
         .fg(if focused { Color::Green } else { Color::DarkGray })
         .add_modifier(Modifier::BOLD);
 
+    let prefix = " ";
+    let sep = " | ";
     let mut spans = vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(branch, branch_style),
+        Span::styled(prefix.to_string(), Style::default()),
+        Span::styled(branch.to_string(), branch_style),
     ];
 
-    if let Some(title) = pr_title {
-        spans.push(Span::styled(
-            " | ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            title,
-            Style::default().fg(if focused { Color::Yellow } else { Color::DarkGray }),
-        ));
+    let mut link_area = None;
+    if let Some(pr) = pr {
+        spans.push(Span::styled(sep.to_string(), Style::default().fg(Color::DarkGray)));
+
+        // 番号をタイトルの前に表示（例: "#123 バグ修正"）。
+        // タイトルが長くヘッダーで途切れても番号は残るようにするため、番号を先頭に置く。
+        let pr_text = format!("#{} {}", pr.number, pr.title);
+        let pr_color = if focused {
+            pr_status_color(pr.status)
+        } else {
+            Color::DarkGray
+        };
+
+        // PR 部分の矩形を算出（クリック判定用）。エリア右端を超えないようクランプする。
+        // ブランチ名だけでヘッダー幅を使い切る場合は PR 文字列が描画されないため矩形を作らない。
+        let branch_end = prefix.width() + branch.width() + sep.width();
+        let offset = branch_end as u16;
+        let start_x = area.x.saturating_add(offset);
+        let area_right = area.x.saturating_add(area.width);
+        if branch_end < area.width as usize && start_x < area_right {
+            let max_width = area_right - start_x;
+            link_area = Some(Rect {
+                x: start_x,
+                y: area.y,
+                width: (pr_text.width() as u16).min(max_width),
+                height: 1,
+            });
+        }
+
+        spans.push(Span::styled(pr_text, Style::default().fg(pr_color)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    link_area
 }
 
 /// タブバーを描画
@@ -906,6 +946,107 @@ mod tests {
     use super::*;
     use crate::config::{Config, SikiConfig, ProjectConfig, WorktreeConfig};
     use std::path::PathBuf;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    // --- render_branch_header（PR 番号・状態色・クリック領域）の検証 ---
+
+    /// branch="feat" (4幅) + " " (1) + " | " (3) → PR 開始 x = 8
+    const PR_START_X: u16 = 8;
+
+    fn render_header(pr: Option<&PrInfo>, focused: bool) -> (Buffer, Option<Rect>) {
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut link = None;
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                link = render_branch_header(f, area, "feat", pr, focused);
+            })
+            .unwrap();
+        (terminal.backend().buffer().clone(), link)
+    }
+
+    fn row_text(buf: &Buffer, w: u16) -> String {
+        (0..w)
+            .map(|x| buf.cell((x, 0)).map(|c| c.symbol()).unwrap_or(""))
+            .collect()
+    }
+
+    fn sample_pr(status: PrStatus) -> PrInfo {
+        PrInfo {
+            number: 123,
+            title: "Fix bug".to_string(),
+            url: "https://example.com/pr/123".to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn header_shows_number_then_title() {
+        let pr = sample_pr(PrStatus::Ready);
+        let (buf, link) = render_header(Some(&pr), true);
+        let text = row_text(&buf, 40);
+        // 番号がタイトルの前に出る（途切れても番号が残る）
+        assert!(text.contains("#123 Fix bug"), "got: {text:?}");
+        // クリック領域は PR 文字列（"#123 Fix bug" = 12幅）を覆う
+        let rect = link.expect("PR ありなら領域が返る");
+        assert_eq!(rect.x, PR_START_X);
+        assert_eq!(rect.width, 12);
+        assert_eq!(rect.height, 1);
+    }
+
+    #[test]
+    fn header_keeps_number_when_title_truncated() {
+        // 幅が狭くタイトルが途切れても、先頭の番号は残る
+        let backend = TestBackend::new(13, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let pr = sample_pr(PrStatus::Ready);
+                render_branch_header(f, f.area(), "feat", Some(&pr), true);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text = row_text(&buf, 13);
+        // "feat | #123" まで描画され、タイトル "Fix bug" は途切れて出ない
+        assert!(text.contains("#123"), "番号は残るべき: {text:?}");
+        assert!(!text.contains("Fix bug"), "タイトルは途切れる: {text:?}");
+    }
+
+    #[test]
+    fn header_status_colors_when_focused() {
+        let cases = [
+            (PrStatus::CiError, Color::Red),
+            (PrStatus::Approved, Color::Green),
+            (PrStatus::Draft, Color::DarkGray),
+            (PrStatus::Ready, Color::Yellow),
+        ];
+        for (status, expected) in cases {
+            let pr = sample_pr(status);
+            let (buf, _) = render_header(Some(&pr), true);
+            let fg = buf.cell((PR_START_X, 0)).unwrap().fg;
+            assert_eq!(fg, expected, "status={status:?}");
+        }
+    }
+
+    #[test]
+    fn header_pr_is_gray_when_not_focused() {
+        // 非フォーカス時は状態に関わらず DarkGray（REQ-402）
+        let pr = sample_pr(PrStatus::CiError);
+        let (buf, _) = render_header(Some(&pr), false);
+        let fg = buf.cell((PR_START_X, 0)).unwrap().fg;
+        assert_eq!(fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn header_no_link_area_without_pr() {
+        let (buf, link) = render_header(None, true);
+        assert!(link.is_none());
+        let text = row_text(&buf, 40);
+        assert!(!text.contains('#'), "PR 無しなら番号は出ない: {text:?}");
+    }
 
     fn app_with_worktree() -> App {
         let config = Config {
