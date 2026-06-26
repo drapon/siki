@@ -29,10 +29,22 @@ pub fn execute_tool(
 }
 
 fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<Value> {
+    // 既定スコープは "project"。"machine" を既定にするとマシン上の全 worktree・
+    // 全 project のセッションを返してしまい、無関係なノイズで応答が膨らむ。
+    // マシン全体を見たいときは scope:"machine" を明示する。
     let scope = params
         .get("scope")
         .and_then(|v| v.as_str())
-        .unwrap_or("machine");
+        .unwrap_or("project");
+
+    // worktree コンテキスト .md と過去会話サマリの本文を同梱するか。
+    // 既定 false。本文は worktree の寿命とともに無制限に増えるため、既定で同梱すると
+    // list_sessions の応答が肥大化し harness 側で「巨大なため省略」と切り詰められる。
+    // 既定では件数ポインタ（SessionStart hook と同じ方針）のみ返す。
+    let include_bodies = params
+        .get("include_bodies")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let all_sessions = db::list_sessions(conn)?;
 
@@ -92,34 +104,37 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         let _ = db::mark_messages_read_for_session(conn, session_id, &msg_ids);
     }
 
-    // DB から自分のセッション情報で worktree のコンテキストを読み込む
+    // 自分のセッション情報（proj/wt）で worktree コンテキストと会話サマリを引く。
     // （std::env::current_dir() はMCPサーバーの起動元CWDであり、worktreeパスと異なる場合がある）
-    let worktree_contexts = if !proj.is_empty() && !wt.is_empty() {
-        let contexts = crate::config::load_contexts(proj, wt);
-        if contexts.is_empty() {
-            None
-        } else {
-            let items: Vec<Value> = contexts
+    let valid_worktree = !proj.is_empty() && !wt.is_empty();
+    let contexts = if valid_worktree {
+        crate::config::load_contexts(proj, wt)
+    } else {
+        Vec::new()
+    };
+    let summaries = if valid_worktree {
+        db::get_conversation_logs_by_worktree(conn, wt, proj).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut result = json!({ "sessions": items, "pending_messages": messages });
+
+    if include_bodies {
+        // 明示要求時のみフル本文を返す。
+        if !contexts.is_empty() {
+            let ctx_items: Vec<Value> = contexts
                 .iter()
                 .map(|(name, content)| json!({ "name": name, "content": content }))
                 .collect();
-            Some(json!({
+            result["worktree_contexts"] = json!({
                 "project": proj,
                 "worktree": wt,
-                "contexts": items
-            }))
+                "contexts": ctx_items
+            });
         }
-    } else {
-        None
-    };
-
-    // SQLite から会話サマリを取得（JSONLパース不要）
-    let conversation_summaries = if !wt.is_empty() && !proj.is_empty() {
-        let logs = db::get_conversation_logs_by_worktree(conn, wt, proj).unwrap_or_default();
-        if logs.is_empty() {
-            None
-        } else {
-            let items: Vec<Value> = logs
+        if !summaries.is_empty() {
+            let sum_items: Vec<Value> = summaries
                 .iter()
                 .map(|log| {
                     json!({
@@ -130,19 +145,19 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
                     })
                 })
                 .collect();
-            Some(json!(items))
+            result["conversation_summaries"] = json!(sum_items);
         }
-    } else {
-        None
-    };
+    } else if !contexts.is_empty() || !summaries.is_empty() {
+        // 既定: 件数ポインタのみ。本文は include_bodies:true で取得させる。
+        let total_bytes: usize = contexts.iter().map(|(_, c)| c.len()).sum();
+        result["background"] = json!({
+            "conversation_summary_count": summaries.len(),
+            "worktree_context_files": contexts.len(),
+            "worktree_context_kb": (total_bytes + 512) / 1024,
+            "hint": "Pass include_bodies:true (with scope:\"worktree\") to fetch full conversation summaries and worktree context bodies. These can be large — prefer fetching only when the current task needs them.",
+        });
+    }
 
-    let mut result = json!({ "sessions": items, "pending_messages": messages });
-    if let Some(ctx) = worktree_contexts {
-        result["worktree_contexts"] = ctx;
-    }
-    if let Some(summaries) = conversation_summaries {
-        result["conversation_summaries"] = summaries;
-    }
     Ok(result)
 }
 
@@ -595,7 +610,8 @@ mod tests {
     fn test_list_sessions_with_data() {
         let conn = test_db();
         db::upsert_session(&conn, "s1", "frontend", "osaka", "myapp", "/tmp", "idle").unwrap();
-        let result = list_sessions(&conn, "s2", &json!({})).unwrap();
+        // 既定スコープは project。呼び出し元は同 project に登録済みの s1 とする。
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["id"], "s1");
@@ -693,21 +709,64 @@ mod tests {
         db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
         db::upsert_session(&conn, "s2", "default", "osaka", "myapp", "/tmp/osaka", "working").unwrap();
         db::upsert_session(&conn, "s3", "default", "tokyo", "myapp", "/tmp/tokyo", "idle").unwrap();
+        // 別 project のセッション（既定 project スコープから除外されることの確認用）
+        db::upsert_session(&conn, "s4", "default", "berlin", "other", "/tmp/berlin", "idle").unwrap();
 
         // scope: worktree → s1のworktree(osaka)のみ
         let result = list_sessions(&conn, "s1", &json!({"scope": "worktree"})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 2);
 
-        // scope: project → myapp全体
+        // scope: project → myapp全体（別 project の s4 は含まない）
         let result = list_sessions(&conn, "s1", &json!({"scope": "project"})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 3);
 
-        // scope: machine（デフォルト）→ 全件
+        // デフォルト → project スコープ。別 project の s4 は出ない
         let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        let ids: Vec<&str> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains(&"s4"), "default scope must be project, got: {:?}", ids);
+
+        // scope: machine → 別 project も含め全件
+        let result = list_sessions(&conn, "s1", &json!({"scope": "machine"})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
-        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions.len(), 4);
+    }
+
+    #[test]
+    fn test_list_sessions_background_pointer_by_default_and_bodies_on_request() {
+        // worktree に過去会話ログがあると、既定では本文を返さず件数ポインタのみ。
+        // include_bodies:true のときだけフル本文 (conversation_summaries) を返す。
+        let workspaces = crate::config::workspaces_dir();
+        let cwd = workspaces
+            .join("proj-z")
+            .join("wt-z")
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt-z", "proj-z", &cwd, "idle").unwrap();
+        db::upsert_conversation_log(&conn, "old", "wt-z", "proj-z", None, "[]").unwrap();
+        db::update_conversation_log_summary(&conn, "old", "past summary text").unwrap();
+
+        // 既定: background ポインタのみ、本文キーは無し
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        assert!(result.get("conversation_summaries").is_none());
+        assert!(result.get("worktree_contexts").is_none());
+        let bg = result.get("background").expect("background pointer expected");
+        assert_eq!(bg["conversation_summary_count"], 1);
+
+        // include_bodies:true: フル本文を返す
+        let result = list_sessions(&conn, "s1", &json!({"include_bodies": true})).unwrap();
+        assert!(result.get("background").is_none());
+        let summaries = result["conversation_summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["summary"], "past summary text");
     }
 
     #[test]
@@ -836,7 +895,7 @@ mod tests {
         db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
         db::update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
 
-        let result = list_sessions(&conn, "s2", &json!({})).unwrap();
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions[0]["alert"], true);
         assert_eq!(sessions[0]["alert_message"], "CI failed");

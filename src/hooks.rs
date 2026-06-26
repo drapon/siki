@@ -227,9 +227,11 @@ worktree is doing.
 
 Other tools you can use:
 
-- `siki:list_sessions` — list sessions in the project / worktree / machine and
-  read full conversation summaries and worktree context bodies. Use this only
-  when you need that content for the current task.
+- `siki:list_sessions` — list sessions (defaults to the current project; pass
+  `scope: "worktree" | "machine"` to narrow or widen). Prior conversation
+  summaries and worktree context files are returned as counts only under
+  `background`; pass `include_bodies: true` to fetch the full bodies, and only
+  when the current task needs them.
 - `siki:get_context` — pull state for a specific session/worktree. Always pass
   `target: { type: "session"|"worktree"|"project", id: "<name>" }`. Passing
   `include_conversation_log: true` returns the full message log, which can be

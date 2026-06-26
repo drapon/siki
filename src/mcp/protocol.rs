@@ -64,14 +64,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "list_sessions".to_string(),
-            description: "List all active siki-managed Claude Code sessions".to_string(),
+            description: "List active siki-managed Claude Code sessions in the current project (use scope to widen/narrow). Background (prior conversation summaries and worktree context files) is returned as counts only by default; pass include_bodies:true to fetch the full bodies.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "scope": {
                         "type": "string",
                         "enum": ["machine", "project", "worktree"],
-                        "description": "Filter scope (default: machine)"
+                        "description": "Filter scope for the returned sessions (default: project). 'machine' = all worktrees/projects on this machine, 'project' = current project, 'worktree' = current worktree only."
+                    },
+                    "include_bodies": {
+                        "type": "boolean",
+                        "description": "Include full conversation summaries and worktree context file bodies (default: false). These grow unbounded over a worktree's life, so by default only counts are returned under 'background'. Set true only when the current task needs the bodies."
                     }
                 }
             }),
