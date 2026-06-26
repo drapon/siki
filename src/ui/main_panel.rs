@@ -4,6 +4,14 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Claude ターミナルの下部（ボーダー内側）に確保する余白（行数）
+///
+/// Claude Code の新 UI は入力欄の下に "auto mode on" などのステータス行を描画する。
+/// 余白が無いと最下行がボーダーに張り付いて見切れてしまうため、PTY 行数を内側領域より
+/// この行数だけ小さくし、ボーダーの内側に空行を作る。ボーダー自体は縮めないので、
+/// 中央ペインの枠は左右パネルの枠と揃ったままになる。
+pub const CLAUDE_TERMINAL_BOTTOM_PADDING: u16 = 1;
+
 /// コマンド名の先頭を大文字にする
 fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
