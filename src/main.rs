@@ -4641,9 +4641,14 @@ fn resize_terminals(
     siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
     layout: &ui::layout::AppLayout,
 ) {
-    // Claude ターミナル: main パネルからタブバー(2行) + ボーダー(2行2列) を引いた内部サイズ
+    // Claude ターミナル: main パネルからヘッダー(1行) + タブバー(2行) + ボーダー(2行2列)
+    // + 下部余白 を引いた内部サイズ
     let claude_cols = layout.main.width.saturating_sub(2);
-    let claude_rows = layout.main.height.saturating_sub(4); // tab bar 2 + border 2
+    let claude_rows = layout
+        .main
+        .height
+        .saturating_sub(5) // header 1 + tab bar 2 + border 2
+        .saturating_sub(ui::main_panel::CLAUDE_TERMINAL_BOTTOM_PADDING);
 
     // 右下ターミナル: ボーダー(2行2列) を引いた内部サイズ
     let term_cols = layout.right_bottom.width.saturating_sub(2);
