@@ -203,9 +203,43 @@ fn broadcast(conn: &Connection, params: &Value, from_session: &str) -> Result<Va
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("message is required"))?;
 
-    db::insert_message(conn, from_session, None, None, None, message, "message", None)?;
+    // 既定スコープは "project"（スキーマの宣言に合わせる）。送信元と同じ project の
+    // セッションにのみ配信する。"machine" は全 NULL でマシン全体へ送る。
+    let scope = params
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("project");
+    match scope {
+        "machine" | "project" => {}
+        _ => anyhow::bail!("Invalid scope: {} (expected \"machine\" or \"project\")", scope),
+    }
 
-    Ok(json!({ "delivered": true }))
+    // project スコープでは送信元の project を sessions から引く。送信元が未登録で
+    // project を特定できない場合は machine 扱い（全 NULL）にフォールバックし、
+    // メッセージを取りこぼさないようにする。
+    let to_project: Option<String> = if scope == "project" {
+        db::list_sessions(conn)?
+            .iter()
+            .find(|s| s.session_id == from_session)
+            .map(|s| s.project_name.clone())
+            .filter(|p| !p.is_empty())
+    } else {
+        None
+    };
+
+    db::insert_message(
+        conn,
+        from_session,
+        None,
+        None,
+        to_project.as_deref(),
+        message,
+        "message",
+        None,
+    )?;
+
+    let effective_scope = if to_project.is_some() { "project" } else { "machine" };
+    Ok(json!({ "delivered": true, "scope": effective_scope }))
 }
 
 fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
@@ -880,14 +914,60 @@ mod tests {
 
     #[test]
     fn test_broadcast() {
+        // 送信元が未登録の場合、project スコープは project を特定できず machine に
+        // フォールバックする（全 NULL）。よって別 worktree/project の受信者にも届く。
         let conn = test_db();
         let params = json!({ "message": "hello everyone" });
         let result = broadcast(&conn, &params, "s1").unwrap();
         assert_eq!(result["delivered"], true);
+        assert_eq!(result["scope"], "machine");
 
         let msgs = db::get_pending_messages(&conn, "s2", "wt", "proj").unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello everyone");
+    }
+
+    #[test]
+    fn test_broadcast_project_scope_limits_to_sender_project() {
+        let conn = test_db();
+        // 送信元 sender は myapp に登録済み
+        db::upsert_session(&conn, "sender", "default", "osaka", "myapp", "/tmp/o", "idle").unwrap();
+
+        // 既定（project）で broadcast → 送信元の project (myapp) 宛
+        let result = broadcast(&conn, &json!({ "message": "team only" }), "sender").unwrap();
+        assert_eq!(result["scope"], "project");
+
+        // 同 project の別セッションは受信できる（to_project = myapp に一致）
+        let same = db::get_pending_messages(&conn, "peer", "tokyo", "myapp").unwrap();
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].content, "team only");
+
+        // 別 project のセッションには届かない
+        let other = db::get_pending_messages(&conn, "outsider", "berlin", "other").unwrap();
+        assert_eq!(other.len(), 0);
+    }
+
+    #[test]
+    fn test_broadcast_machine_scope_reaches_all_projects() {
+        let conn = test_db();
+        db::upsert_session(&conn, "sender", "default", "osaka", "myapp", "/tmp/o", "idle").unwrap();
+
+        let result =
+            broadcast(&conn, &json!({ "message": "all hands", "scope": "machine" }), "sender")
+                .unwrap();
+        assert_eq!(result["scope"], "machine");
+
+        // 別 project のセッションにも届く
+        let other = db::get_pending_messages(&conn, "outsider", "berlin", "other").unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].content, "all hands");
+    }
+
+    #[test]
+    fn test_broadcast_rejects_invalid_scope() {
+        let conn = test_db();
+        let result = broadcast(&conn, &json!({ "message": "x", "scope": "worktree" }), "s1");
+        assert!(result.is_err());
     }
 
     #[test]

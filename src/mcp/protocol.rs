@@ -101,7 +101,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "broadcast".to_string(),
-            description: "Broadcast a message to all sessions".to_string(),
+            description: "Broadcast a message to other sessions. By default (scope: project) only sessions in the sender's project receive it; scope: machine reaches every session on the machine.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -109,7 +109,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "scope": {
                         "type": "string",
                         "enum": ["machine", "project"],
-                        "description": "Broadcast scope (default: project)"
+                        "description": "Broadcast scope (default: project). 'project' = only sessions in the sender's project; 'machine' = every session on the machine. If the sender's project cannot be determined (unregistered), 'project' falls back to 'machine'."
                     }
                 },
                 "required": ["message"]
