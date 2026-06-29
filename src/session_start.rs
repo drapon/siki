@@ -283,7 +283,7 @@ pub fn build_additional_context(conn: &Connection, session_id: &str, cwd: &str) 
             }
             s.push_str(
                 "\nFetch only what the current task needs:\n\
-                - `siki:list_sessions { scope: \"worktree\" }` returns summaries and context bodies.\n\
+                - `siki:list_sessions { include_bodies: true }` returns the full conversation summaries and context bodies (by default it returns counts only).\n\
                 - `siki:get_context { target: { type: \"worktree\", id: \"<name>\" }, include_conversation_log: true }` is large — call it via an Explore or general-purpose subagent so the full log stays out of your main context.\n",
             );
             sections.push(s);

@@ -154,7 +154,7 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
             "conversation_summary_count": summaries.len(),
             "worktree_context_files": contexts.len(),
             "worktree_context_kb": (total_bytes + 512) / 1024,
-            "hint": "Pass include_bodies:true (with scope:\"worktree\") to fetch full conversation summaries and worktree context bodies. These can be large — prefer fetching only when the current task needs them.",
+            "hint": "Pass include_bodies:true to fetch the full conversation summaries and worktree context bodies (independent of scope). These can be large — prefer fetching only when the current task needs them.",
         });
     }
 
@@ -604,6 +604,8 @@ mod tests {
         let result = list_sessions(&conn, "me", &json!({})).unwrap();
         assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
         assert_eq!(result["pending_messages"].as_array().unwrap().len(), 0);
+        // データが無ければ background ポインタは付かない
+        assert!(result.get("background").is_none());
     }
 
     #[test]
@@ -767,6 +769,57 @@ mod tests {
         let summaries = result["conversation_summaries"].as_array().unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0]["summary"], "past summary text");
+    }
+
+    #[test]
+    fn test_list_sessions_context_files_pointer_and_bodies() {
+        // worktree context .md がある場合: 既定では background の件数ポインタ
+        // (worktree_context_files / worktree_context_kb) のみ、include_bodies:true で
+        // worktree_contexts に本文をシリアライズして返すことを検証する。
+        // load_contexts は実ファイルシステム (workspaces_dir 配下) を読むため、
+        // 衝突しない一意な proj/wt 名で実ファイルを作り、結果取得後に必ず削除する。
+        let proj = "ctxtest-proj";
+        let wt = "ctxtest-wt";
+        let ctx_dir = crate::config::worktree_contexts_dir(proj, wt);
+        std::fs::create_dir_all(&ctx_dir).unwrap();
+        std::fs::write(ctx_dir.join("alpha.md"), "alpha body").unwrap();
+        std::fs::write(ctx_dir.join("beta.md"), "beta body content").unwrap();
+
+        let cwd = crate::config::workspaces_dir()
+            .join(proj)
+            .join(wt)
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", wt, proj, &cwd, "idle").unwrap();
+
+        // 結果を取得してから（panic でファイルが残らないよう）後始末する
+        let default_result = list_sessions(&conn, "s1", &json!({}));
+        let bodies_result = list_sessions(&conn, "s1", &json!({"include_bodies": true}));
+        std::fs::remove_dir_all(&ctx_dir).ok();
+
+        // 既定: 本文キーは無く、background に件数ポインタ
+        let default_result = default_result.unwrap();
+        assert!(default_result.get("worktree_contexts").is_none());
+        let bg = default_result
+            .get("background")
+            .expect("background pointer expected");
+        assert_eq!(bg["worktree_context_files"], 2);
+        // "alpha body"(10) + "beta body content"(17) = 27 bytes → (27+512)/1024 = 0 KB
+        assert_eq!(bg["worktree_context_kb"], 0);
+
+        // include_bodies:true: worktree_contexts に本文を返す（名前順 alpha, beta）
+        let bodies_result = bodies_result.unwrap();
+        assert!(bodies_result.get("background").is_none());
+        let wc = &bodies_result["worktree_contexts"];
+        assert_eq!(wc["project"], proj);
+        assert_eq!(wc["worktree"], wt);
+        let items = wc["contexts"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], "alpha");
+        assert_eq!(items[0]["content"], "alpha body");
+        assert_eq!(items[1]["name"], "beta");
+        assert_eq!(items[1]["content"], "beta body content");
     }
 
     #[test]
