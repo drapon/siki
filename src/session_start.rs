@@ -256,8 +256,9 @@ pub fn build_additional_context(conn: &Connection, session_id: &str, cwd: &str) 
     }
 
     if valid_worktree {
+        // 件数しか使わないため messages 本文を載せない軽量クエリを使う。
         let summaries =
-            db::get_conversation_logs_by_worktree(conn, &wt, &proj).unwrap_or_default();
+            db::get_conversation_log_summaries_by_worktree(conn, &wt, &proj).unwrap_or_default();
         let contexts = crate::config::load_contexts(&proj, &wt);
 
         let mut lines: Vec<String> = Vec::new();

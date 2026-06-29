@@ -397,6 +397,15 @@ pub struct ConversationLogRow {
     pub created_at: i64,
 }
 
+/// 会話ログのうち `messages` 本文を除いた軽量行。件数・サマリ一覧用。
+#[derive(Debug, Clone)]
+pub struct ConversationLogSummaryRow {
+    pub session_id: String,
+    pub branch: Option<String>,
+    pub summary: Option<String>,
+    pub created_at: i64,
+}
+
 /// 会話ログを保存する（UPSERT）
 pub fn upsert_conversation_log(
     conn: &Connection,
@@ -452,6 +461,37 @@ pub fn get_conversation_logs_by_worktree(
             messages: row.get(4)?,
             summary: row.get(5)?,
             created_at: row.get(6)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// 会話ログのサマリ情報を worktree 単位で取得する（古い順）。
+///
+/// `get_conversation_logs_by_worktree` と異なり、肥大化しがちな `messages` 本文を
+/// SELECT しない軽量版。件数表示やサマリ一覧のように本文が不要な経路で使う
+/// （`messages` を載せると 100KB 級の行をメモリに展開してしまうため）。
+pub fn get_conversation_log_summaries_by_worktree(
+    conn: &Connection,
+    worktree_name: &str,
+    project_name: &str,
+) -> Result<Vec<ConversationLogSummaryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, branch, summary, created_at
+         FROM conversation_logs
+         WHERE worktree_name = ?1 AND project_name = ?2
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![worktree_name, project_name], |row| {
+        Ok(ConversationLogSummaryRow {
+            session_id: row.get(0)?,
+            branch: row.get(1)?,
+            summary: row.get(2)?,
+            created_at: row.get(3)?,
         })
     })?;
     let mut result = Vec::new();

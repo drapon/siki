@@ -112,13 +112,22 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
     } else {
         Vec::new()
     };
+    // messages 本文を載せない軽量クエリを使う（件数・サマリのみ必要なため）。
+    // DB エラーは握り潰さず呼び出し元へ伝播させる（同関数冒頭の db::list_sessions(conn)? と一貫）。
     let summaries = if valid_worktree {
-        db::get_conversation_logs_by_worktree(conn, wt, proj).unwrap_or_default()
+        db::get_conversation_log_summaries_by_worktree(conn, wt, proj)?
     } else {
         Vec::new()
     };
 
     let mut result = json!({ "sessions": items, "pending_messages": messages });
+
+    // 呼び出し元セッションが DB 未登録（siki TUI 未起動など）の場合、project/worktree
+    // スコープでは自分の proj/wt を特定できず sessions が空になる。黙って空を返すと
+    // 原因が分からないため、診断フラグを添えて scope:"machine" への切り替えを促す。
+    if my_worktree.is_none() {
+        result["caller_unregistered"] = json!(true);
+    }
 
     if include_bodies {
         // 明示要求時のみフル本文を返す。
@@ -739,6 +748,31 @@ mod tests {
         let result = list_sessions(&conn, "s1", &json!({"scope": "machine"})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 4);
+    }
+
+    #[test]
+    fn test_list_sessions_unregistered_caller() {
+        // 呼び出し元が DB 未登録の場合、project 既定スコープでは proj を特定できず
+        // sessions が空になる。診断フラグ caller_unregistered が付くこと、
+        // scope:"machine" を明示すれば全件見えることを保証する。
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
+        db::upsert_session(&conn, "s2", "default", "tokyo", "myapp", "/tmp/tokyo", "idle").unwrap();
+
+        // 未登録の "ghost" が既定（project）で呼ぶ → 空 + caller_unregistered
+        let result = list_sessions(&conn, "ghost", &json!({})).unwrap();
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(result["caller_unregistered"], true);
+
+        // scope:"machine" を明示すれば全件返る
+        let result = list_sessions(&conn, "ghost", &json!({"scope": "machine"})).unwrap();
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
+        // machine でも未登録であることは変わらないので診断は付く
+        assert_eq!(result["caller_unregistered"], true);
+
+        // 登録済み呼び出し元には診断フラグは付かない
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        assert!(result.get("caller_unregistered").is_none());
     }
 
     #[test]
