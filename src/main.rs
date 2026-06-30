@@ -78,7 +78,12 @@ async fn main() -> Result<()> {
         println!("Usage: siki [OPTIONS] [COMMAND]");
         println!();
         println!("Commands:");
-        println!("  list           List projects and worktrees");
+        println!("  new [proj] [name] [--base <ref>]   Create a worktree (prompts if args omitted)");
+        println!("  run [proj] [name] [--base <ref>] [--resume] [-- <llm args>]");
+        println!("                                     Launch the LLM in a worktree (creates if missing)");
+        println!("  rm  [proj] [name] [--yes]          Remove a worktree (confirms unless --yes)");
+        println!("  path <proj> <name>                 Print the worktree's absolute path");
+        println!("  list [proj]                        List projects and worktrees");
         println!("  mcp            Start MCP stdio server");
         println!("  session-start  Internal: SessionStart hook (reads stdin, emits additionalContext)");
         println!("  hook-event <s> Internal: state hook (reads stdin session_id, notifies broker)");
@@ -90,20 +95,16 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // サブコマンド: siki list → プロジェクト一覧を表示
-    if args.len() > 1 && args[1] == "list" {
-        let projects = config::discover_projects();
-        if projects.is_empty() {
-            println!("No projects found.");
-        } else {
-            for p in &projects {
-                println!("{} ({})", p.name, p.path);
-                for w in &p.worktrees {
-                    println!("  └ {} [{}]", w.name, w.branch);
-                }
-            }
+    // 操作系サブコマンド（TUI を起動せず worktree / セッションを操作）
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "new" => return cli::cmd_new(&args[2..]),
+            "run" => return cli::cmd_run(&args[2..]),
+            "rm" => return cli::cmd_rm(&args[2..]),
+            "path" => return cli::cmd_path(&args[2..]),
+            "list" => return cli::cmd_list(&args[2..]),
+            _ => {}
         }
-        return Ok(());
     }
 
     // サブコマンド: siki mcp → MCP stdio サーバーを起動

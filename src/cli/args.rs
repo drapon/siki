@@ -7,9 +7,6 @@
 //! サブコマンドは許可する値フラグ・真偽フラグの集合を明示的に渡す。集合に無い `--xxx` は
 //! エラーにするため、フラグ名のタイポ（`--reume` 等）を黙って positional に落とさず弾ける。
 
-// TASK-0003〜0007 で各サブコマンドから利用するまでの暫定（TASK-0007 で除去）。
-#![allow(dead_code)]
-
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 

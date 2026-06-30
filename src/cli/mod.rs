@@ -6,14 +6,12 @@
 //! 引数不足時は run / new / rm が対話セレクタ（[`prompt`]）で補完する 2 モード方式。
 //! `path` / `list` はスクリプト連携のため非対話。
 
-// 後続タスク（TASK-0004〜0007）で各コマンドを実装・結線するまでの暫定。
-#![allow(dead_code)]
-
 pub mod args;
 pub mod prompt;
 
 use anyhow::{bail, Result};
 use args::ArgScan;
+use prompt::SelectItem;
 use std::path::{Path, PathBuf};
 
 use crate::{config, git, hooks};
@@ -25,13 +23,19 @@ struct ResolvedProject {
     path: PathBuf,
 }
 
-/// プロジェクト一覧から名前で完全一致のものを探す（純粋関数）。
+impl ResolvedProject {
+    fn from_cfg(cfg: &config::ProjectConfig) -> Self {
+        Self {
+            name: cfg.name.clone(),
+            path: PathBuf::from(&cfg.path),
+        }
+    }
+}
+
+/// プロジェクト一覧から名前で完全一致のインデックスを探す（純粋関数）。
 /// 見つからない場合は利用可能なプロジェクト名を列挙したエラーを返す。
-fn find_project<'a>(
-    projects: &'a [config::ProjectConfig],
-    name: &str,
-) -> Result<&'a config::ProjectConfig> {
-    projects.iter().find(|p| p.name == name).ok_or_else(|| {
+fn find_project_index(projects: &[config::ProjectConfig], name: &str) -> Result<usize> {
+    projects.iter().position(|p| p.name == name).ok_or_else(|| {
         let avail: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
         let avail = if avail.is_empty() {
             "なし".to_string()
@@ -42,20 +46,67 @@ fn find_project<'a>(
     })
 }
 
-/// プロジェクト名を解決する。`None` の場合は対話補完（TASK-0007 で実装）。
-fn resolve_project(name: Option<&str>) -> Result<ResolvedProject> {
-    let projects = config::discover_projects();
-    match name {
-        Some(n) => {
-            let p = find_project(&projects, n)?;
-            Ok(ResolvedProject {
-                name: p.name.clone(),
-                path: PathBuf::from(&p.path),
-            })
+/// プロジェクトを解決する。`None` の場合は対話セレクタで選択する。
+fn resolve_project_cfg(name: Option<&str>) -> Result<config::ProjectConfig> {
+    let mut projects = config::discover_projects();
+    let idx = match name {
+        Some(n) => find_project_index(&projects, n)?,
+        None => {
+            if projects.is_empty() {
+                bail!("プロジェクトが見つかりません（~/.siki/workspaces 配下に git リポジトリがありません）");
+            }
+            let items: Vec<SelectItem> = projects
+                .iter()
+                .map(|p| SelectItem::new(p.name.clone(), Some(p.path.clone())))
+                .collect();
+            prompt::select_one("プロジェクトを選択", &items)?
+                .ok_or_else(|| anyhow::anyhow!("中止しました"))?
         }
-        // TASK-0007 で prompt::select_one による選択に置き換える。
-        None => bail!("プロジェクト名を指定してください"),
+    };
+    Ok(projects.swap_remove(idx))
+}
+
+/// 対話で選んだ worktree。
+enum WtChoice {
+    Existing(String),
+    New(String),
+}
+
+/// worktree を対話で選ぶ。`allow_new=true` のとき先頭に「＋ 新規作成…」を出す。
+fn pick_worktree(cfg: &config::ProjectConfig, allow_new: bool) -> Result<WtChoice> {
+    let mut items: Vec<SelectItem> = Vec::new();
+    if allow_new {
+        items.push(SelectItem::new("＋ 新規作成…", None));
     }
+    for w in &cfg.worktrees {
+        items.push(SelectItem::new(w.name.clone(), Some(format!("[{}]", w.branch))));
+    }
+    if items.is_empty() {
+        bail!("worktree がありません: {}", cfg.name);
+    }
+
+    let idx = prompt::select_one(&format!("worktree を選択  ({})", cfg.name), &items)?
+        .ok_or_else(|| anyhow::anyhow!("中止しました"))?;
+
+    if allow_new && idx == 0 {
+        let name = prompt::input_line("新しい worktree 名", None)?;
+        if name.is_empty() {
+            bail!("worktree 名が空です");
+        }
+        Ok(WtChoice::New(name))
+    } else {
+        let offset = usize::from(allow_new);
+        Ok(WtChoice::Existing(cfg.worktrees[idx - offset].name.clone()))
+    }
+}
+
+/// base branch を決める。`--base` 指定があればそれ、無ければ対話で入力（既定値あり）。
+fn interactive_base(base: Option<&str>, proj: &ResolvedProject) -> Result<String> {
+    if let Some(b) = base {
+        return Ok(b.to_string());
+    }
+    let default = config::resolve_base_branch(&proj.path, &proj.name);
+    prompt::input_line("base branch", Some(&default))
 }
 
 /// worktree を指定パスに作成するテスト可能なコア。
@@ -133,19 +184,26 @@ fn create_worktree(proj: &ResolvedProject, name: &str, base: Option<&str>) -> Re
     Ok(wt_path)
 }
 
-/// `siki new <project> <name> [--base <ref>]`
+/// `siki new [project] [name] [--base <ref>]`（不足分は対話補完）
 pub fn cmd_new(args: &[String]) -> Result<()> {
     let scan = ArgScan::parse(args, &["--base"], &[])?;
     let pos = scan.positionals_opt(2)?;
-    let project = pos.first().map(|s| s.as_str());
-    // TASK-0007 で name 不足時に対話補完する。現状は必須。
-    let name = pos
-        .get(1)
-        .map(|s| s.as_str())
-        .ok_or_else(|| anyhow::anyhow!("worktree 名を指定してください"))?;
+    let cfg = resolve_project_cfg(pos.first().map(|s| s.as_str()))?;
+    let proj = ResolvedProject::from_cfg(&cfg);
+    let base = scan.value("--base");
 
-    let proj = resolve_project(project)?;
-    let path = create_worktree(&proj, name, scan.value("--base"))?;
+    let path = match pos.get(1).map(|s| s.as_str()) {
+        Some(name) => create_worktree(&proj, name, base)?,
+        None => {
+            // 対話: worktree 名と base を入力。
+            let name = prompt::input_line("新しい worktree 名", None)?;
+            if name.is_empty() {
+                bail!("worktree 名が空です");
+            }
+            let base = interactive_base(base, &proj)?;
+            create_worktree(&proj, &name, Some(&base))?
+        }
+    };
     println!("{}", path.display());
     Ok(())
 }
@@ -159,20 +217,31 @@ fn remove_worktree_at(project_path: &Path, wt_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `siki rm <project> <name>`
+/// `siki rm [project] [name] [--yes]`（不足分は対話補完。既定で削除確認、`--yes` で省略）
 pub fn cmd_rm(args: &[String]) -> Result<()> {
-    let scan = ArgScan::parse(args, &[], &[])?;
+    let scan = ArgScan::parse(args, &[], &["--yes"])?;
     let pos = scan.positionals_opt(2)?;
-    let project = pos.first().map(|s| s.as_str());
-    // TASK-0007 で name 不足時に対話補完＋削除確認を入れる。現状は必須・確認なし。
-    let name = pos
-        .get(1)
-        .map(|s| s.as_str())
-        .ok_or_else(|| anyhow::anyhow!("worktree 名を指定してください"))?;
+    let cfg = resolve_project_cfg(pos.first().map(|s| s.as_str()))?;
+    let proj = ResolvedProject::from_cfg(&cfg);
 
-    let proj = resolve_project(project)?;
-    validate_worktree_name(name)?;
-    let wt_path = config::worktree_path(&proj.name, name);
+    let name = match pos.get(1).map(|s| s.as_str()) {
+        Some(n) => n.to_string(),
+        None => match pick_worktree(&cfg, false)? {
+            WtChoice::Existing(n) => n,
+            WtChoice::New(_) => unreachable!("allow_new=false"),
+        },
+    };
+    validate_worktree_name(&name)?;
+    let wt_path = config::worktree_path(&proj.name, &name);
+
+    // 既定で削除確認（誤削除防止）。--yes でスキップ。非対話/パイプでは空入力→中止。
+    if !scan.has("--yes")
+        && !prompt::confirm(&format!("worktree '{}' を削除しますか？", name), false)?
+    {
+        eprintln!("中止しました");
+        return Ok(());
+    }
+
     remove_worktree_at(&proj.path, &wt_path)?;
     println!("worktree を削除しました: {}", wt_path.display());
     Ok(())
@@ -182,7 +251,8 @@ pub fn cmd_rm(args: &[String]) -> Result<()> {
 pub fn cmd_path(args: &[String]) -> Result<()> {
     let scan = ArgScan::parse(args, &[], &[])?;
     let pos = scan.positionals(2)?;
-    let proj = resolve_project(Some(&pos[0]))?;
+    let cfg = resolve_project_cfg(Some(&pos[0]))?;
+    let proj = ResolvedProject::from_cfg(&cfg);
     let name = &pos[1];
     validate_worktree_name(name)?;
     let wt_path = config::worktree_path(&proj.name, name);
@@ -303,19 +373,24 @@ fn exec_llm(proj: &ResolvedProject, wt_path: &Path, resume: bool, passthrough: &
     bail!("{} の起動に失敗しました: {}", llm, err)
 }
 
-/// `siki run <project> <name> [--base <ref>] [--resume] [-- <llm args>]`
+/// `siki run [project] [name] [--base <ref>] [--resume] [-- <llm args>]`（不足分は対話補完）
 pub fn cmd_run(args: &[String]) -> Result<()> {
     let scan = ArgScan::parse(args, &["--base"], &["--resume"])?;
     let pos = scan.positionals_opt(2)?;
-    let project = pos.first().map(|s| s.as_str());
-    // TASK-0007 で name 不足時に対話補完する。現状は必須。
-    let name = pos
-        .get(1)
-        .map(|s| s.as_str())
-        .ok_or_else(|| anyhow::anyhow!("worktree 名を指定してください"))?;
+    let cfg = resolve_project_cfg(pos.first().map(|s| s.as_str()))?;
+    let proj = ResolvedProject::from_cfg(&cfg);
+    let base = scan.value("--base");
 
-    let proj = resolve_project(project)?;
-    let wt_path = resolve_or_create_worktree(&proj, name, scan.value("--base"), true)?;
+    let wt_path = match pos.get(1).map(|s| s.as_str()) {
+        Some(name) => resolve_or_create_worktree(&proj, name, base, true)?,
+        None => match pick_worktree(&cfg, true)? {
+            WtChoice::Existing(name) => config::worktree_path(&proj.name, &name),
+            WtChoice::New(name) => {
+                let base = interactive_base(base, &proj)?;
+                create_worktree(&proj, &name, Some(&base))?
+            }
+        },
+    };
     exec_llm(&proj, &wt_path, scan.has("--resume"), scan.rest())
 }
 
@@ -377,10 +452,10 @@ mod tests {
     }
 
     #[test]
-    fn find_project_matches_and_errors() {
+    fn find_project_index_matches_and_errors() {
         let projects = vec![proj_cfg("alpha"), proj_cfg("beta")];
-        assert_eq!(find_project(&projects, "beta").unwrap().name, "beta");
-        assert!(find_project(&projects, "gamma").is_err());
+        assert_eq!(find_project_index(&projects, "beta").unwrap(), 1);
+        assert!(find_project_index(&projects, "gamma").is_err());
     }
 
     #[test]

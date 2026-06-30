@@ -9,9 +9,6 @@
 //! 切り詰めて折り返しを防ぐ（長い branch 名対策）。項目数が端末高さを超えるケースは
 //! スクロールにより崩れうる既知の制約（worktree 数は通常小さい前提）。
 
-// TASK-0007 で各サブコマンドの対話フォールバックに結線するまでの暫定。
-#![allow(dead_code)]
-
 use anyhow::{bail, Result};
 use crossterm::{
     cursor,
