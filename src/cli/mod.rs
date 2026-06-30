@@ -150,19 +150,81 @@ pub fn cmd_new(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// worktree を削除するテスト可能なコア（不在はエラー）。
+fn remove_worktree_at(project_path: &Path, wt_path: &Path) -> Result<()> {
+    if !wt_path.exists() {
+        bail!("worktree が見つかりません: {}", wt_path.display());
+    }
+    git::WorktreeManager::remove_worktree(project_path, wt_path)?;
+    Ok(())
+}
+
 /// `siki rm <project> <name>`
-pub fn cmd_rm(_args: &[String]) -> Result<()> {
-    unimplemented!("TASK-0004 / TASK-0007")
+pub fn cmd_rm(args: &[String]) -> Result<()> {
+    let scan = ArgScan::parse(args, &[], &[])?;
+    let pos = scan.positionals_opt(2)?;
+    let project = pos.first().map(|s| s.as_str());
+    // TASK-0007 で name 不足時に対話補完＋削除確認を入れる。現状は必須・確認なし。
+    let name = pos
+        .get(1)
+        .map(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("worktree 名を指定してください"))?;
+
+    let proj = resolve_project(project)?;
+    validate_worktree_name(name)?;
+    let wt_path = config::worktree_path(&proj.name, name);
+    remove_worktree_at(&proj.path, &wt_path)?;
+    println!("worktree を削除しました: {}", wt_path.display());
+    Ok(())
 }
 
-/// `siki path <project> <name>`
-pub fn cmd_path(_args: &[String]) -> Result<()> {
-    unimplemented!("TASK-0004")
+/// `siki path <project> <name>` — worktree の絶対パスを stdout に出力（非対話）。
+pub fn cmd_path(args: &[String]) -> Result<()> {
+    let scan = ArgScan::parse(args, &[], &[])?;
+    let pos = scan.positionals(2)?;
+    let proj = resolve_project(Some(&pos[0]))?;
+    let name = &pos[1];
+    validate_worktree_name(name)?;
+    let wt_path = config::worktree_path(&proj.name, name);
+    if !wt_path.exists() {
+        bail!("worktree が見つかりません: {}", wt_path.display());
+    }
+    println!("{}", wt_path.display());
+    Ok(())
 }
 
-/// `siki list [project]`
-pub fn cmd_list(_args: &[String]) -> Result<()> {
-    unimplemented!("TASK-0004")
+/// プロジェクト/worktree 一覧を整形する純粋関数。`filter` 指定時はそのプロジェクトのみ。
+fn format_listing(projects: &[config::ProjectConfig], filter: Option<&str>) -> String {
+    let mut out = String::new();
+    for p in projects {
+        if filter.is_some_and(|f| p.name != f) {
+            continue;
+        }
+        out.push_str(&format!("{} ({})\n", p.name, p.path));
+        for w in &p.worktrees {
+            out.push_str(&format!("  └ {} [{}]\n", w.name, w.branch));
+        }
+    }
+    out
+}
+
+/// `siki list [project]` — プロジェクト/worktree 一覧（非対話）。
+pub fn cmd_list(args: &[String]) -> Result<()> {
+    let scan = ArgScan::parse(args, &[], &[])?;
+    let pos = scan.positionals_opt(1)?;
+    let filter = pos.first().map(|s| s.as_str());
+
+    let projects = config::discover_projects();
+    let listing = format_listing(&projects, filter);
+    if listing.is_empty() {
+        match filter {
+            Some(f) => bail!("プロジェクトが見つかりません: {}", f),
+            None => println!("No projects found."),
+        }
+    } else {
+        print!("{}", listing);
+    }
+    Ok(())
 }
 
 /// worktree を解決する。不在かつ `create_if_missing` なら作成する。
@@ -319,6 +381,47 @@ mod tests {
         let projects = vec![proj_cfg("alpha"), proj_cfg("beta")];
         assert_eq!(find_project(&projects, "beta").unwrap().name, "beta");
         assert!(find_project(&projects, "gamma").is_err());
+    }
+
+    #[test]
+    fn remove_worktree_at_removes_and_errors() {
+        let repo = init_repo();
+        let holder = TempDir::new().unwrap();
+        let wt = holder.path().join("osaka");
+        create_worktree_at(repo.path(), &wt, "osaka", "HEAD", &[]).unwrap();
+        remove_worktree_at(repo.path(), &wt).unwrap();
+
+        let out = Command::new("git")
+            .args(["worktree", "list"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(!listing.contains("osaka"), "削除後も worktree が残存: {}", listing);
+
+        // 不在パスの削除はエラー
+        assert!(remove_worktree_at(repo.path(), &holder.path().join("none")).is_err());
+    }
+
+    #[test]
+    fn format_listing_filters_by_project() {
+        let mut a = proj_cfg("alpha");
+        a.worktrees = vec![config::WorktreeConfig {
+            name: "tokyo".to_string(),
+            branch: "feature/x".to_string(),
+        }];
+        let projects = vec![a, proj_cfg("beta")];
+
+        let all = format_listing(&projects, None);
+        assert!(all.contains("alpha (/tmp/x)"));
+        assert!(all.contains("  └ tokyo [feature/x]"));
+        assert!(all.contains("beta"));
+
+        let only = format_listing(&projects, Some("alpha"));
+        assert!(only.contains("alpha"));
+        assert!(!only.contains("beta"));
+
+        assert!(format_listing(&projects, Some("zzz")).is_empty());
     }
 
     #[test]
