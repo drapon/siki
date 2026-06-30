@@ -797,6 +797,21 @@ pub fn resolve_llms(config: &Config) -> Vec<String> {
     }
 }
 
+/// プロジェクトパスとプロジェクト名から base_branch を解決する
+///
+/// 解決順: siki.json > config.toml > "origin/main"。
+/// TUI（`main.rs`）と CLI（`cli`）の両方から共有する。
+pub fn resolve_base_branch(project_path: &Path, project_name: &str) -> String {
+    load_effective_siki_json(project_path, project_name)
+        .and_then(|sj| sj.base_branch)
+        .or_else(|| {
+            load_config(&default_config_path())
+                .ok()
+                .and_then(|c| c.siki.base_branch)
+        })
+        .unwrap_or_else(|| "origin/main".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

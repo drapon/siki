@@ -2,6 +2,7 @@ mod app;
 mod broker;
 mod claude;
 mod claude_history;
+mod cli;
 mod config;
 mod db;
 mod event;
@@ -687,7 +688,7 @@ async fn handle_event(
             if app.selected_worktree == Some(worktree_id) {
                 if let Some(wt) = app.worktree_by_id(worktree_id) {
                     let wt_path = wt.path.clone();
-                    let base = resolve_base_branch(&app.projects[worktree_id.0].path, &app.projects[worktree_id.0].name);
+                    let base = config::resolve_base_branch(&app.projects[worktree_id.0].path, &app.projects[worktree_id.0].name);
                     diff_view.load(&wt_path, &base);
                     local_changes.load(&wt_path);
                     source_tree.load(&wt_path);
@@ -1193,7 +1194,7 @@ async fn handle_event(
                                             // Done バッジをクリア（既読）
                                             clear_done_badges(session_registry, app, wt_id, broker_db);
                                             let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
-                                            let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                                            let base = config::resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                                             source_tree.load(&wt_path);
                                             diff_view.load(&wt_path, &base);
                                             local_changes.load(&wt_path);
@@ -1503,7 +1504,7 @@ async fn handle_event(
             if let Some(wt_id) = app.selected_worktree {
                 if let Some(wt) = app.worktree_by_id(wt_id) {
                     let wt_path = wt.path.clone();
-                    let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                    let base = config::resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                     diff_view.load(&wt_path, &base);
                     local_changes.load(&wt_path);
                     diff_view.refresh_spinner = ui::diff_view::REFRESH_SPINNER_TICKS;
@@ -2574,7 +2575,7 @@ fn handle_right_panel_tab_click(
     if new_mode == app::RightPanelMode::Diff {
         if let Some(wt) = app.worktree_by_id(wt_id) {
             let wt_path = wt.path.clone();
-            let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+            let base = config::resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
             diff_view.load(&wt_path, &base);
             local_changes.load(&wt_path);
         }
@@ -2742,7 +2743,7 @@ fn handle_left_panel_key(
 
                 // base_branch を解決: siki.json > config.toml > "origin/main"
                 let project_name = &app.projects[pi].name;
-                app.add_worktree_base_branch = resolve_base_branch(project_path, project_name);
+                app.add_worktree_base_branch = config::resolve_base_branch(project_path, project_name);
 
                 app.show_add_worktree_popup = true;
             }
@@ -2797,7 +2798,7 @@ fn handle_left_panel_key(
             };
             if let Some(pi) = project_index {
                 let project_path = app.projects[pi].path.clone();
-                let base = resolve_base_branch(&project_path, &app.projects[pi].name);
+                let base = config::resolve_base_branch(&project_path, &app.projects[pi].name);
                 let remote = base.split('/').next().unwrap_or("origin").to_string();
                 app.show_info(format!("Fetching {}...", remote));
                 let tx = event_tx.clone();
@@ -2962,7 +2963,7 @@ fn handle_left_panel_key(
                 clear_done_badges(session_registry, app, wt_id, broker_db);
                 // worktree のパスからソースツリーと diff を読み込む
                 let wt_path = app.worktree_by_id(wt_id).unwrap().path.clone();
-                let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                let base = config::resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                 source_tree.load(&wt_path);
                 diff_view.load(&wt_path, &base);
                 local_changes.load(&wt_path);
@@ -5082,7 +5083,7 @@ fn handle_right_panel_key(
                     if let Some(wt_id) = app.selected_worktree {
                         if let Some(wt) = app.worktree_by_id(wt_id) {
                             let wt_path = wt.path.clone();
-                            let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                            let base = config::resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                             diff_view.load(&wt_path, &base);
                             local_changes.load(&wt_path);
                             diff_view.refresh_spinner = ui::diff_view::REFRESH_SPINNER_TICKS;
@@ -5286,7 +5287,7 @@ fn load_right_panel_data_if_needed(
             match wt.right_panel_mode {
                 app::RightPanelMode::Diff => {
                     let wt_path = wt.path.clone();
-                    let base = resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
+                    let base = config::resolve_base_branch(&app.projects[wt_id.0].path, &app.projects[wt_id.0].name);
                     diff_view.load(&wt_path, &base);
                     local_changes.load(&wt_path);
                 }
@@ -5325,18 +5326,6 @@ fn sync_right_panel_context_items(app: &mut app::App) {
             }
         }
     }
-}
-
-/// プロジェクトパスとプロジェクト名から base_branch を解決する
-fn resolve_base_branch(project_path: &std::path::Path, project_name: &str) -> String {
-    config::load_effective_siki_json(project_path, project_name)
-        .and_then(|sj| sj.base_branch)
-        .or_else(|| {
-            config::load_config(&config::default_config_path())
-                .ok()
-                .and_then(|c| c.siki.base_branch)
-        })
-        .unwrap_or_else(|| "origin/main".to_string())
 }
 
 /// `gh` の statusCheckRollup 要素が失敗を示すか判定する
