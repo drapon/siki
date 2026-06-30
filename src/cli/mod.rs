@@ -133,8 +133,24 @@ fn create_worktree_at(
     Ok(())
 }
 
+/// setup スクリプトに渡す `SIKI_*` 環境変数を組み立てる純粋関数（TUI の run_siki_script と同セット）。
+/// worktree 名は wt_path の末尾要素から取る。
+fn setup_env(proj: &ResolvedProject, wt_path: &Path) -> Vec<(&'static str, String)> {
+    let wt_name = wt_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    vec![
+        ("SIKI_PROJECT_PATH", proj.path.to_string_lossy().into_owned()),
+        ("SIKI_WORKTREE_PATH", wt_path.to_string_lossy().into_owned()),
+        ("SIKI_WORKTREE_NAME", wt_name),
+    ]
+}
+
 /// siki.json の setup スクリプトがあれば worktree dir で実行する（inherited stdio）。
 /// 失敗しても worktree 作成自体は成功扱いとし、警告のみ表示する。
+/// TUI と同様に `SIKI_*` 環境変数を注入する。エラー文にはスクリプト全文を載せない
+/// （setup に直書きされたトークン等が CI ログ/スクロールバックに漏れるのを防ぐ）。
 fn run_setup_script(proj: &ResolvedProject, wt_path: &Path) {
     let Some(sj) = config::load_effective_siki_json(&proj.path, &proj.name) else {
         return;
@@ -146,11 +162,12 @@ fn run_setup_script(proj: &ResolvedProject, wt_path: &Path) {
         .arg("-c")
         .arg(&setup)
         .current_dir(wt_path)
+        .envs(setup_env(proj, wt_path))
         .status();
     match status {
         Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("setup スクリプトが非ゼロ終了しました（{}）: {}", s, setup),
-        Err(e) => eprintln!("setup スクリプトの実行に失敗しました（{}）: {}", e, setup),
+        Ok(s) => eprintln!("setup スクリプトが非ゼロ終了しました（{}）。内容は siki.json を確認してください", s),
+        Err(e) => eprintln!("setup スクリプトの実行に失敗しました（{}）。内容は siki.json を確認してください", e),
     }
 }
 
@@ -167,6 +184,11 @@ fn validate_worktree_name(name: &str) -> Result<()> {
     }
     if name.contains('/') || name.contains('\\') || name.split(std::path::MAIN_SEPARATOR).any(|c| c == "..") || name == ".." {
         bail!("worktree 名にパス区切りや親参照（.. /）は使えません: {}", name);
+    }
+    // 単一ドット '.' は worktree_path(<proj>, ".") が <proj>/ 自体に解決され、
+    // rm の fallback remove_dir_all がプロジェクト配下を一掃しうるため弾く。
+    if name == "." {
+        bail!("worktree 名にカレント参照（.）は使えません: {}", name);
     }
     Ok(())
 }
@@ -349,7 +371,10 @@ fn resolve_llm() -> String {
         .unwrap_or_else(|_| "claude".to_string())
 }
 
-/// worktree dir で LLM を exec で起動する（正常時は戻らない）。
+/// worktree dir で LLM を exec で起動する。
+///
+/// 正常時はプロセスが LLM に置換されるため**この関数は戻らない**。
+/// 戻り値（常に `Err`）が返るのは exec 失敗・hook 解決前の検証エラー時のみ。
 fn exec_llm(proj: &ResolvedProject, wt_path: &Path, resume: bool, passthrough: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
@@ -384,7 +409,9 @@ pub fn cmd_run(args: &[String]) -> Result<()> {
     let wt_path = match pos.get(1).map(|s| s.as_str()) {
         Some(name) => resolve_or_create_worktree(&proj, name, base, true)?,
         None => match pick_worktree(&cfg, true)? {
-            WtChoice::Existing(name) => config::worktree_path(&proj.name, &name),
+            // 対話で既存を選んだ場合も、外部で削除済み等に備えて存在を確認する
+            // （非対話パスと挙動を揃え、exec の current_dir で不明瞭な OS エラーを出さない）。
+            WtChoice::Existing(name) => resolve_or_create_worktree(&proj, &name, base, false)?,
             WtChoice::New(name) => {
                 let base = interactive_base(base, &proj)?;
                 create_worktree(&proj, &name, Some(&base))?
@@ -528,5 +555,23 @@ mod tests {
         assert!(validate_worktree_name("../etc").is_err());
         assert!(validate_worktree_name("a/b").is_err());
         assert!(validate_worktree_name("-x").is_err());
+        // sec-f1: 単一ドット '.' は worktree_path で <proj>/ に解決され、
+        // rm の fallback remove_dir_all がプロジェクト配下を一掃するため必ず弾く。
+        assert!(validate_worktree_name(".").is_err());
+    }
+
+    #[test]
+    fn setup_env_provides_siki_vars() {
+        // wt-f1: setup スクリプトに TUI と同じ SIKI_* を渡す
+        let proj = ResolvedProject {
+            name: "myproj".to_string(),
+            path: PathBuf::from("/tmp/myproj"),
+        };
+        let wt = PathBuf::from("/tmp/myproj-wt/tokyo");
+        let env = setup_env(&proj, &wt);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("SIKI_PROJECT_PATH"), Some("/tmp/myproj"));
+        assert_eq!(get("SIKI_WORKTREE_PATH"), Some("/tmp/myproj-wt/tokyo"));
+        assert_eq!(get("SIKI_WORKTREE_NAME"), Some("tokyo"));
     }
 }

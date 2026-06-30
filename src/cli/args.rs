@@ -44,7 +44,15 @@ impl ArgScan {
                     let key = format!("--{}", &stripped[..eq]);
                     let val = stripped[eq + 1..].to_string();
                     if !value_keys.contains(&key.as_str()) {
+                        // 真偽フラグに `=` を付けた場合は「値を取らない」旨を明示し、
+                        // 未知フラグ（タイポ）と区別する。
+                        if bool_keys.contains(&key.as_str()) {
+                            bail!("{} は値を取りません（真偽フラグです。'=' は使えません）", key);
+                        }
                         bail!("不明な値フラグ: {}", key);
+                    }
+                    if val.is_empty() {
+                        bail!("{} の値が空です", key);
                     }
                     values.insert(key, val);
                     i += 1;
@@ -52,10 +60,11 @@ impl ArgScan {
                 }
 
                 if value_keys.contains(&tok.as_str()) {
-                    // `--key value` 形式。次が別フラグ（`--` / `--xxx`）なら値欠落として弾く
-                    // （`--base --resume` が --resume を黙って飲み込む事故を防ぐ）。
+                    // `--key value` 形式。次が別フラグ（`--` / 単一・二重ハイフン始まり）なら
+                    // 値欠落として弾く（`--base --resume` や `--base -r` が次フラグを
+                    // 黙って値に飲み込む事故を防ぐ）。`-` 始まりの正規値は `--base=...` を使う。
                     let val = match args.get(i + 1) {
-                        Some(v) if v == "--" || v.starts_with("--") => {
+                        Some(v) if v == "--" || v.starts_with('-') => {
                             bail!("{} の値が指定されていません（次が {} です）", tok, v)
                         }
                         Some(v) => v.clone(),
@@ -222,5 +231,33 @@ mod tests {
     fn err_unknown_value_flag_equals() {
         // 値フラグでないキーに `=` を付けた場合はエラー
         assert!(ArgScan::parse(&v(&["--foo=bar"]), &["--base"], &[]).is_err());
+    }
+
+    #[test]
+    fn err_value_flag_swallows_single_hyphen() {
+        // arg-f1: `--base -r` は -r を値にせず値欠落エラー（-r が claude 短縮フラグ等の場合の事故防止）
+        assert!(ArgScan::parse(&v(&["--base", "-r"]), &["--base"], &[]).is_err());
+        // 正規の `-` 始まり値は `=` 形式で渡せること（こちらは通る）
+        let s = ArgScan::parse(&v(&["--base=-detached"]), &["--base"], &[]).unwrap();
+        assert_eq!(s.value("--base"), Some("-detached"));
+    }
+
+    #[test]
+    fn err_empty_equals_value() {
+        // arg-f2: `--base=`（= 後が空）は空値エラー（空 ref を git に渡さない）
+        assert!(ArgScan::parse(&v(&["--base="]), &["--base"], &[]).is_err());
+    }
+
+    #[test]
+    fn bool_flag_with_equals_has_clear_message() {
+        // arg-f3: 真偽フラグに `=` を付けた場合は「値を取らない」旨のメッセージにする
+        let err = ArgScan::parse(&v(&["--resume=true"]), &[], &["--resume"])
+            .err()
+            .expect("--resume=true はエラーになるべき");
+        assert!(
+            err.to_string().contains("真偽フラグ"),
+            "bool フラグの = 形式エラーが真偽フラグである旨を含まない: {}",
+            err
+        );
     }
 }
