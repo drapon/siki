@@ -16,7 +16,7 @@ use anyhow::{bail, Result};
 use args::ArgScan;
 use std::path::{Path, PathBuf};
 
-use crate::{config, git};
+use crate::{config, git, hooks};
 
 /// 解決済みプロジェクト（`discover_projects` の 1 要素に相当）。
 struct ResolvedProject {
@@ -165,9 +165,96 @@ pub fn cmd_list(_args: &[String]) -> Result<()> {
     unimplemented!("TASK-0004")
 }
 
+/// worktree を解決する。不在かつ `create_if_missing` なら作成する。
+fn resolve_or_create_worktree(
+    proj: &ResolvedProject,
+    name: &str,
+    base: Option<&str>,
+    create_if_missing: bool,
+) -> Result<PathBuf> {
+    // 既存パスにヒットする経路でも name を検証する（cmd_new との一貫性／workspaces 外参照防止）。
+    validate_worktree_name(name)?;
+    let wt_path = config::worktree_path(&proj.name, name);
+    if wt_path.exists() {
+        return Ok(wt_path);
+    }
+    if create_if_missing {
+        create_worktree(proj, name, base)
+    } else {
+        bail!(
+            "worktree が見つかりません: {} （`siki new {} {}` で作成できます）",
+            wt_path.display(),
+            proj.name,
+            name
+        )
+    }
+}
+
+/// `--resume` を有効化してよいか判定する。`-r` は claude 固有の再開フラグなので、
+/// claude 以外の LLM で `--resume` を指定された場合はサイレントに壊さずエラーにする。
+fn check_resume(resume: bool, llm: &str) -> Result<bool> {
+    if resume && llm != "claude" {
+        bail!("--resume は claude 専用です（現在の LLM: {}）", llm);
+    }
+    Ok(resume)
+}
+
+/// `siki run` の LLM 起動 argv（プログラム名を除く）を組み立てる純粋関数。
+/// `--resume` は claude の再開フラグ `-r` に対応し、`--` 以降の passthrough を続ける。
+fn build_run_argv(resume: bool, passthrough: &[String]) -> Vec<String> {
+    let mut argv = Vec::new();
+    if resume {
+        argv.push("-r".to_string());
+    }
+    argv.extend(passthrough.iter().cloned());
+    argv
+}
+
+/// 設定からデフォルト LLM を解決する。設定が読めなければ "claude"。
+fn resolve_llm() -> String {
+    config::load_config(&config::default_config_path())
+        .map(|c| config::resolve_llm(&c))
+        .unwrap_or_else(|_| "claude".to_string())
+}
+
+/// worktree dir で LLM を exec で起動する（正常時は戻らない）。
+fn exec_llm(proj: &ResolvedProject, wt_path: &Path, resume: bool, passthrough: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let llm = resolve_llm();
+    let resume = check_resume(resume, &llm)?;
+
+    // hook 注入は claude のときのみ（TUI の launch_llm_with_args と同条件）。
+    // 失敗してもセッション起動自体は止めず、警告に留める。
+    if llm == "claude" {
+        if let Err(e) = hooks::ensure_hooks_configured(wt_path, &proj.name) {
+            eprintln!("hook 注入に失敗しました（監視なしで続行）: {}", e);
+        }
+    }
+
+    let argv = build_run_argv(resume, passthrough);
+    // exec はプロセスを置き換えるため、戻ってくるのは失敗時のみ。
+    let err = std::process::Command::new(&llm)
+        .args(&argv)
+        .current_dir(wt_path)
+        .exec();
+    bail!("{} の起動に失敗しました: {}", llm, err)
+}
+
 /// `siki run <project> <name> [--base <ref>] [--resume] [-- <llm args>]`
-pub fn cmd_run(_args: &[String]) -> Result<()> {
-    unimplemented!("TASK-0005 / TASK-0007")
+pub fn cmd_run(args: &[String]) -> Result<()> {
+    let scan = ArgScan::parse(args, &["--base"], &["--resume"])?;
+    let pos = scan.positionals_opt(2)?;
+    let project = pos.first().map(|s| s.as_str());
+    // TASK-0007 で name 不足時に対話補完する。現状は必須。
+    let name = pos
+        .get(1)
+        .map(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("worktree 名を指定してください"))?;
+
+    let proj = resolve_project(project)?;
+    let wt_path = resolve_or_create_worktree(&proj, name, scan.value("--base"), true)?;
+    exec_llm(&proj, &wt_path, scan.has("--resume"), scan.rest())
 }
 
 #[cfg(test)]
@@ -232,6 +319,26 @@ mod tests {
         let projects = vec![proj_cfg("alpha"), proj_cfg("beta")];
         assert_eq!(find_project(&projects, "beta").unwrap().name, "beta");
         assert!(find_project(&projects, "gamma").is_err());
+    }
+
+    #[test]
+    fn check_resume_claude_only() {
+        assert_eq!(check_resume(false, "claude").unwrap(), false);
+        assert_eq!(check_resume(true, "claude").unwrap(), true);
+        assert_eq!(check_resume(false, "codex").unwrap(), false);
+        assert!(check_resume(true, "codex").is_err());
+    }
+
+    #[test]
+    fn build_run_argv_variants() {
+        assert!(build_run_argv(false, &[]).is_empty());
+        assert_eq!(build_run_argv(true, &[]), vec!["-r".to_string()]);
+        let pt = vec!["--model".to_string(), "opus".to_string()];
+        assert_eq!(build_run_argv(false, &pt), pt);
+        assert_eq!(
+            build_run_argv(true, &pt),
+            vec!["-r".to_string(), "--model".to_string(), "opus".to_string()]
+        );
     }
 
     #[test]
