@@ -281,6 +281,9 @@ pub fn get_pending_messages(
                 OR to_worktree = ?2
                 OR to_project = ?3
                 OR (to_session IS NULL AND to_worktree IS NULL AND to_project IS NULL))
+           -- 自分が送った fanout（broadcast / worktree / project 宛 = to_session NULL）は
+           -- 自分自身には返さない。直接宛 (to_session 指定) はそのまま配信する。
+           AND NOT (from_session = ?1 AND to_session IS NULL)
          ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![session_id, worktree_name, project_name], |row| {

@@ -54,7 +54,8 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         .map(|s| (s.worktree_name.as_str(), s.project_name.as_str()))
         .unwrap_or(("", ""));
 
-    // scope に応じてフィルタ
+    // scope に応じてフィルタ。enum 外の値はサイレントに machine 扱いにせず拒否する
+    // （broadcast と同じコントラクト。タイポが全件返却で気付かれないのを防ぐ）。
     let sessions: Vec<&db::SessionRow> = match scope {
         "worktree" => all_sessions
             .iter()
@@ -64,7 +65,11 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
             .iter()
             .filter(|s| !proj.is_empty() && s.project_name == proj)
             .collect(),
-        _ => all_sessions.iter().collect(), // "machine" = 全件
+        "machine" => all_sessions.iter().collect(),
+        _ => anyhow::bail!(
+            "Invalid scope: {} (expected \"machine\", \"project\", or \"worktree\")",
+            scope
+        ),
     };
 
     let items: Vec<Value> = sessions
@@ -158,9 +163,18 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         }
     } else if !contexts.is_empty() || !summaries.is_empty() {
         // 既定: 件数ポインタのみ。本文は include_bodies:true で取得させる。
+        // KB 見積もりは worktree context（.md）と会話サマリ本文の両方を計上する。
+        // どちらも include_bodies:true で返るため、合計サイズが分からないと呼び出し元が
+        // 取得コストを過小評価してしまう。
         let total_bytes: usize = contexts.iter().map(|(_, c)| c.len()).sum();
+        let summary_bytes: usize = summaries
+            .iter()
+            .filter_map(|s| s.summary.as_deref())
+            .map(|s| s.len())
+            .sum();
         result["background"] = json!({
             "conversation_summary_count": summaries.len(),
+            "conversation_summary_kb": (summary_bytes + 512) / 1024,
             "worktree_context_files": contexts.len(),
             "worktree_context_kb": (total_bytes + 512) / 1024,
             "hint": "Pass include_bodies:true to fetch the full conversation summaries and worktree context bodies (independent of scope). These can be large — prefer fetching only when the current task needs them.",
@@ -217,12 +231,16 @@ fn broadcast(conn: &Connection, params: &Value, from_session: &str) -> Result<Va
     // project スコープでは送信元の project を sessions から引く。送信元が未登録で
     // project を特定できない場合は machine 扱い（全 NULL）にフォールバックし、
     // メッセージを取りこぼさないようにする。
+    // "unknown" は guess_names_from_cwd（workspaces 外起動時）と DB デフォルトの
+    // センチネルであり、有効な project 名ではない。これを to_project に採用すると
+    // 他の "unknown" セッション群へ誤配信されるため、空文字と同様に machine
+    // フォールバック扱いにする（session_start.rs の valid_worktree 判定と一致）。
     let to_project: Option<String> = if scope == "project" {
         db::list_sessions(conn)?
             .iter()
             .find(|s| s.session_id == from_session)
             .map(|s| s.project_name.clone())
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty() && p != "unknown")
     } else {
         None
     };
@@ -968,6 +986,78 @@ mod tests {
         let conn = test_db();
         let result = broadcast(&conn, &json!({ "message": "x", "scope": "worktree" }), "s1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_broadcast_unknown_project_falls_back_to_machine() {
+        // project_name が "unknown"（workspaces 外で起動し guess_names_from_cwd が
+        // フォールバックした登録）の送信元は project を特定できないものとして扱い、
+        // machine フォールバックする。"unknown" を project 名として配信すると、無関係な
+        // 別 "unknown" セッション群へ誤配信されてしまうため。
+        let conn = test_db();
+        db::upsert_session(&conn, "ghost", "default", "unknown", "unknown", "/elsewhere", "idle")
+            .unwrap();
+
+        let result = broadcast(&conn, &json!({ "message": "hi" }), "ghost").unwrap();
+        // "unknown" は project として採用せず machine フォールバック
+        assert_eq!(result["scope"], "machine");
+
+        // machine 扱いなので無関係な project のセッションにも届く
+        let other = db::get_pending_messages(&conn, "outsider", "berlin", "other").unwrap();
+        assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn test_broadcast_does_not_echo_to_sender() {
+        // 送信元自身は自分が送った broadcast / project fanout を受信しない。
+        let conn = test_db();
+        db::upsert_session(&conn, "sender", "default", "osaka", "myapp", "/tmp/o", "idle").unwrap();
+
+        // project スコープ broadcast（to_project = myapp）
+        broadcast(&conn, &json!({ "message": "to my team" }), "sender").unwrap();
+        let mine = db::get_pending_messages(&conn, "sender", "osaka", "myapp").unwrap();
+        assert_eq!(mine.len(), 0, "sender must not receive own project broadcast");
+
+        // 同 project の別セッションは受信する
+        let peer = db::get_pending_messages(&conn, "peer", "tokyo", "myapp").unwrap();
+        assert_eq!(peer.len(), 1);
+
+        // machine broadcast（全 NULL）でも送信元には返らない
+        broadcast(&conn, &json!({ "message": "all", "scope": "machine" }), "sender").unwrap();
+        let mine2 = db::get_pending_messages(&conn, "sender", "osaka", "myapp").unwrap();
+        assert_eq!(mine2.len(), 0, "sender must not receive own machine broadcast");
+    }
+
+    #[test]
+    fn test_list_sessions_rejects_invalid_scope() {
+        // 不正な scope はサイレントに machine 扱い（全件）にせず、broadcast と同様に拒否する。
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp", "idle").unwrap();
+        let result = list_sessions(&conn, "s1", &json!({"scope": "bogus"}));
+        assert!(result.is_err(), "invalid scope must error, not silently return all");
+    }
+
+    #[test]
+    fn test_background_pointer_includes_conversation_summary_kb() {
+        // background ポインタは worktree context だけでなく会話サマリ本文のサイズも
+        // KB で見積もる（include_bodies のコストを呼び出し元が事前判断できるように）。
+        let workspaces = crate::config::workspaces_dir();
+        let cwd = workspaces
+            .join("proj-kb")
+            .join("wt-kb")
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt-kb", "proj-kb", &cwd, "idle").unwrap();
+        db::upsert_conversation_log(&conn, "old", "wt-kb", "proj-kb", None, "[]").unwrap();
+        // 約 2000 bytes のサマリ本文
+        let big = "x".repeat(2000);
+        db::update_conversation_log_summary(&conn, "old", &big).unwrap();
+
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        let bg = result.get("background").expect("background pointer expected");
+        // 2000 bytes → (2000 + 512) / 1024 = 2 KB
+        assert_eq!(bg["conversation_summary_kb"], 2);
     }
 
     #[test]
