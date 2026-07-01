@@ -78,6 +78,26 @@ impl ClaudeSession {
         self.id
     }
 
+    /// テスト専用: 実際の `claude` CLI の代わりに軽量なダミープロセスを起動し、
+    /// 指定した id を持つ ClaudeSession を構築する。main.rs 側のイベントルーティング
+    /// テストで `sessions` に投入するために使う（terminal.rs の spawn_dummy_term と同様のパターン）。
+    #[cfg(test)]
+    pub fn new_for_test(id: u64) -> Self {
+        let mut process = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn dummy process for ClaudeSession test");
+        let stdin_writer = process.stdin.take().expect("dummy process stdin");
+        Self {
+            id,
+            process,
+            stdin_writer,
+        }
+    }
+
     /// Claude Code にメッセージを送信する
     ///
     /// NDJSON 形式で stdin に書き込む。
