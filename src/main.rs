@@ -296,6 +296,7 @@ async fn main() -> Result<()> {
                 let _ = tx.send(event::AppEvent::PrInfo {
                     worktree_id: wt_id,
                     worktree_name: wt_name,
+                    worktree_path: wt_path.to_string_lossy().to_string(),
                     info,
                 });
             });
@@ -712,14 +713,7 @@ async fn handle_event(
                     if !claude_session_id.is_empty() {
                         if let Some(wt) = app.worktree_by_id(key) {
                             let wt_name = wt.name.clone();
-                            let project_name = app
-                                .projects
-                                .iter()
-                                .find(|p| {
-                                    p.worktrees.iter().any(|w| w.name == wt_name)
-                                })
-                                .map(|p| p.name.clone())
-                                .unwrap_or_default();
+                            let project_name = app.projects[key.0].name.clone();
                             if let Ok(conn) = broker_db.lock() {
                                 // worktree に紐づくアクティブなセッションの claude_session_id を更新
                                 let _ = conn.execute(
@@ -758,6 +752,7 @@ async fn handle_event(
                         let _ = tx.send(event::AppEvent::PrInfo {
                             worktree_id: wt_id,
                             worktree_name: wt_name,
+                            worktree_path: wt_path.to_string_lossy().to_string(),
                             info,
                         });
                     });
@@ -1493,14 +1488,16 @@ async fn handle_event(
         AppEvent::PrInfo {
             worktree_id,
             worktree_name,
+            worktree_path,
             info,
         } => {
-            // fetch開始時点でキャプチャしたworktree名と現在のworktree名が一致する場合のみ
+            // fetch開始時点でキャプチャしたworktree名・pathと現在のworktreeが一致する場合のみ
             // 書き込む。worktree/project削除のreindexでworktree_idがシフトしていた場合、
             // 同じキーへ来た別の実在worktreeへ誤って上書きすることを防ぐ（uradori裏取りで
-            // 確認済み）。名前が一致しない、またはworktreeが既に存在しない場合は黙って破棄する。
+            // 確認済み）。名前・pathが一致しない、またはworktreeが既に存在しない場合は黙って破棄する。
             if let Some(wt) = app.worktree_by_id_mut(worktree_id)
                 && wt.name == worktree_name
+                && wt.path == worktree_path
             {
                 wt.pr = info;
             }
@@ -2260,6 +2257,7 @@ fn finalize_add_worktree(
         let _ = tx.send(event::AppEvent::PrInfo {
             worktree_id: (pi, wi),
             worktree_name: pr_wt_name,
+            worktree_path: pr_path.to_string_lossy().to_string(),
             info,
         });
     });
@@ -6544,6 +6542,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_init_event_updates_wrong_project_row_when_worktree_names_collide_bug() {
+        // uradori裏取り: Init イベントの claude_session_id DB更新は、既に resolve_session_key で
+        // 解決済みの key.0 (project_index) を使わず、`app.projects.iter().find(worktree名一致)`
+        // という名前ベースの再探索で project_name を決めている。同名 worktree を持つ複数
+        // プロジェクトが存在すると、Vec 内で最初にマッチした（=無関係な）プロジェクトの
+        // sessions 行が更新されてしまうことを実際の (in-memory) DB で再現する。
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![
+                ProjectConfig {
+                    name: "project-a".to_string(),
+                    path: "/tmp/project-a".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/a".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "project-b".to_string(),
+                    path: "/tmp/project-b".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/b".to_string(),
+                    }],
+                },
+            ],
+        };
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        // 実際のセッションは project-b (project_index=1) の worktree "wt0" に属する
+        sessions.insert((1, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let broker_db = test_broker_db();
+        {
+            let conn = broker_db.lock().unwrap();
+            db::upsert_session(&conn, "sess-a", "claude", "wt0", "project-a", "/tmp/project-a", "idle").unwrap();
+            db::upsert_session(&conn, "sess-b", "claude", "wt0", "project-b", "/tmp/project-b", "idle").unwrap();
+        }
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeOutput {
+                worktree_id: (1, 0),
+                session_id: 1,
+                event: event::ClaudeStreamEvent::Init {
+                    session_id: "claude-resume-id-for-project-b".to_string(),
+                },
+            },
+            None,
+            &None,
+            &broker_db,
+        )
+        .await;
+
+        let conn = broker_db.lock().unwrap();
+        let sess_a_claude_id: Option<String> = conn
+            .query_row(
+                "SELECT claude_session_id FROM sessions WHERE session_id = 'sess-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sess_b_claude_id: Option<String> = conn
+            .query_row(
+                "SELECT claude_session_id FROM sessions WHERE session_id = 'sess-b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            sess_a_claude_id, None,
+            "project-bのセッションのInitイベントで、無関係なproject-aの行が更新されてはならない"
+        );
+        assert_eq!(
+            sess_b_claude_id,
+            Some("claude-resume-id-for-project-b".to_string()),
+            "project-b(実際にイベントが属するプロジェクト)の行が更新されるべき"
+        );
+    }
+
+    #[tokio::test]
     async fn test_claude_complete_event() {
         let config = sample_config();
         let mut app = app::App::new(&config);
@@ -6620,6 +6725,7 @@ mod tests {
             event::AppEvent::PrInfo {
                 worktree_id: (0, 0),
                 worktree_name: "old-worktree".to_string(),
+                worktree_path: "/tmp/old-test-project".to_string(),
                 info: Some(app::PrInfo {
                     number: 1,
                     title: "誤って上書きされるべきでないPR".to_string(),
@@ -6672,6 +6778,9 @@ mod tests {
             event::AppEvent::PrInfo {
                 worktree_id: (0, 0),
                 worktree_name: "feature".to_string(),
+                worktree_path: crate::config::worktree_path("test-project", "feature")
+                    .to_string_lossy()
+                    .to_string(),
                 info: Some(app::PrInfo {
                     number: 2,
                     title: "正しく書き込まれるべきPR".to_string(),
@@ -6687,6 +6796,100 @@ mod tests {
 
         let wt = app.worktree_by_id((0, 0)).unwrap();
         assert_eq!(wt.pr.as_ref().map(|p| p.number), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_prinfo_event_cross_project_name_collision_after_project_removal_bug() {
+        // uradori裏取り: worktree_name の一意性は同一プロジェクト内でしか保証されない
+        // （config::generate_worktree_name は同一プロジェクトのworktree名のみを避ける、
+        // main.rs の add_worktree 起動処理 (existing_names 収集箇所) 参照）。
+        // プロジェクト削除で app.projects がシフトした後、削除されたプロジェクトの
+        // fetch_pr_info タスクが送る古いPrInfoイベントが、同じ index に来た別プロジェクトの
+        // 同名 worktree へ誤って書き込まれてしまうことを再現する。
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![
+                ProjectConfig {
+                    name: "project-a".to_string(),
+                    path: "/tmp/project-a".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/a".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "project-b".to_string(),
+                    path: "/tmp/project-b".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/b".to_string(),
+                    }],
+                },
+            ],
+        };
+        let mut app = app::App::new(&config);
+
+        // project-a (index 0) が削除された状況をシミュレートする。
+        // Vec::remove により project-b が index 0 へシフトする。
+        app.projects.remove(0);
+        assert_eq!(app.projects[0].name, "project-b");
+
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // project-a の worktree "wt0" 用に fetch開始時点でキャプチャされた、削除前の古いイベント。
+        // worktree_id=(0,0) は project-a 削除前の座標だが、シフト後は project-b の "wt0" を指す。
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::PrInfo {
+                worktree_id: (0, 0),
+                worktree_name: "wt0".to_string(), // project-a側のworktree名（project-bと偶然同名）
+                worktree_path: config::worktree_path("project-a", "wt0")
+                    .to_string_lossy()
+                    .to_string(),
+                info: Some(app::PrInfo {
+                    number: 999,
+                    title: "project-a向けのPRがproject-bに誤って書き込まれる".to_string(),
+                    url: "https://example.com/pr/999".to_string(),
+                    status: app::PrStatus::Ready,
+                }),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert!(
+            wt.pr.is_none(),
+            "project-a向けのPrInfoがproject-bのworktreeへ誤って書き込まれてはならない\
+             （worktree_nameだけでなくプロジェクト識別子も照合すべき）"
+        );
     }
 
     #[tokio::test]

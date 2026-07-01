@@ -19,13 +19,10 @@ pub struct ClaudeSession {
     stdin_writer: ChildStdin,
 }
 
-#[cfg(test)]
 impl Drop for ClaudeSession {
     fn drop(&mut self) {
-        // new_for_test が起動するダミープロセス(sleep 30)がテスト終了後も残存し続けない
-        // よう、Drop時に即座にkillする（terminal.rs::TerminalEmulator::Dropと同様の意図）。
-        // 本番用 ClaudeSession(実際のclaude CLI)は spawn() 側のライフサイクル管理に
-        // 委ねるため、この Drop はテストビルドのみに限定する。
+        // archive/project 削除時に sessions から取り除かれた際、実プロセスと
+        // read_stdout_task を確実に終了させるため、本番・テスト双方で有効にする。
         let _ = self.process.start_kill();
     }
 }

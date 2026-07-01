@@ -51,6 +51,9 @@ pub enum AppEvent {
         /// worktree_id 自体がシフトしていても、無関係な worktree へ誤って書き込まないよう
         /// 受信側で現在の名前と照合するために使う
         worktree_name: String,
+        /// fetch 開始時点でキャプチャした worktree の絶対パス。プロジェクト横断で一意なため、
+        /// worktree_name に加えてこちらも照合することでプロジェクト跨ぎの取り違えを防ぐ
+        worktree_path: String,
         info: Option<crate::app::PrInfo>,
     },
     /// 定期 tick（UI リフレッシュ）
