@@ -33,6 +33,28 @@ type TerminalKey = (app::WorktreeId, usize);
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 
+/// reader thread が spawn 時に保持した tab_index/worktree_id に対応する terminals の key を返す。
+///
+/// resolve_claude_term_key と同型のパターン（まず直接キー引き、次に terminal_id のみで
+/// マップ全体を走査）。terminals には従来この種の再探索処理が存在せず、worktree 削除による
+/// reindex 後は直接キー引きに失敗したイベントがすべて黙って破棄されていた。
+fn resolve_terminal_key(
+    terminals: &HashMap<TerminalKey, terminal::TerminalEmulator>,
+    worktree_id: app::WorktreeId,
+    tab_index: usize,
+    terminal_id: u64,
+) -> Option<TerminalKey> {
+    if let Some(emu) = terminals.get(&(worktree_id, tab_index)) {
+        if emu.id() == terminal_id {
+            return Some((worktree_id, tab_index));
+        }
+    }
+    terminals
+        .iter()
+        .find(|(_, emu)| emu.id() == terminal_id)
+        .map(|(key, _)| *key)
+}
+
 /// reader thread が spawn 時に保持した tab_index/worktree_id に対応する claude_terms の key を返す。
 ///
 /// Ctrl+W で Claude タブを閉じると `handle_claude_terminal_key` が HashMap key を詰めるため、
@@ -740,14 +762,16 @@ async fn handle_event(
                         // 調整するため、外部保持のオフセットを同期する
                         let current = emu.scrollback();
                         if current > 0 {
-                            if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
+                            // worktree_id ではなく解決済み key.0 を使う（worktree 削除の
+                            // reindex で worktree_id 自体がシフトしている可能性があるため）
+                            if let Some(wt) = app.worktree_by_id_mut(key.0) {
                                 wt.claude_scroll_offsets.insert(key.1, current);
                             }
                         }
                     }
                 }
-            } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
-                if emu.id() == terminal_id {
+            } else if let Some(key) = resolve_terminal_key(terminals, worktree_id, tab_index, terminal_id) {
+                if let Some(emu) = terminals.get_mut(&key) {
                     emu.process(&data);
                 }
             }
@@ -771,8 +795,8 @@ async fn handle_event(
                         emu.mark_exited();
                     }
                 }
-            } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
-                if emu.id() == terminal_id {
+            } else if let Some(key) = resolve_terminal_key(terminals, worktree_id, tab_index, terminal_id) {
+                if let Some(emu) = terminals.get_mut(&key) {
                     emu.mark_exited();
                 }
             }
@@ -7996,6 +8020,52 @@ mod tests {
             tab_index,
         )
         .expect("spawn dummy terminal")
+    }
+
+    #[test]
+    fn test_resolve_terminal_key_direct_hit() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+        let emu = spawn_dummy_term(&tx, wt_id, 0);
+        let id = emu.id();
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_id, 0), emu);
+
+        let key = resolve_terminal_key(&terminals, wt_id, 0, id);
+        assert_eq!(key, Some((wt_id, 0)));
+    }
+
+    #[test]
+    fn test_resolve_terminal_key_finds_after_worktree_shift() {
+        // worktree 削除の reindex で terminals のキーの worktree_id 側がシフトしても、
+        // reader thread が送り続ける古い worktree_id では発見できてはならない
+        // （直接キー引きは失敗するが、terminal_id のみの全体走査で救う）
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_old: app::WorktreeId = (0, 3);
+        let wt_new: app::WorktreeId = (0, 2);
+
+        let emu = spawn_dummy_term(&tx, wt_old, 0);
+        let id = emu.id();
+
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_new, 0), emu);
+
+        let key = resolve_terminal_key(&terminals, wt_old, 0, id);
+        assert_eq!(key, Some((wt_new, 0)));
+    }
+
+    #[test]
+    fn test_resolve_terminal_key_none_for_dropped() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+        let other = spawn_dummy_term(&tx, wt_id, 0);
+        let other_id = other.id();
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_id, 0), other);
+
+        let dropped_id = other_id + 999;
+        let key = resolve_terminal_key(&terminals, wt_id, 0, dropped_id);
+        assert_eq!(key, None);
     }
 
     #[test]
