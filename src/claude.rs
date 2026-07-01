@@ -19,6 +19,17 @@ pub struct ClaudeSession {
     stdin_writer: ChildStdin,
 }
 
+#[cfg(test)]
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        // new_for_test が起動するダミープロセス(sleep 30)がテスト終了後も残存し続けない
+        // よう、Drop時に即座にkillする（terminal.rs::TerminalEmulator::Dropと同様の意図）。
+        // 本番用 ClaudeSession(実際のclaude CLI)は spawn() 側のライフサイクル管理に
+        // 委ねるため、この Drop はテストビルドのみに限定する。
+        let _ = self.process.start_kill();
+    }
+}
+
 impl ClaudeSession {
     /// Claude Code CLI をサブプロセスとして起動する
     ///
@@ -281,6 +292,25 @@ mod tests {
         let id1 = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let id2 = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         assert_ne!(id1, id2, "連続採番されたidは一意でなければならない");
+    }
+
+    #[tokio::test]
+    async fn test_claude_session_drop_kills_dummy_process() {
+        // uradori裏取りで確認済みの回帰: ClaudeSession::new_for_test が起動する
+        // ダミープロセス(sleep 30)がDrop時にkillされず、テスト完了後も残存し続けていた。
+        let session = ClaudeSession::new_for_test(1);
+        let pid = session.process.id().expect("dummy process should have a pid");
+        drop(session);
+
+        // Drop 内の kill シグナル送出が反映されるまで少し待つ
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "Drop後もpid={}のダミープロセスが生存している", pid);
     }
 
     // --- parse_stream_event テスト ---

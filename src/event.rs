@@ -47,6 +47,10 @@ pub enum AppEvent {
     /// GitHub PR 情報取得完了
     PrInfo {
         worktree_id: WorktreeId,
+        /// fetch 開始時点でキャプチャした worktree 名。worktree/project 削除の reindex で
+        /// worktree_id 自体がシフトしていても、無関係な worktree へ誤って書き込まないよう
+        /// 受信側で現在の名前と照合するために使う
+        worktree_name: String,
         info: Option<crate::app::PrInfo>,
     },
     /// 定期 tick（UI リフレッシュ）
