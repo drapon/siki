@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -7,10 +8,23 @@ use tokio::sync::mpsc;
 use crate::app::WorktreeId;
 use crate::event::{AppEvent, ClaudeStreamEvent};
 
+/// ClaudeSession のグローバル一意id採番用カウンタ。
+/// terminal.rs::NEXT_TERMINAL_ID とは独立（TerminalEmulator と ClaudeSession は無関係な概念）。
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Claude Code CLI セッションの管理
 pub struct ClaudeSession {
+    id: u64,
     process: Child,
     stdin_writer: ChildStdin,
+}
+
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        // archive/project 削除時に sessions から取り除かれた際、実プロセスと
+        // read_stdout_task を確実に終了させるため、本番・テスト双方で有効にする。
+        let _ = self.process.start_kill();
+    }
 }
 
 impl ClaudeSession {
@@ -55,13 +69,41 @@ impl ClaudeSession {
             .take()
             .ok_or_else(|| anyhow::anyhow!("stdout の取得に失敗"))?;
 
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+
         // stdout 読み取り用の背景タスク
-        tokio::spawn(read_stdout_task(stdout, event_tx, worktree_id));
+        tokio::spawn(read_stdout_task(stdout, event_tx, worktree_id, id));
 
         Ok(Self {
+            id,
             process,
             stdin_writer,
         })
+    }
+
+    /// 生存期間中不変の一意id（TerminalEmulator::id() と同形）
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// テスト専用: 実際の `claude` CLI の代わりに軽量なダミープロセスを起動し、
+    /// 指定した id を持つ ClaudeSession を構築する。main.rs 側のイベントルーティング
+    /// テストで `sessions` に投入するために使う（terminal.rs の spawn_dummy_term と同様のパターン）。
+    #[cfg(test)]
+    pub fn new_for_test(id: u64) -> Self {
+        let mut process = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn dummy process for ClaudeSession test");
+        let stdin_writer = process.stdin.take().expect("dummy process stdin");
+        Self {
+            id,
+            process,
+            stdin_writer,
+        }
     }
 
     /// Claude Code にメッセージを送信する
@@ -100,6 +142,7 @@ async fn read_stdout_task(
     stdout: tokio::process::ChildStdout,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     worktree_id: WorktreeId,
+    session_id: u64,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -111,17 +154,22 @@ async fn read_stdout_task(
             if let ClaudeStreamEvent::Error { ref message } = event {
                 let _ = event_tx.send(AppEvent::ClaudeError {
                     worktree_id,
+                    session_id,
                     error: message.clone(),
                 });
             } else {
                 let _ = event_tx.send(AppEvent::ClaudeOutput {
                     worktree_id,
+                    session_id,
                     event,
                 });
             }
 
             if is_result {
-                let _ = event_tx.send(AppEvent::ClaudeComplete { worktree_id });
+                let _ = event_tx.send(AppEvent::ClaudeComplete {
+                    worktree_id,
+                    session_id,
+                });
                 return;
             }
         }
@@ -130,6 +178,7 @@ async fn read_stdout_task(
     // stdout が閉じた = プロセス終了
     let _ = event_tx.send(AppEvent::ClaudeError {
         worktree_id,
+        session_id,
         error: "Claude Code プロセスが予期せず終了しました".to_string(),
     });
 }
@@ -230,6 +279,36 @@ pub fn parse_stream_event(line: &str) -> Option<ClaudeStreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ClaudeSession id 採番テスト ---
+
+    #[test]
+    fn test_session_id_counter_produces_unique_ids() {
+        // spawn() は実際の `claude` CLI を要求するため単体テストでは呼べない。
+        // ClaudeSession::spawn が使う採番ロジックそのもの（NEXT_SESSION_ID）を直接検証する。
+        let id1 = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let id2 = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id1, id2, "連続採番されたidは一意でなければならない");
+    }
+
+    #[tokio::test]
+    async fn test_claude_session_drop_kills_dummy_process() {
+        // uradori裏取りで確認済みの回帰: ClaudeSession::new_for_test が起動する
+        // ダミープロセス(sleep 30)がDrop時にkillされず、テスト完了後も残存し続けていた。
+        let session = ClaudeSession::new_for_test(1);
+        let pid = session.process.id().expect("dummy process should have a pid");
+        drop(session);
+
+        // Drop 内の kill シグナル送出が反映されるまで少し待つ
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "Drop後もpid={}のダミープロセスが生存している", pid);
+    }
 
     // --- parse_stream_event テスト ---
 
@@ -455,6 +534,7 @@ mod tests {
     async fn test_stdout_reader_sends_events() {
         let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         let worktree_id: WorktreeId = (0, 0);
+        let session_id: u64 = 42;
 
         // パイプを使ってシミュレーション
         let ndjson = [
@@ -489,29 +569,35 @@ mod tests {
                     if let ClaudeStreamEvent::Error { ref message } = event {
                         let _ = tx_clone.send(AppEvent::ClaudeError {
                             worktree_id,
+                            session_id,
                             error: message.clone(),
                         });
                     } else {
                         let _ = tx_clone.send(AppEvent::ClaudeOutput {
                             worktree_id,
+                            session_id,
                             event,
                         });
                     }
 
                     if is_result {
-                        let _ = tx_clone.send(AppEvent::ClaudeComplete { worktree_id });
+                        let _ = tx_clone.send(AppEvent::ClaudeComplete {
+                            worktree_id,
+                            session_id,
+                        });
                         return;
                     }
                 }
             }
         });
 
-        // イベントを受信して検証
+        // イベントを受信して検証（session_id が一貫して乗ることも確認する）
         let event1 = rx.recv().await.unwrap();
         assert!(matches!(
             event1,
             AppEvent::ClaudeOutput {
                 event: ClaudeStreamEvent::Init { .. },
+                session_id: 42,
                 ..
             }
         ));
@@ -521,6 +607,7 @@ mod tests {
             event2,
             AppEvent::ClaudeOutput {
                 event: ClaudeStreamEvent::ContentDelta { .. },
+                session_id: 42,
                 ..
             }
         ));
@@ -530,18 +617,20 @@ mod tests {
             event3,
             AppEvent::ClaudeOutput {
                 event: ClaudeStreamEvent::Result { .. },
+                session_id: 42,
                 ..
             }
         ));
 
         let event4 = rx.recv().await.unwrap();
-        assert!(matches!(event4, AppEvent::ClaudeComplete { .. }));
+        assert!(matches!(event4, AppEvent::ClaudeComplete { session_id: 42, .. }));
     }
 
     #[tokio::test]
     async fn test_stdout_reader_handles_error_event() {
         let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         let worktree_id: WorktreeId = (1, 2);
+        let session_id: u64 = 7;
 
         let ndjson = r#"{"type":"error","error":"API error"}"#;
 
@@ -563,11 +652,13 @@ mod tests {
                     if let ClaudeStreamEvent::Error { ref message } = event {
                         let _ = tx_clone.send(AppEvent::ClaudeError {
                             worktree_id,
+                            session_id,
                             error: message.clone(),
                         });
                     } else {
                         let _ = tx_clone.send(AppEvent::ClaudeOutput {
                             worktree_id,
+                            session_id,
                             event,
                         });
                     }
@@ -579,9 +670,11 @@ mod tests {
         match event {
             AppEvent::ClaudeError {
                 worktree_id: wt_id,
+                session_id: sid,
                 error,
             } => {
                 assert_eq!(wt_id, (1, 2));
+                assert_eq!(sid, 7);
                 assert_eq!(error, "API error");
             }
             _ => panic!("expected ClaudeError event"),
