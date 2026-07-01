@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -7,8 +8,13 @@ use tokio::sync::mpsc;
 use crate::app::WorktreeId;
 use crate::event::{AppEvent, ClaudeStreamEvent};
 
+/// ClaudeSession のグローバル一意id採番用カウンタ。
+/// terminal.rs::NEXT_TERMINAL_ID とは独立（TerminalEmulator と ClaudeSession は無関係な概念）。
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Claude Code CLI セッションの管理
 pub struct ClaudeSession {
+    id: u64,
     process: Child,
     stdin_writer: ChildStdin,
 }
@@ -55,13 +61,21 @@ impl ClaudeSession {
             .take()
             .ok_or_else(|| anyhow::anyhow!("stdout の取得に失敗"))?;
 
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+
         // stdout 読み取り用の背景タスク
         tokio::spawn(read_stdout_task(stdout, event_tx, worktree_id));
 
         Ok(Self {
+            id,
             process,
             stdin_writer,
         })
+    }
+
+    /// 生存期間中不変の一意id（TerminalEmulator::id() と同形）
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Claude Code にメッセージを送信する
@@ -230,6 +244,17 @@ pub fn parse_stream_event(line: &str) -> Option<ClaudeStreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ClaudeSession id 採番テスト ---
+
+    #[test]
+    fn test_session_id_counter_produces_unique_ids() {
+        // spawn() は実際の `claude` CLI を要求するため単体テストでは呼べない。
+        // ClaudeSession::spawn が使う採番ロジックそのもの（NEXT_SESSION_ID）を直接検証する。
+        let id1 = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let id2 = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id1, id2, "連続採番されたidは一意でなければならない");
+    }
 
     // --- parse_stream_event テスト ---
 
