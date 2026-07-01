@@ -64,7 +64,7 @@ impl ClaudeSession {
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
 
         // stdout 読み取り用の背景タスク
-        tokio::spawn(read_stdout_task(stdout, event_tx, worktree_id));
+        tokio::spawn(read_stdout_task(stdout, event_tx, worktree_id, id));
 
         Ok(Self {
             id,
@@ -114,6 +114,7 @@ async fn read_stdout_task(
     stdout: tokio::process::ChildStdout,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     worktree_id: WorktreeId,
+    session_id: u64,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -125,17 +126,22 @@ async fn read_stdout_task(
             if let ClaudeStreamEvent::Error { ref message } = event {
                 let _ = event_tx.send(AppEvent::ClaudeError {
                     worktree_id,
+                    session_id,
                     error: message.clone(),
                 });
             } else {
                 let _ = event_tx.send(AppEvent::ClaudeOutput {
                     worktree_id,
+                    session_id,
                     event,
                 });
             }
 
             if is_result {
-                let _ = event_tx.send(AppEvent::ClaudeComplete { worktree_id });
+                let _ = event_tx.send(AppEvent::ClaudeComplete {
+                    worktree_id,
+                    session_id,
+                });
                 return;
             }
         }
@@ -144,6 +150,7 @@ async fn read_stdout_task(
     // stdout が閉じた = プロセス終了
     let _ = event_tx.send(AppEvent::ClaudeError {
         worktree_id,
+        session_id,
         error: "Claude Code プロセスが予期せず終了しました".to_string(),
     });
 }
@@ -480,6 +487,7 @@ mod tests {
     async fn test_stdout_reader_sends_events() {
         let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         let worktree_id: WorktreeId = (0, 0);
+        let session_id: u64 = 42;
 
         // パイプを使ってシミュレーション
         let ndjson = [
@@ -514,29 +522,35 @@ mod tests {
                     if let ClaudeStreamEvent::Error { ref message } = event {
                         let _ = tx_clone.send(AppEvent::ClaudeError {
                             worktree_id,
+                            session_id,
                             error: message.clone(),
                         });
                     } else {
                         let _ = tx_clone.send(AppEvent::ClaudeOutput {
                             worktree_id,
+                            session_id,
                             event,
                         });
                     }
 
                     if is_result {
-                        let _ = tx_clone.send(AppEvent::ClaudeComplete { worktree_id });
+                        let _ = tx_clone.send(AppEvent::ClaudeComplete {
+                            worktree_id,
+                            session_id,
+                        });
                         return;
                     }
                 }
             }
         });
 
-        // イベントを受信して検証
+        // イベントを受信して検証（session_id が一貫して乗ることも確認する）
         let event1 = rx.recv().await.unwrap();
         assert!(matches!(
             event1,
             AppEvent::ClaudeOutput {
                 event: ClaudeStreamEvent::Init { .. },
+                session_id: 42,
                 ..
             }
         ));
@@ -546,6 +560,7 @@ mod tests {
             event2,
             AppEvent::ClaudeOutput {
                 event: ClaudeStreamEvent::ContentDelta { .. },
+                session_id: 42,
                 ..
             }
         ));
@@ -555,18 +570,20 @@ mod tests {
             event3,
             AppEvent::ClaudeOutput {
                 event: ClaudeStreamEvent::Result { .. },
+                session_id: 42,
                 ..
             }
         ));
 
         let event4 = rx.recv().await.unwrap();
-        assert!(matches!(event4, AppEvent::ClaudeComplete { .. }));
+        assert!(matches!(event4, AppEvent::ClaudeComplete { session_id: 42, .. }));
     }
 
     #[tokio::test]
     async fn test_stdout_reader_handles_error_event() {
         let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         let worktree_id: WorktreeId = (1, 2);
+        let session_id: u64 = 7;
 
         let ndjson = r#"{"type":"error","error":"API error"}"#;
 
@@ -588,11 +605,13 @@ mod tests {
                     if let ClaudeStreamEvent::Error { ref message } = event {
                         let _ = tx_clone.send(AppEvent::ClaudeError {
                             worktree_id,
+                            session_id,
                             error: message.clone(),
                         });
                     } else {
                         let _ = tx_clone.send(AppEvent::ClaudeOutput {
                             worktree_id,
+                            session_id,
                             event,
                         });
                     }
@@ -604,9 +623,11 @@ mod tests {
         match event {
             AppEvent::ClaudeError {
                 worktree_id: wt_id,
+                session_id: sid,
                 error,
             } => {
                 assert_eq!(wt_id, (1, 2));
+                assert_eq!(sid, 7);
                 assert_eq!(error, "API error");
             }
             _ => panic!("expected ClaudeError event"),

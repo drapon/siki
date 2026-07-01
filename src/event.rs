@@ -15,13 +15,20 @@ pub enum AppEvent {
     /// Claude Code からの出力
     ClaudeOutput {
         worktree_id: WorktreeId,
+        /// 送信元 ClaudeSession の生成時点で不変の一意id。worktree 削除の reindex で
+        /// worktree_id 自体がシフトしていても、sessions 内の現在のキーを再特定するために使う
+        session_id: u64,
         event: ClaudeStreamEvent,
     },
     /// Claude Code の応答完了
-    ClaudeComplete { worktree_id: WorktreeId },
+    ClaudeComplete {
+        worktree_id: WorktreeId,
+        session_id: u64,
+    },
     /// Claude Code のエラー
     ClaudeError {
         worktree_id: WorktreeId,
+        session_id: u64,
         error: String,
     },
     /// ターミナル（PTY）からの出力
@@ -199,15 +206,18 @@ mod tests {
         let _resize = AppEvent::Resize(80, 24);
         let _claude_output = AppEvent::ClaudeOutput {
             worktree_id: (0, 0),
+            session_id: 1,
             event: ClaudeStreamEvent::ContentDelta {
                 text: "hello".to_string(),
             },
         };
         let _claude_complete = AppEvent::ClaudeComplete {
             worktree_id: (0, 0),
+            session_id: 1,
         };
         let _claude_error = AppEvent::ClaudeError {
             worktree_id: (0, 0),
+            session_id: 1,
             error: "test error".to_string(),
         };
         let _terminal_output = AppEvent::TerminalOutput {

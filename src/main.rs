@@ -678,6 +678,7 @@ async fn handle_event(
         AppEvent::ClaudeOutput {
             worktree_id,
             event: ref stream_event,
+            ..
         } => {
             // Init イベントの claude_session_id を DB に保存
             if let event::ClaudeStreamEvent::Init { session_id } = stream_event {
@@ -705,7 +706,7 @@ async fn handle_event(
             }
             app.handle_claude_output(worktree_id, stream_event.clone());
         }
-        AppEvent::ClaudeComplete { worktree_id } => {
+        AppEvent::ClaudeComplete { worktree_id, .. } => {
             app.handle_claude_complete(worktree_id);
             // 選択中の worktree が完了した場合、Diff と SourceTree を自動更新
             if app.selected_worktree == Some(worktree_id) {
@@ -734,6 +735,7 @@ async fn handle_event(
         AppEvent::ClaudeError {
             worktree_id,
             error,
+            ..
         } => {
             app.handle_claude_error(worktree_id, &error);
         }
@@ -6297,6 +6299,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::ClaudeOutput {
                 worktree_id: (0, 0),
+                session_id: 1,
                 event: event::ClaudeStreamEvent::ContentDelta {
                     text: "hello".to_string(),
                 },
@@ -6342,6 +6345,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::ClaudeComplete {
                 worktree_id: (0, 0),
+                session_id: 1,
             },
             None,
             &None,
@@ -6382,6 +6386,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::ClaudeError {
                 worktree_id: (0, 0),
+                session_id: 1,
                 error: "test error".to_string(),
             },
             None,
