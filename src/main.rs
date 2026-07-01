@@ -33,11 +33,13 @@ type TerminalKey = (app::WorktreeId, usize);
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 
-/// reader thread が spawn 時に保持した tab_index に対応する claude_terms の key を返す。
+/// reader thread が spawn 時に保持した tab_index/worktree_id に対応する claude_terms の key を返す。
 ///
 /// Ctrl+W で Claude タブを閉じると `handle_claude_terminal_key` が HashMap key を詰めるため、
-/// reader thread が送ってくる event の `tab_index` は古くなる。まず元の位置を試し、
-/// terminal_id が一致しなければ同 worktree 内を scan して現在の key を再特定する。
+/// reader thread が送ってくる event の `tab_index` は古くなる。また worktree 削除による
+/// reindex（`reindex_worktree_maps`/`reindex_project_maps`）で `worktree_id` 自体も
+/// シフトすることがある。まず元の位置を試し、terminal_id が一致しなければ
+/// claude_terms 全体を terminal_id のみで走査して現在の key を再特定する。
 fn resolve_claude_term_key(
     claude_terms: &HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     worktree_id: app::WorktreeId,
@@ -51,7 +53,7 @@ fn resolve_claude_term_key(
     }
     claude_terms
         .iter()
-        .find(|(key, emu)| key.0 == worktree_id && emu.id() == terminal_id)
+        .find(|(_, emu)| emu.id() == terminal_id)
         .map(|(key, _)| *key)
 }
 
@@ -8041,7 +8043,31 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_claude_term_key_isolates_worktrees() {
+    fn test_resolve_claude_term_key_finds_across_worktree_shift() {
+        // worktree 削除による reindex_worktree_maps/reindex_project_maps で
+        // emulator の実キーの worktree_id 側がシフトすることがある（Bug A）。
+        // reader thread は spawn 時の古い worktree_id を送り続けるため、
+        // key.0 の一致に絞らず terminal_id のみで発見できなければならない（REQ-004）。
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_old: app::WorktreeId = (0, 3); // reader thread が保持し続ける古い worktree_id
+        let wt_new: app::WorktreeId = (0, 2); // reindex 後の実際の格納先
+
+        let emu = spawn_dummy_term(&tx, wt_old, CLAUDE_TAB_BASE);
+        let id = emu.id();
+
+        let mut claude_terms = HashMap::new();
+        // reindex_worktree_maps 相当: (wt_old, 0) → (wt_new, 0) へ移動済みの状態を再現
+        claude_terms.insert((wt_new, 0), emu);
+
+        // イベントは古い wt_old のまま届くが、terminal_id 一致で wt_new を発見できる
+        let key = resolve_claude_term_key(&claude_terms, wt_old, 0, id);
+        assert_eq!(key, Some((wt_new, 0)));
+    }
+
+    #[test]
+    fn test_resolve_claude_term_key_ignores_worktree_id_mismatch() {
+        // 別 worktree の emulator しか存在しない場合でも、terminal_id が一致すれば
+        // その emulator を返す（worktree_id はもはやヒントに過ぎない、REQ-004）。
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let wt_a: app::WorktreeId = (0, 0);
         let wt_b: app::WorktreeId = (0, 1);
@@ -8054,8 +8080,7 @@ mod tests {
         claude_terms.insert((wt_a, 0), emu_a);
         claude_terms.insert((wt_b, 0), emu_b);
 
-        // wt_b で id_a を問い合わせても、別 worktree の emulator は返さない
         let key = resolve_claude_term_key(&claude_terms, wt_b, 0, id_a);
-        assert_eq!(key, None);
+        assert_eq!(key, Some((wt_a, 0)));
     }
 }
