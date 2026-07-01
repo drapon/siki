@@ -8540,4 +8540,24 @@ mod tests {
         let key = resolve_claude_term_key(&claude_terms, wt_b, 0, id_a);
         assert_eq!(key, Some((wt_a, 0)));
     }
+
+    #[test]
+    fn test_resolve_claude_term_key_handles_combined_tab_and_worktree_shift() {
+        // EDGE-001: 同一 worktree 内での Ctrl+W によるタブ整理（claude_idx シフト）と、
+        // 別 worktree 削除による worktree_id シフトが同時に絡んでも解決できる。
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // reader thread は spawn 時の古い worktree_id=(0,3) と古い claude_idx=1 を
+        // 送り続ける想定（Ctrl+W でタブ1が閉じられタブ0に詰められ、かつ worktree 削除で
+        // (0,3) → (0,2) にシフト済み）
+        let wt_old: app::WorktreeId = (0, 3);
+        let wt_new: app::WorktreeId = (0, 2);
+
+        let emu = spawn_dummy_term(&tx, wt_old, CLAUDE_TAB_BASE + 1);
+        let id = emu.id();
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert((wt_new, 0), emu);
+
+        let key = resolve_claude_term_key(&claude_terms, wt_old, 1, id);
+        assert_eq!(key, Some((wt_new, 0)));
+    }
 }
