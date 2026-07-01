@@ -755,6 +755,13 @@ pub fn load_contexts(project_name: &str, worktree_name: &str) -> Vec<(String, St
     items
 }
 
+/// バイト数を KB に丸めて返す（四捨五入相当: +512 してから 1024 で割る）。
+/// list_sessions の background ポインタと SessionStart hook の件数表示で共用し、
+/// 丸め方針を一箇所に集約する。
+pub fn bytes_to_kb(bytes: usize) -> usize {
+    (bytes + 512) / 1024
+}
+
 /// Unix ソケットのパスを返す: ~/.siki/sock
 pub fn sock_path() -> std::path::PathBuf {
     siki_home().join("sock")
@@ -802,6 +809,17 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_bytes_to_kb_rounds_half_up() {
+        assert_eq!(bytes_to_kb(0), 0);
+        assert_eq!(bytes_to_kb(511), 0);
+        assert_eq!(bytes_to_kb(512), 1);
+        assert_eq!(bytes_to_kb(1023), 1);
+        assert_eq!(bytes_to_kb(1024), 1);
+        assert_eq!(bytes_to_kb(1536), 2);
+        assert_eq!(bytes_to_kb(2000), 2);
+    }
 
     #[test]
     fn test_parse_valid_config() {
