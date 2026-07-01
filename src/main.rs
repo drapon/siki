@@ -4517,6 +4517,10 @@ fn handle_remove_project_confirm_key(
                 // メモリから削除
                 app.projects.remove(pi);
 
+                // 削除位置より後ろの project_index を持つ sessions/terminals/claude_terms を
+                // 1つ前方へシフトする（REQ-102: プロジェクト削除の連鎖ズレ対策）
+                reindex_project_maps(sessions, terminals, claude_terms, pi);
+
                 // selected_worktree をリセット
                 if let Some((sel_pi, sel_wi)) = app.selected_worktree {
                     if sel_pi == pi {
@@ -8379,6 +8383,76 @@ mod tests {
         reindex_project_maps(&mut sessions, &mut terminals, &mut claude_terms, 0);
 
         assert!(sessions.contains_key(&(0, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_remove_project_confirm_reindexes_later_projects() {
+        // 3プロジェクト構成で中間（project_index=1）を削除すると、後続プロジェクト
+        // （project_index=2 だった "web"）の sessions が (1, 0) にシフトし、
+        // selected_worktree も (2,0) → (1,0) に補正される（REQ-102, REQ-103）
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![
+                ProjectConfig {
+                    name: "siki".to_string(),
+                    path: "/tmp/test-siki".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "b0".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "api".to_string(),
+                    path: "/tmp/test-api".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "b0".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "web".to_string(),
+                    path: "/tmp/test-web".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "b0".to_string(),
+                    }],
+                },
+            ],
+        };
+        let mut app = app::App::new(&config);
+        app.show_remove_project_confirm = true;
+        app.remove_project_target = Some(1); // "api" (project_index=1) を削除
+        app.selected_worktree = Some((2, 0)); // "web" を選択中だった
+
+        let mut sessions = HashMap::new();
+        sessions.insert((2, 0), claude::ClaudeSession::new_for_test(9));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+
+        let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        handle_remove_project_confirm_key(
+            &mut app,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            key,
+        );
+
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.projects[1].name, "web");
+        assert!(sessions.contains_key(&(1, 0)), "project_index=2 → 1 へシフトする");
+        assert!(!sessions.contains_key(&(2, 0)), "旧キーは残らない");
+        assert_eq!(
+            app.selected_worktree,
+            Some((1, 0)),
+            "selected_worktree も project_index シフトに追従する"
+        );
     }
 
     #[test]
