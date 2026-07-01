@@ -199,9 +199,9 @@ fn list_sessions_with_cwd(
             .sum();
         result["background"] = json!({
             "conversation_summary_count": summaries.len(),
-            "conversation_summary_kb": (summary_bytes + 512) / 1024,
+            "conversation_summary_kb": crate::config::bytes_to_kb(summary_bytes),
             "worktree_context_files": contexts.len(),
-            "worktree_context_kb": (total_bytes + 512) / 1024,
+            "worktree_context_kb": crate::config::bytes_to_kb(total_bytes),
             "hint": "Pass include_bodies:true to fetch the full conversation summaries and worktree context bodies (independent of scope). These can be large — prefer fetching only when the current task needs them.",
         });
     }

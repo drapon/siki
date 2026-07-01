@@ -273,7 +273,7 @@ pub fn build_additional_context(conn: &Connection, session_id: &str, cwd: &str) 
             lines.push(format!(
                 "- {} worktree context file(s) (~{} KB total)",
                 contexts.len(),
-                (total_bytes + 512) / 1024
+                crate::config::bytes_to_kb(total_bytes)
             ));
         }
         if !lines.is_empty() {
