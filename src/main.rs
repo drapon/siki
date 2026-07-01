@@ -4691,6 +4691,52 @@ fn reindex_worktree_maps(
     }
 }
 
+/// プロジェクト削除後、削除位置より後ろの project_index を持つ
+/// sessions / terminals / claude_terms のキーを1つ前にずらす。
+/// reindex_worktree_maps と対になる、project_index シフト専用の新設関数。
+fn reindex_project_maps(
+    sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    removed_project_index: usize,
+) {
+    // sessions: HashMap<(pi, wi), _>
+    let keys: Vec<_> = sessions
+        .keys()
+        .filter(|(pi, _)| *pi > removed_project_index)
+        .cloned()
+        .collect();
+    for (pi, wi) in keys {
+        if let Some(val) = sessions.remove(&(pi, wi)) {
+            sessions.insert((pi - 1, wi), val);
+        }
+    }
+
+    // terminals: HashMap<((pi, wi), tab), _>
+    let keys: Vec<_> = terminals
+        .keys()
+        .filter(|((pi, _), _)| *pi > removed_project_index)
+        .cloned()
+        .collect();
+    for ((pi, wi), tab) in keys {
+        if let Some(val) = terminals.remove(&((pi, wi), tab)) {
+            terminals.insert(((pi - 1, wi), tab), val);
+        }
+    }
+
+    // claude_terms: HashMap<((pi, wi), tab), _>
+    let keys: Vec<_> = claude_terms
+        .keys()
+        .filter(|((pi, _), _)| *pi > removed_project_index)
+        .cloned()
+        .collect();
+    for ((pi, wi), tab) in keys {
+        if let Some(val) = claude_terms.remove(&((pi, wi), tab)) {
+            claude_terms.insert(((pi - 1, wi), tab), val);
+        }
+    }
+}
+
 /// PTY ターミナルを実際の描画エリアに合わせてリサイズする
 fn resize_terminals(
     app: &app::App,
@@ -8275,6 +8321,64 @@ mod tests {
 
         let key = resolve_session_key(&sessions, wt_id, 999);
         assert_eq!(key, None);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_project_maps_shifts_later_projects() {
+        // project_index=1 を削除した想定。project_index=2 だったエントリはすべて
+        // project_index=1 のキーへ移動し、project_index=0 は変化しない
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        sessions.insert((2, 0), claude::ClaudeSession::new_for_test(2));
+
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        terminals.insert(((0, 0), 0), spawn_dummy_term(&tx, (0, 0), 0));
+        terminals.insert(((2, 1), 0), spawn_dummy_term(&tx, (2, 1), 0));
+
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert(((2, 0), 0), spawn_dummy_term(&tx, (2, 0), CLAUDE_TAB_BASE));
+
+        reindex_project_maps(&mut sessions, &mut terminals, &mut claude_terms, 1);
+
+        assert!(sessions.contains_key(&(0, 0)), "project_index=0 は変化しない");
+        assert!(!sessions.contains_key(&(2, 0)), "旧キーは残らない");
+        assert!(sessions.contains_key(&(1, 0)), "project_index=2 → 1 へシフトする");
+
+        assert!(terminals.contains_key(&((0, 0), 0)));
+        assert!(!terminals.contains_key(&((2, 1), 0)));
+        assert!(terminals.contains_key(&((1, 1), 0)));
+
+        assert!(!claude_terms.contains_key(&((2, 0), 0)));
+        assert!(claude_terms.contains_key(&((1, 0), 0)));
+    }
+
+    #[tokio::test]
+    async fn test_reindex_project_maps_noop_when_removing_last_project() {
+        // 末尾プロジェクト削除時はシフト対象が存在せず、何も変化しない（境界値 EDGE-101）
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        sessions.insert((1, 0), claude::ClaudeSession::new_for_test(2));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+
+        reindex_project_maps(&mut sessions, &mut terminals, &mut claude_terms, 1);
+
+        assert!(sessions.contains_key(&(0, 0)));
+        assert!(sessions.contains_key(&(1, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_reindex_project_maps_noop_with_single_project() {
+        // プロジェクトが1件のみの状態で削除する場合、シフト対象がなく正常終了する（EDGE-102）
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+
+        reindex_project_maps(&mut sessions, &mut terminals, &mut claude_terms, 0);
+
+        assert!(sessions.contains_key(&(0, 0)));
     }
 
     #[test]
