@@ -32,10 +32,10 @@
 
 ## 全体進捗
 
-- [ ] Phase 1: PTY/Claudeタブのid解決強化（Bug A）
-- [ ] Phase 2: ClaudeSessionのid化とルーティング修正（Bug B）
-- [ ] Phase 3: プロジェクト削除時のreindex追加（Bug C）
-- [ ] Phase 4: 統合確認・回帰防止
+- [x] Phase 1: PTY/Claudeタブのid解決強化（Bug A）
+- [x] Phase 2: ClaudeSessionのid化とルーティング修正（Bug B）
+- [x] Phase 3: プロジェクト削除時のreindex追加（Bug C）
+- [x] Phase 4: 統合確認・回帰防止
 
 ## マイルストーン
 
@@ -55,8 +55,8 @@
 
 ### タスク一覧
 
-- [ ] [TASK-0001: resolve_claude_term_keyのフォールバック範囲拡大](TASK-0001.md) - 2h (TDD) 🔵
-- [ ] [TASK-0002: terminals用resolve_terminal_key新設と配線](TASK-0002.md) - 3h (TDD) 🔵
+- [x] [TASK-0001: resolve_claude_term_keyのフォールバック範囲拡大](TASK-0001.md) - 2h (TDD) 🔵
+- [x] [TASK-0002: terminals用resolve_terminal_key新設と配線](TASK-0002.md) - 3h (TDD) 🔵
 
 ### 依存関係
 
@@ -74,9 +74,9 @@ TASK-0002 （独立、TASK-0001と並行実行可）
 
 ### タスク一覧
 
-- [ ] [TASK-0003: ClaudeSessionへのid採番追加](TASK-0003.md) - 2h (TDD) 🔵
-- [ ] [TASK-0004: AppEventへのsession_idフィールド追加と送信元配線](TASK-0004.md) - 1.5h (TDD) 🔵
-- [ ] [TASK-0005: resolve_session_key新設とClaudeOutput等ハンドラ書き換え](TASK-0005.md) - 3h (TDD) 🔵
+- [x] [TASK-0003: ClaudeSessionへのid採番追加](TASK-0003.md) - 2h (TDD) 🔵
+- [x] [TASK-0004: AppEventへのsession_idフィールド追加と送信元配線](TASK-0004.md) - 1.5h (TDD) 🔵
+- [x] [TASK-0005: resolve_session_key新設とClaudeOutput等ハンドラ書き換え](TASK-0005.md) - 3h (TDD) 🔵
 
 ### 依存関係
 
@@ -94,8 +94,8 @@ TASK-0003 → TASK-0004 → TASK-0005
 
 ### タスク一覧
 
-- [ ] [TASK-0006: reindex_project_maps新設](TASK-0006.md) - 2h (TDD) 🔵
-- [ ] [TASK-0007: handle_remove_project_confirm_keyへの配線](TASK-0007.md) - 1.5h (TDD) 🔵
+- [x] [TASK-0006: reindex_project_maps新設](TASK-0006.md) - 2h (TDD) 🔵
+- [x] [TASK-0007: handle_remove_project_confirm_keyへの配線](TASK-0007.md) - 1.5h (TDD) 🔵
 
 ### 依存関係
 
@@ -112,7 +112,7 @@ TASK-0006 → TASK-0007
 
 ### タスク一覧
 
-- [ ] [TASK-0008: 統合ビルド・テスト確認とエッジケース検証](TASK-0008.md) - 2h (DIRECT) 🔵
+- [x] [TASK-0008: 統合ビルド・テスト確認とエッジケース検証](TASK-0008.md) - 2h (DIRECT) 🔵
 
 ### 依存関係
 

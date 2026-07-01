@@ -44,10 +44,10 @@ fn resolve_terminal_key(
     tab_index: usize,
     terminal_id: u64,
 ) -> Option<TerminalKey> {
-    if let Some(emu) = terminals.get(&(worktree_id, tab_index)) {
-        if emu.id() == terminal_id {
-            return Some((worktree_id, tab_index));
-        }
+    if let Some(emu) = terminals.get(&(worktree_id, tab_index))
+        && emu.id() == terminal_id
+    {
+        return Some((worktree_id, tab_index));
     }
     terminals
         .iter()
@@ -68,10 +68,10 @@ fn resolve_claude_term_key(
     claude_idx: usize,
     terminal_id: u64,
 ) -> Option<(app::WorktreeId, usize)> {
-    if let Some(emu) = claude_terms.get(&(worktree_id, claude_idx)) {
-        if emu.id() == terminal_id {
-            return Some((worktree_id, claude_idx));
-        }
+    if let Some(emu) = claude_terms.get(&(worktree_id, claude_idx))
+        && emu.id() == terminal_id
+    {
+        return Some((worktree_id, claude_idx));
     }
     claude_terms
         .iter()
@@ -89,10 +89,10 @@ fn resolve_session_key(
     worktree_id: app::WorktreeId,
     session_id: u64,
 ) -> Option<app::WorktreeId> {
-    if let Some(session) = sessions.get(&worktree_id) {
-        if session.id() == session_id {
-            return Some(worktree_id);
-        }
+    if let Some(session) = sessions.get(&worktree_id)
+        && session.id() == session_id
+    {
+        return Some(worktree_id);
     }
     sessions
         .iter()
