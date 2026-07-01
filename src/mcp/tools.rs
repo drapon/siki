@@ -14,7 +14,15 @@ pub fn execute_tool(
     session_id: &str,
 ) -> Result<Value> {
     match tool_name {
-        "list_sessions" => list_sessions(conn, session_id, params),
+        "list_sessions" => {
+            // 未登録呼び出し元のフォールバック用に MCP サーバープロセスの cwd を渡す。
+            // MCP サーバーはその session の worktree で spawn されるため current_dir が
+            // worktree パスになる（session_start.rs の cwd フォールバックと同方針）。
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            list_sessions_with_cwd(conn, session_id, &cwd, params)
+        }
         "send_message" => send_message(conn, params, session_id),
         "broadcast" => broadcast(conn, params, session_id),
         "set_summary" => set_summary(conn, params, session_id),
@@ -28,7 +36,12 @@ pub fn execute_tool(
     }
 }
 
-fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<Value> {
+fn list_sessions_with_cwd(
+    conn: &Connection,
+    session_id: &str,
+    cwd: &str,
+    params: &Value,
+) -> Result<Value> {
     // 既定スコープは "project"。"machine" を既定にするとマシン上の全 worktree・
     // 全 project のセッションを返してしまい、無関係なノイズで応答が膨らむ。
     // マシン全体を見たいときは scope:"machine" を明示する。
@@ -48,11 +61,23 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
 
     let all_sessions = db::list_sessions(conn)?;
 
-    // 自セッションの worktree/project を特定（スコープフィルタに使用）
+    // 自セッションの worktree/project を特定（スコープフィルタに使用）。
+    // 登録済みなら DB の proj/wt を使う。DB 未登録（siki への register と upsert 完了の
+    // 間のレース中など）は cwd から補完する。補完しないと自分の proj/wt が特定できず、
+    // project スコープのフィルタと project broadcast の受信で空・取りこぼしになる
+    // （session_start.rs の cwd 派生と同方針。"unknown" センチネルは無効扱い）。
     let my_worktree = all_sessions.iter().find(|s| s.session_id == session_id);
-    let (wt, proj) = my_worktree
-        .map(|s| (s.worktree_name.as_str(), s.project_name.as_str()))
-        .unwrap_or(("", ""));
+    let (wt, proj): (String, String) = match my_worktree {
+        Some(s) => (s.worktree_name.clone(), s.project_name.clone()),
+        None => {
+            let (p, w) = crate::session::guess_names_from_cwd(cwd);
+            if p == "unknown" || w == "unknown" {
+                (String::new(), String::new())
+            } else {
+                (w, p)
+            }
+        }
+    };
 
     // scope に応じてフィルタ。enum 外の値はサイレントに machine 扱いにせず拒否する
     // （broadcast と同じコントラクト。タイポが全件返却で気付かれないのを防ぐ）。
@@ -89,7 +114,7 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         })
         .collect();
 
-    let pending = db::get_pending_messages(conn, session_id, wt, proj)?;
+    let pending = db::get_pending_messages(conn, session_id, &wt, &proj)?;
     let msg_ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
     let messages: Vec<Value> = pending
         .iter()
@@ -113,14 +138,14 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
     // （std::env::current_dir() はMCPサーバーの起動元CWDであり、worktreeパスと異なる場合がある）
     let valid_worktree = !proj.is_empty() && !wt.is_empty();
     let contexts = if valid_worktree {
-        crate::config::load_contexts(proj, wt)
+        crate::config::load_contexts(&proj, &wt)
     } else {
         Vec::new()
     };
     // messages 本文を載せない軽量クエリを使う（件数・サマリのみ必要なため）。
     // DB エラーは握り潰さず呼び出し元へ伝播させる（同関数冒頭の db::list_sessions(conn)? と一貫）。
     let summaries = if valid_worktree {
-        db::get_conversation_log_summaries_by_worktree(conn, wt, proj)?
+        db::get_conversation_log_summaries_by_worktree(conn, &wt, &proj)?
     } else {
         Vec::new()
     };
@@ -182,6 +207,13 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
     }
 
     Ok(result)
+}
+
+/// テスト用の薄いラッパ。cwd フォールバックを効かせない（cwd 空）決定的な入口。
+/// 本番経路は execute_tool が current_dir を渡して list_sessions_with_cwd を呼ぶ。
+#[cfg(test)]
+fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<Value> {
+    list_sessions_with_cwd(conn, session_id, "", params)
 }
 
 fn send_message(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
@@ -825,6 +857,53 @@ mod tests {
         // 登録済み呼び出し元には診断フラグは付かない
         let result = list_sessions(&conn, "s1", &json!({})).unwrap();
         assert!(result.get("caller_unregistered").is_none());
+    }
+
+    #[test]
+    fn test_list_sessions_unregistered_caller_derives_proj_from_cwd() {
+        // DB 未登録の呼び出し元でも、cwd が workspaces 配下なら proj/wt を補完し、
+        // 同 project のセッション表示と project broadcast の受信ができる（登録レース対策）。
+        // guess_names_from_cwd は FS を読まず文字列でパスを分解するため実ファイル作成は不要。
+        let proj = "m2proj";
+        let wt = "m2wt";
+        let cwd = crate::config::workspaces_dir()
+            .join(proj)
+            .join(wt)
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        // 同 project の登録済みセッションと送信者
+        db::upsert_session(&conn, "peer", "default", "otherwt", proj, "/tmp/p", "idle").unwrap();
+        db::upsert_session(&conn, "sender", "default", "otherwt", proj, "/tmp/s", "idle").unwrap();
+        // 別 project のセッション（project スコープから除外される確認用）
+        db::upsert_session(&conn, "outsider", "default", "bwt", "bproj", "/tmp/o", "idle").unwrap();
+        // 登録済み sender が project broadcast（to_project = m2proj）
+        broadcast(&conn, &json!({ "message": "for the project" }), "sender").unwrap();
+
+        // 未登録 "ghost" が cwd 付きで既定（project）スコープで呼ぶ
+        let result = list_sessions_with_cwd(&conn, "ghost", &cwd, &json!({})).unwrap();
+
+        // DB 未登録の診断は付く（登録は完了していない）
+        assert_eq!(result["caller_unregistered"], true);
+        // cwd から proj を補完 → 同 project のセッションだけが見える（別 project は除外）
+        let ids: Vec<&str> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"peer"), "should see same-project peer, got {:?}", ids);
+        assert!(ids.contains(&"sender"), "should see same-project sender, got {:?}", ids);
+        assert!(!ids.contains(&"outsider"), "must exclude other project, got {:?}", ids);
+        // project broadcast を取りこぼさない
+        let msgs = result["pending_messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "unregistered caller should receive project broadcast via cwd");
+        assert_eq!(msgs[0]["content"], "for the project");
+
+        // cwd が空（従来の未登録経路）なら補完できず空のまま（回帰の確認）
+        let empty = list_sessions_with_cwd(&conn, "ghost", "", &json!({})).unwrap();
+        assert_eq!(empty["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(empty["pending_messages"].as_array().unwrap().len(), 0);
     }
 
     #[test]
