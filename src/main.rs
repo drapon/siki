@@ -19,6 +19,7 @@ mod ui;
 
 use anyhow::Result;
 use config::load_config;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,13 @@ enum DispatchAction {
     MarkReadAndClear,
     IncrementRetry(u32),
     MarkReadAndAlert,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpawnRequestPayload {
+    parent: String,
+    branch: String,
+    worktree_name: Option<String>,
 }
 
 fn decide_dispatch_action(
@@ -76,6 +84,87 @@ fn sync_worktree_parents_from_meta(app: &mut app::App) {
             }
         }
     }
+}
+
+fn process_spawn_requests(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    conn: &rusqlite::Connection,
+) {
+    let Ok(requests) = db::get_pending_spawn_requests(conn) else {
+        return;
+    };
+    for request in requests {
+        handle_spawn_request(app, terminals, event_tx, shell, &request);
+        let _ = db::mark_messages_read(conn, &[request.id]);
+    }
+}
+
+fn handle_spawn_request(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    request: &db::SpawnRequestRow,
+) {
+    let Some(project_name) = request.to_project.as_deref() else {
+        app.show_error("spawn_request の project が未指定です".to_string());
+        return;
+    };
+    let Some(project_index) = app.projects.iter().position(|p| p.name == project_name) else {
+        app.show_error(format!("spawn_request の project が見つかりません: {}", project_name));
+        return;
+    };
+    let payload = match serde_json::from_str::<SpawnRequestPayload>(&request.content) {
+        Ok(payload) => payload,
+        Err(e) => {
+            app.show_error(format!("spawn_request のJSON解析に失敗: {}", e));
+            return;
+        }
+    };
+    if !app.projects[project_index]
+        .worktrees
+        .iter()
+        .any(|w| w.name == payload.parent)
+    {
+        app.show_error(format!("spawn_request の親worktreeが見つかりません: {}", payload.parent));
+        return;
+    }
+    let worktree_name = resolve_spawn_worktree_name(app, project_index, payload.worktree_name);
+    if spawn_worktree_name_exists(app, project_index, &worktree_name) {
+        app.show_error(format!("spawn_request のworktree名が重複しています: {}", worktree_name));
+        return;
+    }
+    if let Err(e) = create_worktree_internal(
+        app, terminals, event_tx, shell,
+        project_index, &worktree_name, &payload.branch, None, false, None, Some(&payload.parent),
+    ) {
+        app.show_error(e);
+    }
+}
+
+fn resolve_spawn_worktree_name(
+    app: &app::App,
+    project_index: usize,
+    requested: Option<String>,
+) -> String {
+    if let Some(name) = requested {
+        return name;
+    }
+    let existing_names: Vec<String> = app.projects[project_index]
+        .worktrees
+        .iter()
+        .map(|w| w.name.clone())
+        .collect();
+    config::generate_worktree_name(&existing_names)
+}
+
+fn spawn_worktree_name_exists(app: &app::App, project_index: usize, worktree_name: &str) -> bool {
+    let project = &app.projects[project_index];
+    project.worktrees.iter().any(|w| w.name == worktree_name)
+        || config::worktree_path(&project.name, worktree_name).exists()
 }
 
 fn detach_children_of_removed_worktree(app: &mut app::App, pi: usize, removed_name: &str) {
@@ -1915,6 +2004,7 @@ async fn handle_event(
                         }
                     }
                 }
+                process_spawn_requests(app, terminals, event_tx, shell, &conn);
             }
         }
     }
@@ -2320,51 +2410,19 @@ fn trimmed_or_none(input: &str) -> Option<String> {
     }
 }
 
-/// worktree 作成の共通処理（モード問わず）
-fn finalize_add_worktree(
-    app: &mut app::App,
-    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
-    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
-    shell: &str,
-    branch: &str,
-    start_point: Option<&str>,
-    no_track: bool,
+fn new_worktree_entry(
+    wt_name: &str,
     display_name: Option<&str>,
-) {
-    let pi = app.add_worktree_project_index;
-    let wt_name = app.add_worktree_name.clone();
-
-    let project_name = app.projects[pi].name.clone();
-    let project_path = app.projects[pi].path.clone();
-    let wt_path = config::worktree_path(&project_name, &wt_name);
-
-    let shared_dirs = config::load_effective_shared_dirs(&project_name);
-
-    if let Err(e) = git::WorktreeManager::create_worktree_from_ref(
-        &project_path,
-        &wt_path,
-        branch,
-        start_point,
-        no_track,
-        &shared_dirs,
-    ) {
-        app.show_error(format!("worktree の作成に失敗: {}", e));
-        app.show_add_worktree_popup = false;
-        app.add_worktree_input.clear();
-        app.add_worktree_branch_filter.clear();
-        app.add_worktree_display_input.clear();
-        app.add_worktree_display_focus = false;
-        app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
-        return;
-    }
-
-    // メモリ上に worktree を追加
-    app.projects[pi].worktrees.push(app::Worktree {
-        name: wt_name.clone(),
+    parent: Option<&str>,
+    branch: &str,
+    wt_path: std::path::PathBuf,
+) -> app::Worktree {
+    app::Worktree {
+        name: wt_name.to_string(),
         display_name: display_name.map(|s| s.to_string()),
-        parent: None,
+        parent: parent.map(|s| s.to_string()),
         branch: branch.to_string(),
-        path: wt_path.clone(),
+        path: wt_path,
         chat_history: Vec::new(),
         open_files: Vec::new(),
         active_tab: 0,
@@ -2379,7 +2437,49 @@ fn finalize_add_worktree(
         claude_session_id: None,
         context_items: Vec::new(),
         context_cursor: 0,
-    });
+    }
+}
+
+/// worktree 作成のコア処理（状態レス）
+fn create_worktree_internal(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    project_index: usize,
+    worktree_name: &str,
+    branch: &str,
+    start_point: Option<&str>,
+    no_track: bool,
+    display_name: Option<&str>,
+    parent: Option<&str>,
+) -> std::result::Result<(), String> {
+    let pi = project_index;
+    let wt_name = worktree_name.to_string();
+    let project_name = app.projects[pi].name.clone();
+    let project_path = app.projects[pi].path.clone();
+    let wt_path = config::worktree_path(&project_name, &wt_name);
+    let shared_dirs = config::load_effective_shared_dirs(&project_name);
+
+    if let Err(e) = git::WorktreeManager::create_worktree_from_ref(
+        &project_path,
+        &wt_path,
+        branch,
+        start_point,
+        no_track,
+        &shared_dirs,
+    ) {
+        return Err(format!("worktree の作成に失敗: {}", e));
+    }
+
+    // メモリ上に worktree を追加
+    app.projects[pi].worktrees.push(new_worktree_entry(
+        &wt_name,
+        display_name,
+        parent,
+        branch,
+        wt_path.clone(),
+    ));
 
     // PR 情報を非同期取得
     let wi = app.projects[pi].worktrees.len() - 1;
@@ -2407,6 +2507,15 @@ fn finalize_add_worktree(
         }
     }
 
+    // 親リンクが指定されていれば project.json に永続化
+    if let Some(parent_name) = parent {
+        if let Err(e) =
+            config::save_worktree_parent(&project_name, &wt_name, Some(parent_name))
+        {
+            app.show_error(format!("親リンクの保存に失敗: {}", e));
+        }
+    }
+
     // setup スクリプトがあれば実行（siki.json 優先、なければ project.json）
     let wi = app.projects[pi].worktrees.len() - 1;
     let wt_id = (pi, wi);
@@ -2418,6 +2527,30 @@ fn finalize_add_worktree(
                 wt_id, setup_script, &wt_name, &wt_path,
             );
         }
+    }
+
+    Ok(())
+}
+
+/// worktree 作成の共通処理（モード問わず）
+fn finalize_add_worktree(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    branch: &str,
+    start_point: Option<&str>,
+    no_track: bool,
+    display_name: Option<&str>,
+) {
+    let pi = app.add_worktree_project_index;
+    let wt_name = app.add_worktree_name.clone();
+
+    if let Err(e) = create_worktree_internal(
+        app, terminals, event_tx, shell,
+        pi, &wt_name, branch, start_point, no_track, display_name, None,
+    ) {
+        app.show_error(e);
     }
 
     app.show_add_worktree_popup = false;
@@ -5961,6 +6094,18 @@ mod tests {
         Arc::new(Mutex::new(db::init(std::path::Path::new(":memory:")).unwrap()))
     }
 
+    fn init_git_repo() -> tempfile::TempDir {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+        std::process::Command::new("git").args(["init"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.name", "Test"]).current_dir(project_path).output().unwrap();
+        std::fs::write(project_path.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git").args(["add", "."]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["commit", "-m", "initial"]).current_dir(project_path).output().unwrap();
+        temp_dir
+    }
+
     struct TestProjectMeta {
         name: String,
     }
@@ -5998,12 +6143,182 @@ mod tests {
         }
     }
 
+    fn config_with_project_path(project_name: &str, project_path: String) -> Config {
+        Config {
+            siki: SikiConfig::default(),
+            projects: vec![ProjectConfig {
+                name: project_name.to_string(),
+                path: project_path,
+                display_name: None,
+                worktrees: vec![WorktreeConfig {
+                    name: "feature".to_string(),
+                    branch: "main".to_string(),
+                }],
+            }],
+        }
+    }
+
     fn worktree_parent(app: &app::App, name: &str) -> Option<String> {
         app.projects[0]
             .worktrees
             .iter()
             .find(|worktree| worktree.name == name)
             .and_then(|worktree| worktree.parent.clone())
+    }
+
+    #[tokio::test]
+    async fn create_worktree_internal_works_without_popup_state_and_sets_parent() {
+        let temp_dir = init_git_repo();
+        let project_name = format!("task-0009-create-parent-{}", std::process::id());
+        let _ = config::remove_project_meta(&project_name);
+        config::save_project_meta(&project_name, temp_dir.path()).unwrap();
+        let config = config_with_project_path(&project_name, temp_dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = create_worktree_internal(
+            &mut app, &mut terminals, &tx, "/bin/sh",
+            0, "child", "feature/child", None, false, None, Some("feature"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(app.projects[0].worktrees.len(), 2);
+        let child = app.projects[0].worktrees.last().unwrap();
+        assert_eq!(child.name, "child");
+        assert_eq!(child.parent.as_deref(), Some("feature"));
+        let meta = config::load_worktree_meta(&project_name, "child").unwrap();
+        assert_eq!(meta.parent.as_deref(), Some("feature"));
+        let _ = git::WorktreeManager::remove_worktree(temp_dir.path(), &config::worktree_path(&project_name, "child"));
+        let _ = config::remove_project_meta(&project_name);
+    }
+
+    #[tokio::test]
+    async fn create_worktree_internal_with_no_parent_does_not_write_parent_meta() {
+        let temp_dir = init_git_repo();
+        let project_name = format!("task-0009-create-no-parent-{}", std::process::id());
+        let _ = config::remove_project_meta(&project_name);
+        config::save_project_meta(&project_name, temp_dir.path()).unwrap();
+        let config = config_with_project_path(&project_name, temp_dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = create_worktree_internal(
+            &mut app, &mut terminals, &tx, "/bin/sh",
+            0, "child", "feature/no-parent", None, false, None, None,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(worktree_parent(&app, "child"), None);
+        assert!(config::load_worktree_meta(&project_name, "child").is_none());
+        let _ = git::WorktreeManager::remove_worktree(temp_dir.path(), &config::worktree_path(&project_name, "child"));
+        let _ = config::remove_project_meta(&project_name);
+    }
+
+    #[tokio::test]
+    async fn create_worktree_internal_returns_err_without_pushing_on_git_failure() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let project_name = format!("task-0009-create-fail-{}", std::process::id());
+        let _ = config::remove_project_meta(&project_name);
+        config::save_project_meta(&project_name, temp_dir.path()).unwrap();
+        let config = config_with_project_path(&project_name, temp_dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let initial_count = app.projects[0].worktrees.len();
+
+        let result = create_worktree_internal(
+            &mut app, &mut terminals, &tx, "/bin/sh",
+            0, "child", "feature/fail", None, false, None, Some("feature"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(app.projects[0].worktrees.len(), initial_count);
+        assert!(config::load_worktree_meta(&project_name, "child").is_none());
+        let _ = config::remove_project_meta(&project_name);
+    }
+
+    #[test]
+    fn process_spawn_requests_marks_read_for_unknown_project() {
+        let conn = db::init(std::path::Path::new(":memory:")).unwrap();
+        db::insert_message(
+            &conn,
+            "s1",
+            None,
+            None,
+            Some("missing-project"),
+            r#"{"parent":"feature","branch":"feature/x","worktree_name":"child"}"#,
+            "spawn_request",
+            None,
+        )
+        .unwrap();
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        process_spawn_requests(&mut app, &mut terminals, &tx, "/bin/sh", &conn);
+
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, app::StatusLevel::Error);
+        assert!(msg.text.contains("project が見つかりません"));
+    }
+
+    #[test]
+    fn process_spawn_requests_marks_read_for_invalid_json() {
+        let conn = db::init(std::path::Path::new(":memory:")).unwrap();
+        db::insert_message(
+            &conn,
+            "s1",
+            None,
+            None,
+            Some("test-project"),
+            "{not-json",
+            "spawn_request",
+            None,
+        )
+        .unwrap();
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        process_spawn_requests(&mut app, &mut terminals, &tx, "/bin/sh", &conn);
+
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, app::StatusLevel::Error);
+        assert!(msg.text.contains("JSON解析に失敗"));
+    }
+
+    #[test]
+    fn process_spawn_requests_marks_read_for_missing_parent() {
+        let conn = db::init(std::path::Path::new(":memory:")).unwrap();
+        db::insert_message(
+            &conn,
+            "s1",
+            None,
+            None,
+            Some("test-project"),
+            r#"{"parent":"missing","branch":"feature/x","worktree_name":"child"}"#,
+            "spawn_request",
+            None,
+        )
+        .unwrap();
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        process_spawn_requests(&mut app, &mut terminals, &tx, "/bin/sh", &conn);
+
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+        assert_eq!(app.projects[0].worktrees.len(), 1);
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, app::StatusLevel::Error);
+        assert!(msg.text.contains("親worktreeが見つかりません"));
     }
 
     #[test]

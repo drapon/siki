@@ -137,6 +137,25 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "spawn_child_worktree".to_string(),
+            description: "Request creation of a child worktree under a parent in the caller's project. TUI Tick processes the request asynchronously.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "parent": {
+                        "type": "string",
+                        "description": "生成した子の親とするworktree名（通常は呼び出し元自身）"
+                    },
+                    "branch": { "type": "string" },
+                    "worktree_name": {
+                        "type": "string",
+                        "description": "省略時は既存のworktree名自動採番規則に従う"
+                    }
+                },
+                "required": ["parent", "branch"]
+            }),
+        },
+        ToolDefinition {
             name: "broadcast".to_string(),
             description: "Broadcast a message to other sessions. By default (scope: project) only sessions in the sender's project receive it; scope: machine reaches every session on the machine.".to_string(),
             input_schema: serde_json::json!({
@@ -301,7 +320,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -312,6 +331,7 @@ mod tests {
         assert!(names.contains(&"send_message"));
         assert!(names.contains(&"dispatch"));
         assert!(names.contains(&"move_worktree"));
+        assert!(names.contains(&"spawn_child_worktree"));
         assert!(names.contains(&"broadcast"));
         assert!(names.contains(&"set_summary"));
         assert!(names.contains(&"handoff"));

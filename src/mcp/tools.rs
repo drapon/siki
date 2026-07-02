@@ -34,6 +34,7 @@ pub fn execute_tool(
         "summarize_history" => summarize_history(conn, params, session_id),
         "dispatch" => dispatch(conn, params, session_id),
         "move_worktree" => move_worktree(conn, params, session_id),
+        "spawn_child_worktree" => spawn_child_worktree(conn, params, session_id),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -373,6 +374,58 @@ fn move_worktree(conn: &Connection, params: &Value, from_session: &str) -> Resul
     crate::config::save_worktree_parent(&project_name, child, parent)?;
 
     Ok(json!({ "child": child, "parent": parent }))
+}
+
+/// 呼び出し元project内に子worktree生成要求を投入する。
+fn spawn_child_worktree(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
+    let parent = params
+        .get("parent")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("parent is required"))?;
+    let branch = params
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("branch is required"))?;
+    let worktree_name = params.get("worktree_name").and_then(|v| v.as_str());
+
+    let all_sessions = db::list_sessions(conn)?;
+    let project_name = all_sessions
+        .iter()
+        .find(|s| s.session_id == from_session)
+        .map(|s| s.project_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("caller session not found"))?;
+
+    if !crate::config::worktree_path(&project_name, parent).exists() {
+        anyhow::bail!("parent worktree not found: {}", parent);
+    }
+    if let Some(name) = worktree_name {
+        if crate::config::worktree_path(&project_name, name).exists() {
+            anyhow::bail!("worktree already exists: {}", name);
+        }
+    }
+
+    let content = json!({
+        "parent": parent,
+        "branch": branch,
+        "worktree_name": worktree_name,
+    });
+    db::insert_message(
+        conn,
+        from_session,
+        None,
+        None,
+        Some(&project_name),
+        &content.to_string(),
+        "spawn_request",
+        None,
+    )?;
+
+    Ok(json!({
+        "requested": true,
+        "parent": parent,
+        "branch": branch,
+        "worktree_name": worktree_name,
+    }))
 }
 
 fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
@@ -1516,6 +1569,101 @@ mod tests {
 
         assert!(err.to_string().contains("child worktree not found: Y"));
         assert!(config::load_worktree_meta(&project.name, "Y").is_none());
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_inserts_spawn_request() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-ok", &["parent"]);
+        db::upsert_session(&conn, "s1", "default", "parent", &project.name, "/tmp/parent", "idle").unwrap();
+
+        let result = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "parent", "branch": "feature/child", "worktree_name": "child"}),
+            "s1",
+        )
+        .unwrap();
+
+        assert_eq!(result, json!({
+            "requested": true,
+            "parent": "parent",
+            "branch": "feature/child",
+            "worktree_name": "child",
+        }));
+        let rows = db::get_pending_spawn_requests(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].to_project.as_deref(), Some(project.name.as_str()));
+        let content: Value = serde_json::from_str(&rows[0].content).unwrap();
+        assert_eq!(content["parent"], "parent");
+        assert_eq!(content["branch"], "feature/child");
+        assert_eq!(content["worktree_name"], "child");
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_allows_omitted_worktree_name() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-auto-name", &["parent"]);
+        db::upsert_session(&conn, "s1", "default", "parent", &project.name, "/tmp/parent", "idle").unwrap();
+
+        let result = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "parent", "branch": "feature/child"}),
+            "s1",
+        )
+        .unwrap();
+
+        assert_eq!(result["worktree_name"], Value::Null);
+        let content: Value =
+            serde_json::from_str(&db::get_pending_spawn_requests(&conn).unwrap()[0].content).unwrap();
+        assert_eq!(content["worktree_name"], Value::Null);
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_requires_parent_and_branch() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "parent", "myapp", "/tmp/parent", "idle").unwrap();
+
+        let missing_parent = spawn_child_worktree(&conn, &json!({"branch": "feature/x"}), "s1")
+            .unwrap_err();
+        assert!(missing_parent.to_string().contains("parent is required"));
+
+        let missing_branch = spawn_child_worktree(&conn, &json!({"parent": "parent"}), "s1")
+            .unwrap_err();
+        assert!(missing_branch.to_string().contains("branch is required"));
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_rejects_missing_parent() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-missing-parent", &["main"]);
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "missing", "branch": "feature/x"}),
+            "s1",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("parent worktree not found: missing"));
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_rejects_existing_worktree_name() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-existing", &["parent", "child"]);
+        db::upsert_session(&conn, "s1", "default", "parent", &project.name, "/tmp/parent", "idle").unwrap();
+
+        let err = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "parent", "branch": "feature/x", "worktree_name": "child"}),
+            "s1",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("worktree already exists: child"));
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
     }
 
     #[test]
