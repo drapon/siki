@@ -32,6 +32,7 @@ pub fn execute_tool(
         "save_skill" => save_skill(params),
         "list_skills" => list_skills(params),
         "summarize_history" => summarize_history(conn, params, session_id),
+        "dispatch" => dispatch(conn, params, session_id),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -290,6 +291,47 @@ fn broadcast(conn: &Connection, params: &Value, from_session: &str) -> Result<Va
 
     let effective_scope = if to_project.is_some() { "project" } else { "machine" };
     Ok(json!({ "delivered": true, "scope": effective_scope }))
+}
+
+/// 指揮者worktreeから対象worktreeのClaudeターミナルへプロンプトを自動投入する。
+///
+/// DB へ message_type='dispatch' の行を INSERT するのみで、実際の PTY 書き込みは
+/// TUI 本体の Tick が担う（人間の承認ステップは挟まない）。
+/// target.type "subtree" はスキーマ上先行宣言されているが、Phase 2 で
+/// get_descendants が配線されるまで明示的にエラーとする。
+fn dispatch(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
+    let target = params.get("target").ok_or_else(|| anyhow::anyhow!("target is required"))?;
+    let target_type = target
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("target.type is required"))?;
+    let target_id = target
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("target.id is required"))?;
+    let prompt = params
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("prompt is required"))?;
+
+    // 呼び出し元セッションの project_name を自己解決（list_sessions と同じパターン）
+    let all_sessions = db::list_sessions(conn)?;
+    let project_name = all_sessions
+        .iter()
+        .find(|s| s.session_id == from_session)
+        .map(|s| s.project_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("caller session not found"))?;
+
+    let targets: Vec<String> = match target_type {
+        "worktree" => vec![target_id.to_string()],
+        _ => anyhow::bail!("Invalid or not-yet-supported target type: {}", target_type),
+    };
+
+    for wt_name in &targets {
+        db::insert_message(conn, from_session, None, Some(wt_name), Some(&project_name), prompt, "dispatch", None)?;
+    }
+
+    Ok(json!({ "dispatched": targets.len(), "targets": targets }))
 }
 
 fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
@@ -1137,6 +1179,78 @@ mod tests {
         let bg = result.get("background").expect("background pointer expected");
         // 2000 bytes → (2000 + 512) / 1024 = 2 KB
         assert_eq!(bg["conversation_summary_kb"], 2);
+    }
+
+    #[test]
+    fn test_dispatch_to_worktree_inserts_dispatch_message() {
+        let conn = test_db();
+        db::upsert_session(&conn, "parent", "default", "main", "myapp", "/tmp/main", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "worktree", "id": "child-a" },
+            "prompt": "do X"
+        });
+
+        let result = dispatch(&conn, &params, "parent").unwrap();
+        assert_eq!(result, json!({"dispatched": 1, "targets": ["child-a"]}));
+
+        let dispatches = db::get_pending_dispatches(&conn).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].to_worktree.as_deref(), Some("child-a"));
+        assert_eq!(dispatches[0].to_project.as_deref(), Some("myapp"));
+        assert_eq!(dispatches[0].content, "do X");
+
+        let message_type: String = conn
+            .query_row("SELECT message_type FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_type, "dispatch");
+    }
+
+    #[test]
+    fn test_dispatch_rejects_not_yet_supported_target_types() {
+        let conn = test_db();
+        db::upsert_session(&conn, "parent", "default", "main", "myapp", "/tmp/main", "idle").unwrap();
+
+        // "subtree" は Phase 2（TASK-0007）まで意図的にエラーとする
+        for target_type in ["subtree", "invalid"] {
+            let params = json!({
+                "target": { "type": target_type, "id": "child-a" },
+                "prompt": "do X"
+            });
+            let err = dispatch(&conn, &params, "parent").unwrap_err();
+            assert!(
+                err.to_string().contains("Invalid or not-yet-supported target type"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatch_requires_target_and_prompt() {
+        let conn = test_db();
+        db::upsert_session(&conn, "parent", "default", "main", "myapp", "/tmp/main", "idle").unwrap();
+
+        let missing_target = dispatch(&conn, &json!({"prompt": "do X"}), "parent").unwrap_err();
+        assert!(missing_target.to_string().contains("target is required"));
+
+        let missing_prompt = dispatch(
+            &conn,
+            &json!({"target": { "type": "worktree", "id": "child-a" }}),
+            "parent",
+        )
+        .unwrap_err();
+        assert!(missing_prompt.to_string().contains("prompt is required"));
+    }
+
+    #[test]
+    fn test_dispatch_rejects_unknown_caller_session() {
+        let conn = test_db();
+        let params = json!({
+            "target": { "type": "worktree", "id": "child-a" },
+            "prompt": "do X"
+        });
+
+        let err = dispatch(&conn, &params, "missing").unwrap_err();
+        assert!(err.to_string().contains("caller session not found"));
     }
 
     #[test]

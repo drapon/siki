@@ -100,6 +100,25 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "dispatch".to_string(),
+            description: "Send a prompt to a worktree's Claude terminal for fully-automatic injection (no human approval step, TUI Tick delivers it)".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["worktree", "subtree"] },
+                            "id": { "type": "string", "description": "worktree名（typeがsubtreeの場合は指揮者worktree名）" }
+                        },
+                        "required": ["type", "id"]
+                    },
+                    "prompt": { "type": "string" }
+                },
+                "required": ["target", "prompt"]
+            }),
+        },
+        ToolDefinition {
             name: "broadcast".to_string(),
             description: "Broadcast a message to other sessions. By default (scope: project) only sessions in the sender's project receive it; scope: machine reaches every session on the machine.".to_string(),
             input_schema: serde_json::json!({
@@ -264,7 +283,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
@@ -273,8 +292,21 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"list_sessions"));
         assert!(names.contains(&"send_message"));
+        assert!(names.contains(&"dispatch"));
         assert!(names.contains(&"broadcast"));
         assert!(names.contains(&"set_summary"));
         assert!(names.contains(&"handoff"));
+    }
+
+    #[test]
+    fn test_dispatch_tool_schema_includes_subtree_target_type() {
+        // "subtree" は Phase 2 で実装されるが、スキーマ変更を避けるため enum には先行して含める
+        let tools = tool_definitions();
+        let dispatch = tools.iter().find(|t| t.name == "dispatch").unwrap();
+        let enum_values =
+            &dispatch.input_schema["properties"]["target"]["properties"]["type"]["enum"];
+        let values = enum_values.as_array().unwrap();
+        assert!(values.contains(&serde_json::json!("worktree")));
+        assert!(values.contains(&serde_json::json!("subtree")));
     }
 }
