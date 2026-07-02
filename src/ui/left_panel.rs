@@ -1,5 +1,5 @@
 use crate::app::{App, Project, Worktree, WorktreeId};
-use crate::session::SessionRegistry;
+use crate::session::{SessionRegistry, SessionState};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use std::collections::{HashMap, HashSet};
@@ -115,6 +115,82 @@ impl LeftPanel {
         }
     }
 
+    fn descendants_of(worktrees: &[Worktree], root: &str) -> Vec<usize> {
+        let mut children_of: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+        for (wi, wt) in worktrees.iter().enumerate() {
+            children_of.entry(wt.parent.as_deref()).or_default().push(wi);
+        }
+
+        let mut descendants = Vec::new();
+        let mut visited = HashSet::new();
+        Self::push_descendants(
+            root,
+            Some(root),
+            worktrees,
+            &children_of,
+            &mut descendants,
+            &mut visited,
+        );
+        descendants
+    }
+
+    fn push_descendants<'a>(
+        root: &str,
+        parent_key: Option<&'a str>,
+        worktrees: &'a [Worktree],
+        children_of: &HashMap<Option<&'a str>, Vec<usize>>,
+        descendants: &mut Vec<usize>,
+        visited: &mut HashSet<usize>,
+    ) {
+        let Some(children) = children_of.get(&parent_key) else {
+            return;
+        };
+        for wi in children {
+            if worktrees[*wi].name == root || !visited.insert(*wi) {
+                continue;
+            }
+            descendants.push(*wi);
+            Self::push_descendants(
+                root,
+                Some(worktrees[*wi].name.as_str()),
+                worktrees,
+                children_of,
+                descendants,
+                visited,
+            );
+        }
+    }
+
+    fn compute_badge(
+        project_name: &str,
+        worktrees: &[Worktree],
+        worktree_index: usize,
+        session_registry: Option<&SessionRegistry>,
+    ) -> (bool, Option<SessionState>) {
+        let wt = &worktrees[worktree_index];
+        let own_alert = session_registry
+            .map(|reg| reg.has_alert(project_name, &wt.name))
+            .unwrap_or(false);
+        let own_state = session_registry
+            .and_then(|reg| reg.aggregate_state(project_name, &wt.name));
+        let Some(reg) = session_registry else {
+            return (own_alert, own_state);
+        };
+
+        let mut merged_alert = own_alert;
+        let mut merged_state = own_state;
+        for descendant_index in Self::descendants_of(worktrees, &wt.name) {
+            let descendant_name = &worktrees[descendant_index].name;
+            merged_alert |= reg.has_alert(project_name, descendant_name);
+            merged_state = [merged_state, reg.aggregate_state(project_name, descendant_name)]
+                .into_iter()
+                .flatten()
+                .max_by_key(|state| state.priority());
+        }
+
+        (merged_alert, merged_state)
+    }
+
     /// カーソルを下に移動
     pub fn move_down(&mut self, entries_len: usize) {
         if entries_len == 0 {
@@ -204,11 +280,12 @@ impl LeftPanel {
                         let project_name = &app.projects[*project_index].name;
                         let branch_char = if *is_last { "└" } else { "├" };
                         // セッションレジストリから状態バッジを取得（なければ既存アイコン）
-                        let has_alert = session_registry
-                            .map(|reg| reg.has_alert(project_name, &wt.name))
-                            .unwrap_or(false);
-                        let session_state = session_registry
-                            .and_then(|reg| reg.aggregate_state(project_name, &wt.name));
+                        let (has_alert, session_state) = Self::compute_badge(
+                            project_name,
+                            &app.projects[*project_index].worktrees,
+                            *worktree_index,
+                            session_registry,
+                        );
                         let (icon, icon_color) = if has_alert {
                             ("●", Color::Red)
                         } else if let Some(state) = session_state {
@@ -408,6 +485,23 @@ mod tests {
         }
     }
 
+    fn register_session(
+        reg: &mut SessionRegistry,
+        id: &str,
+        project: &str,
+        worktree: &str,
+        state: SessionState,
+    ) {
+        let cwd = format!(
+            "{}/{}/{}",
+            crate::config::workspaces_dir().display(),
+            project,
+            worktree
+        );
+        reg.register(id.to_string(), cwd, "default".to_string());
+        reg.update_state(id, state);
+    }
+
     #[test]
     fn test_build_entries_all_expanded() {
         let projects = sample_projects();
@@ -595,6 +689,113 @@ mod tests {
             .collect();
 
         assert_eq!(worktree_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_descendants_of_resolves_children_and_grandchildren() {
+        let worktrees = vec![
+            test_worktree("A", None),
+            test_worktree("B", Some("A")),
+            test_worktree("C", Some("B")),
+            test_worktree("D", Some("A")),
+        ];
+
+        assert_eq!(LeftPanel::descendants_of(&worktrees, "A"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_descendants_of_cycle_does_not_recurse_forever() {
+        let worktrees = vec![
+            test_worktree("X", Some("Y")),
+            test_worktree("Y", Some("X")),
+        ];
+
+        assert_eq!(LeftPanel::descendants_of(&worktrees, "X"), vec![1]);
+    }
+
+    #[test]
+    fn test_compute_badge_childless_matches_own_state_and_alert() {
+        let worktrees = vec![
+            test_worktree("idle", None),
+            test_worktree("working", None),
+            test_worktree("alert", None),
+        ];
+        let mut reg = SessionRegistry::new();
+        register_session(&mut reg, "s-idle", "tree", "idle", SessionState::Idle);
+        register_session(&mut reg, "s-working", "tree", "working", SessionState::Working);
+        register_session(&mut reg, "s-alert", "tree", "alert", SessionState::Done);
+        reg.set_alert("s-alert", true, Some("needs review".to_string()));
+
+        for (index, wt) in worktrees.iter().enumerate() {
+            let badge = LeftPanel::compute_badge("tree", &worktrees, index, Some(&reg));
+            let own = (
+                reg.has_alert("tree", &wt.name),
+                reg.aggregate_state("tree", &wt.name),
+            );
+            assert_eq!(badge, own);
+        }
+    }
+
+    #[test]
+    fn test_compute_badge_rolls_up_child_working_to_idle_parent() {
+        let worktrees = vec![
+            test_worktree("parent", None),
+            test_worktree("child", Some("parent")),
+        ];
+        let mut reg = SessionRegistry::new();
+        register_session(&mut reg, "s-parent", "tree", "parent", SessionState::Idle);
+        register_session(&mut reg, "s-child", "tree", "child", SessionState::Working);
+
+        let (_, state) = LeftPanel::compute_badge("tree", &worktrees, 0, Some(&reg));
+        assert_eq!(state, Some(SessionState::Working));
+    }
+
+    #[test]
+    fn test_compute_badge_does_not_downgrade_parent_working() {
+        let worktrees = vec![
+            test_worktree("parent", None),
+            test_worktree("child", Some("parent")),
+        ];
+        let mut reg = SessionRegistry::new();
+        register_session(&mut reg, "s-parent", "tree", "parent", SessionState::Working);
+        register_session(&mut reg, "s-child", "tree", "child", SessionState::Idle);
+
+        let (_, state) = LeftPanel::compute_badge("tree", &worktrees, 0, Some(&reg));
+        assert_eq!(state, Some(SessionState::Working));
+    }
+
+    #[test]
+    fn test_compute_badge_rolls_up_child_alert_with_or() {
+        let worktrees = vec![
+            test_worktree("parent", None),
+            test_worktree("child", Some("parent")),
+        ];
+        let mut reg = SessionRegistry::new();
+        register_session(&mut reg, "s-parent", "tree", "parent", SessionState::Idle);
+        register_session(&mut reg, "s-child", "tree", "child", SessionState::Idle);
+
+        assert!(!LeftPanel::compute_badge("tree", &worktrees, 0, Some(&reg)).0);
+
+        reg.set_alert("s-child", true, Some("blocked".to_string()));
+        assert!(LeftPanel::compute_badge("tree", &worktrees, 0, Some(&reg)).0);
+    }
+
+    #[test]
+    fn test_compute_badge_rolls_up_grandchild_state_and_alert() {
+        let worktrees = vec![
+            test_worktree("A", None),
+            test_worktree("B", Some("A")),
+            test_worktree("C", Some("B")),
+        ];
+        let mut reg = SessionRegistry::new();
+        register_session(&mut reg, "s-a", "tree", "A", SessionState::Idle);
+        register_session(&mut reg, "s-b", "tree", "B", SessionState::Idle);
+        register_session(&mut reg, "s-c", "tree", "C", SessionState::Working);
+        reg.set_alert("s-c", true, Some("needs review".to_string()));
+
+        let (alert, state) = LeftPanel::compute_badge("tree", &worktrees, 0, Some(&reg));
+        assert!(alert);
+        assert_eq!(state, Some(SessionState::Working));
     }
 
     #[test]
