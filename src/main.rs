@@ -32,6 +32,33 @@ type TerminalKey = (app::WorktreeId, usize);
 /// Claude ターミナルを識別する特殊なタブインデックスの基底値
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
+const DISPATCH_RETRY_LIMIT: u32 = 30;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchAction {
+    MarkReadAndClear,
+    IncrementRetry(u32),
+    MarkReadAndAlert,
+}
+
+fn decide_dispatch_action(
+    is_resolved: bool,
+    is_alive: bool,
+    write_ok: bool,
+    retry_count: u32,
+    limit: u32,
+) -> DispatchAction {
+    if is_resolved && is_alive && write_ok {
+        return DispatchAction::MarkReadAndClear;
+    }
+
+    let next_count = retry_count.saturating_add(1);
+    if next_count >= limit {
+        DispatchAction::MarkReadAndAlert
+    } else {
+        DispatchAction::IncrementRetry(next_count)
+    }
+}
 
 /// reader thread が spawn 時に保持した tab_index/worktree_id に対応する terminals の key を返す。
 ///
@@ -229,6 +256,7 @@ async fn main() -> Result<()> {
     let mut terminals: HashMap<TerminalKey, terminal::TerminalEmulator> = HashMap::new();
     let mut claude_terms: HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator> =
         HashMap::new();
+    let mut dispatch_retry_counts: HashMap<i64, u32> = HashMap::new();
     let mut siki_init_terminal: Option<terminal::TerminalEmulator> = None;
 
     // セッションレジストリ・DB・broker の起動
@@ -406,6 +434,7 @@ async fn main() -> Result<()> {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &event_tx,
             &shell,
@@ -439,6 +468,7 @@ async fn handle_event(
     sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    dispatch_retry_counts: &mut HashMap<i64, u32>,
     siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     shell: &str,
@@ -1780,6 +1810,52 @@ async fn handle_event(
                     if let Ok(alerted) = db::get_alerted_sessions(&conn) {
                         let mut reg = registry.lock().unwrap();
                         reg.sync_alerts_from_db(&alerted);
+                    }
+                }
+            }
+            if let Ok(conn) = broker_db.lock() {
+                if let Ok(dispatches) = db::get_pending_dispatches(&conn) {
+                    for d in dispatches {
+                        let (Some(to_wt), Some(to_proj)) = (&d.to_worktree, &d.to_project) else {
+                            continue;
+                        };
+                        let mut is_resolved = false;
+                        let mut is_alive = false;
+                        let mut write_ok = false;
+                        if let Some(wt_id) = app.find_worktree_id(to_proj, to_wt) {
+                            is_resolved = true;
+                            if let Some(emu) = claude_terms.get_mut(&(wt_id, 0)) {
+                                is_alive = emu.is_alive();
+                                if is_alive {
+                                    let msg = format!("{}\n", d.content);
+                                    write_ok = emu.write(msg.as_bytes()).is_ok();
+                                }
+                            }
+                        }
+                        let retry_count = *dispatch_retry_counts.get(&d.id).unwrap_or(&0);
+                        match decide_dispatch_action(
+                            is_resolved,
+                            is_alive,
+                            write_ok,
+                            retry_count,
+                            DISPATCH_RETRY_LIMIT,
+                        ) {
+                            DispatchAction::MarkReadAndClear => {
+                                let _ = db::mark_messages_read(&conn, &[d.id]);
+                                dispatch_retry_counts.remove(&d.id);
+                            }
+                            DispatchAction::IncrementRetry(next_count) => {
+                                dispatch_retry_counts.insert(d.id, next_count);
+                            }
+                            DispatchAction::MarkReadAndAlert => {
+                                let _ = db::mark_messages_read(&conn, &[d.id]);
+                                dispatch_retry_counts.remove(&d.id);
+                                app.show_error(format!(
+                                    "dispatch配送に失敗しました（{}回リトライ後に断念）: {} -> {}",
+                                    DISPATCH_RETRY_LIMIT, to_proj, to_wt
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -5738,6 +5814,38 @@ mod tests {
         Arc::new(Mutex::new(db::init(std::path::Path::new(":memory:")).unwrap()))
     }
 
+    #[test]
+    fn test_decide_dispatch_action_marks_read_on_success() {
+        assert_eq!(
+            decide_dispatch_action(true, true, true, 0, DISPATCH_RETRY_LIMIT),
+            DispatchAction::MarkReadAndClear
+        );
+    }
+
+    #[test]
+    fn test_decide_dispatch_action_increments_retry_for_unresolved_target() {
+        assert_eq!(
+            decide_dispatch_action(false, false, false, 0, DISPATCH_RETRY_LIMIT),
+            DispatchAction::IncrementRetry(1)
+        );
+    }
+
+    #[test]
+    fn test_decide_dispatch_action_alerts_on_retry_limit_boundary() {
+        assert_eq!(
+            decide_dispatch_action(true, false, false, 29, DISPATCH_RETRY_LIMIT),
+            DispatchAction::MarkReadAndAlert
+        );
+    }
+
+    #[test]
+    fn test_decide_dispatch_action_alerts_if_limit_reached_state_remains() {
+        assert_eq!(
+            decide_dispatch_action(false, false, false, 30, DISPATCH_RETRY_LIMIT),
+            DispatchAction::MarkReadAndAlert
+        );
+    }
+
     // --- グローバルキーの状態遷移テスト ---
 
     #[tokio::test]
@@ -5752,6 +5860,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5766,6 +5875,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5790,6 +5900,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5804,6 +5915,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5828,6 +5940,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5842,6 +5955,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5866,6 +5980,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5881,6 +5996,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5906,6 +6022,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5920,6 +6037,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5944,6 +6062,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5958,6 +6077,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5983,6 +6103,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5997,6 +6118,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6021,6 +6143,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6035,6 +6158,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6061,6 +6185,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6076,6 +6201,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6101,6 +6227,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6116,6 +6243,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -6141,6 +6269,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6156,6 +6285,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6180,6 +6310,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6195,6 +6326,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6222,6 +6354,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6237,6 +6370,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6261,6 +6395,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6276,6 +6411,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6302,6 +6438,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6320,6 +6457,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6344,6 +6482,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6359,6 +6498,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6386,6 +6526,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6399,6 +6540,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6660,6 +6802,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6673,6 +6816,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6759,6 +6903,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6772,6 +6917,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7189,6 +7335,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7203,6 +7350,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7227,6 +7375,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7243,6 +7392,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7275,6 +7425,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7295,6 +7446,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7324,6 +7476,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7349,6 +7502,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7373,6 +7527,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7397,6 +7552,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7426,6 +7582,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7441,6 +7598,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7469,6 +7627,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7484,6 +7643,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7511,6 +7671,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7524,6 +7685,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7551,6 +7713,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7564,6 +7727,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7588,6 +7752,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7603,6 +7768,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7628,6 +7794,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7643,6 +7810,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -7668,6 +7836,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7683,6 +7852,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7707,6 +7877,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7723,6 +7894,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7749,6 +7921,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7764,6 +7937,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7814,6 +7988,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7834,6 +8009,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7869,6 +8045,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7886,6 +8063,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7908,6 +8086,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7931,6 +8110,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7954,6 +8134,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7979,6 +8160,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8007,6 +8189,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8026,6 +8209,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8054,6 +8238,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8072,6 +8257,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8099,6 +8285,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8117,6 +8304,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8144,6 +8332,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8165,6 +8354,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8188,6 +8378,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8213,6 +8404,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8236,6 +8428,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -8264,6 +8457,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8282,6 +8476,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8333,6 +8528,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8354,6 +8550,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8387,6 +8584,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8403,6 +8601,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8426,6 +8625,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8453,6 +8653,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8467,6 +8668,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8493,6 +8695,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8508,6 +8711,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8533,6 +8737,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8548,6 +8753,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -8573,6 +8779,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8589,6 +8796,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8614,6 +8822,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8630,6 +8839,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8660,6 +8870,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8677,6 +8888,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8705,6 +8917,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8719,6 +8932,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8744,6 +8958,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8766,6 +8981,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",

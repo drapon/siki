@@ -575,6 +575,21 @@ impl App {
         self.projects.get_mut(pi)?.worktrees.get_mut(wi)
     }
 
+    /// (project_name, worktree_name) から現在の WorktreeId を解決する（REQ-002）。
+    /// WorktreeId は add/remove で再インデックスされ不安定なため、呼び出しの都度解決すること
+    /// （キャッシュしてはならない）。
+    pub fn find_worktree_id(&self, project_name: &str, worktree_name: &str) -> Option<WorktreeId> {
+        self.projects.iter().enumerate().find_map(|(pi, p)| {
+            if p.name != project_name {
+                return None;
+            }
+            p.worktrees
+                .iter()
+                .position(|w| w.name == worktree_name)
+                .map(|wi| (pi, wi))
+        })
+    }
+
     /// ステータスメッセージの自動クリア時間
     const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -888,6 +903,41 @@ mod tests {
 
         let wt = app.selected_worktree().unwrap();
         assert_eq!(wt.branch, "modified-branch");
+    }
+
+    #[test]
+    fn test_find_worktree_id_resolves_existing_worktree() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("webapp", "fix-bug"), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_find_worktree_id_returns_none_for_unknown_worktree() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("webapp", "unknown"), None);
+    }
+
+    #[test]
+    fn test_find_worktree_id_returns_none_for_unknown_project() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("unknown-project", "feature-auth"), None);
+    }
+
+    #[test]
+    fn test_find_worktree_id_returns_none_for_empty_projects() {
+        let config = Config {
+            siki: SikiConfig::default(),
+            projects: vec![],
+        };
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("webapp", "feature-auth"), None);
     }
 
     #[test]
