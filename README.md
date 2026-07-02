@@ -103,6 +103,7 @@ siki [OPTIONS] [COMMAND]
 | `A` | Add project |
 | `r` | Run script (`siki.json`) |
 | `d` | Archive worktree / remove project |
+| `M` | Move worktree under a parent (conductor) |
 | `S` | Create `siki.json` for project |
 
 ### Main Panel (File Viewer)

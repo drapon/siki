@@ -33,6 +33,7 @@ pub fn execute_tool(
         "list_skills" => list_skills(params),
         "summarize_history" => summarize_history(conn, params, session_id),
         "dispatch" => dispatch(conn, params, session_id),
+        "move_worktree" => move_worktree(conn, params, session_id),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -332,6 +333,38 @@ fn dispatch(conn: &Connection, params: &Value, from_session: &str) -> Result<Val
     }
 
     Ok(json!({ "dispatched": targets.len(), "targets": targets }))
+}
+
+/// 呼び出し元project内でworktreeの親リンクを付け替える。
+fn move_worktree(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
+    let child = params
+        .get("child")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("child is required"))?;
+    let parent = params.get("parent").and_then(|v| v.as_str());
+
+    let all_sessions = db::list_sessions(conn)?;
+    let project_name = all_sessions
+        .iter()
+        .find(|s| s.session_id == from_session)
+        .map(|s| s.project_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("caller session not found"))?;
+
+    if !crate::config::worktree_path(&project_name, child).exists() {
+        anyhow::bail!("child worktree not found: {}", child);
+    }
+    if let Some(p) = parent {
+        if !crate::config::worktree_path(&project_name, p).exists() {
+            anyhow::bail!("parent worktree not found: {}", p);
+        }
+        if crate::config::would_create_cycle(&project_name, child, p) {
+            anyhow::bail!("circular parent link: {} -> {}", child, p);
+        }
+    }
+
+    crate::config::save_worktree_parent(&project_name, child, parent)?;
+
+    Ok(json!({ "child": child, "parent": parent }))
 }
 
 fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
@@ -727,10 +760,33 @@ fn list_skills(params: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use std::path::Path;
 
     fn test_db() -> Connection {
         db::init(Path::new(":memory:")).unwrap()
+    }
+
+    struct TestProject {
+        name: String,
+    }
+
+    impl TestProject {
+        fn new(suffix: &str, worktrees: &[&str]) -> Self {
+            let name = format!("task-0004-{}-{}", std::process::id(), suffix);
+            let _ = config::remove_project_meta(&name);
+            config::save_project_meta(&name, Path::new("/tmp/siki-task-0004")).unwrap();
+            for worktree in worktrees {
+                std::fs::create_dir_all(config::worktree_path(&name, worktree)).unwrap();
+            }
+            Self { name }
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = config::remove_project_meta(&self.name);
+        }
     }
 
     #[test]
@@ -1251,6 +1307,75 @@ mod tests {
 
         let err = dispatch(&conn, &params, "missing").unwrap_err();
         assert!(err.to_string().contains("caller session not found"));
+    }
+
+    #[test]
+    fn test_move_worktree_sets_parent() {
+        let conn = test_db();
+        let project = TestProject::new("sets-parent", &["child", "parent"]);
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let result = move_worktree(&conn, &json!({"child": "child", "parent": "parent"}), "s1").unwrap();
+
+        assert_eq!(result, json!({"child": "child", "parent": "parent"}));
+        let meta = config::load_worktree_meta(&project.name, "child").unwrap();
+        assert_eq!(meta.parent.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn test_move_worktree_rejects_self_parent() {
+        let conn = test_db();
+        let project = TestProject::new("self-parent", &["X"]);
+        config::save_worktree_parent(&project.name, "X", None).unwrap();
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = move_worktree(&conn, &json!({"child": "X", "parent": "X"}), "s1").unwrap_err();
+
+        assert!(err.to_string().contains("circular parent link: X -> X"));
+        let meta = config::load_worktree_meta(&project.name, "X").unwrap();
+        assert_eq!(meta.parent, None);
+    }
+
+    #[test]
+    fn test_move_worktree_rejects_transitive_cycle() {
+        let conn = test_db();
+        let project = TestProject::new("transitive-cycle", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = move_worktree(&conn, &json!({"child": "A", "parent": "C"}), "s1").unwrap_err();
+
+        assert!(err.to_string().contains("circular parent link: A -> C"));
+        let meta = config::load_worktree_meta(&project.name, "A").unwrap();
+        assert_eq!(meta.parent, None);
+    }
+
+    #[test]
+    fn test_move_worktree_detaches_with_null_parent() {
+        let conn = test_db();
+        let project = TestProject::new("detach", &["A", "B"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let result = move_worktree(&conn, &json!({"child": "B", "parent": null}), "s1").unwrap();
+
+        assert_eq!(result, json!({"child": "B", "parent": null}));
+        let meta = config::load_worktree_meta(&project.name, "B").unwrap();
+        assert_eq!(meta.parent, None);
+    }
+
+    #[test]
+    fn test_move_worktree_rejects_missing_child_without_creating_meta() {
+        let conn = test_db();
+        let project = TestProject::new("missing-child", &["X"]);
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = move_worktree(&conn, &json!({"child": "Y", "parent": "X"}), "s1").unwrap_err();
+
+        assert!(err.to_string().contains("child worktree not found: Y"));
+        assert!(config::load_worktree_meta(&project.name, "Y").is_none());
     }
 
     #[test]

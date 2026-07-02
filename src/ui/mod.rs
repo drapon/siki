@@ -133,6 +133,11 @@ pub fn render(
         render_archive_confirm_popup(frame, app);
     }
 
+    // worktree 親付け替えポップアップ
+    if app.show_move_worktree_popup {
+        render_move_worktree_popup(frame, app);
+    }
+
     // プロジェクト除外確認ダイアログ
     if app.show_remove_project_confirm {
         render_remove_project_confirm_popup(frame, app);
@@ -665,6 +670,53 @@ fn render_archive_confirm_popup(frame: &mut Frame, app: &App) {
 
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+fn render_move_worktree_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect(50, 45, frame.area());
+
+    let target_project_index = app.move_worktree_target.map(|(pi, _)| pi);
+    let child = app
+        .move_worktree_target
+        .and_then(|(pi, wi)| app.projects.get(pi)?.worktrees.get(wi))
+        .map(|wt| wt.name.as_str())
+        .unwrap_or("???");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Move worktree: {}", child))
+        .title_bottom(" j/k: 選択  Enter: 確定  Esc: キャンセル ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let items: Vec<ratatui::widgets::ListItem> = app
+        .move_worktree_candidates
+        .iter()
+        .map(|candidate| {
+            let label = match candidate {
+                Some(wi) => target_project_index
+                    .and_then(|pi| app.projects.get(pi))
+                    .and_then(|project| project.worktrees.get(*wi))
+                    .map(|wt| wt.display_name.as_deref().unwrap_or(wt.name.as_str()))
+                    .unwrap_or("???"),
+                None => "(独立化 - 親なし)",
+            };
+            ratatui::widgets::ListItem::new(format!("  {}", label))
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let mut state = ratatui::widgets::ListState::default()
+        .with_selected(Some(app.move_worktree_cursor));
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_remove_project_confirm_popup(frame: &mut Frame, app: &App) {

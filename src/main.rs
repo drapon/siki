@@ -643,6 +643,10 @@ async fn handle_event(
                 handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, left_panel, key);
                 return;
             }
+            if app.show_move_worktree_popup {
+                handle_move_worktree_popup_key(app, key);
+                return;
+            }
             if app.show_remove_project_confirm {
                 handle_remove_project_confirm_key(app, sessions, terminals, claude_terms, key);
                 return;
@@ -981,7 +985,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings || app.show_context_list || app.show_context_name_popup || app.show_context_url_popup {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_move_worktree_popup || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings || app.show_context_list || app.show_context_name_popup || app.show_context_url_popup {
                 return;
             }
             match mouse.kind {
@@ -2937,6 +2941,26 @@ fn handle_left_panel_key(
                 None => {}
             }
         }
+        KeyCode::Char('M') => {
+            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) =
+                left_panel.current_entry(&entries)
+            {
+                let pi = *project_index;
+                let wi = *worktree_index;
+                let mut candidates = vec![None];
+                candidates.extend(
+                    app.projects[pi]
+                        .worktrees
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, _)| if i == wi { None } else { Some(Some(i)) }),
+                );
+                app.move_worktree_target = Some((pi, wi));
+                app.move_worktree_candidates = candidates;
+                app.move_worktree_cursor = 0;
+                app.show_move_worktree_popup = true;
+            }
+        }
         KeyCode::Char('F') => {
             // git fetch でリモート追跡ブランチを最新化
             let project_index = match left_panel.current_entry(&entries) {
@@ -4633,6 +4657,73 @@ fn handle_remove_project_confirm_key(
         }
         _ => {}
     }
+}
+
+/// worktree 親付け替えポップアップのキー処理
+fn handle_move_worktree_popup_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if app.move_worktree_cursor + 1 < app.move_worktree_candidates.len() {
+                app.move_worktree_cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.move_worktree_cursor = app.move_worktree_cursor.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if move_worktree_to_selected_parent(app).is_ok() {
+                close_move_worktree_popup(app);
+            }
+        }
+        KeyCode::Esc => {
+            close_move_worktree_popup(app);
+        }
+        _ => {}
+    }
+}
+
+fn move_worktree_to_selected_parent(app: &mut app::App) -> anyhow::Result<()> {
+    let (pi, wi) = app
+        .move_worktree_target
+        .ok_or_else(|| anyhow::anyhow!("move target is missing"))?;
+    let Some(candidate) = app.move_worktree_candidates.get(app.move_worktree_cursor).cloned() else {
+        return Ok(());
+    };
+
+    let project_name = app.projects[pi].name.clone();
+    let child = app.projects[pi].worktrees[wi].name.clone();
+    let parent = candidate.map(|parent_wi| app.projects[pi].worktrees[parent_wi].name.clone());
+
+    if let Some(ref p) = parent {
+        if config::would_create_cycle(&project_name, &child, p) {
+            app.show_error(format!("circular parent link: {} -> {}", child, p));
+            return Err(anyhow::anyhow!("circular parent link"));
+        }
+    }
+
+    if let Err(err) = config::save_worktree_parent(&project_name, &child, parent.as_deref()) {
+        app.show_error(format!("親の付け替えに失敗: {}", err));
+        return Err(err);
+    }
+
+    app.projects[pi].worktrees[wi].parent = parent.clone();
+    match parent {
+        Some(p) => app.show_info(format!("{} を {} の配下に移動しました", child, p)),
+        None => app.show_info(format!("{} を独立化しました", child)),
+    }
+    Ok(())
+}
+
+fn close_move_worktree_popup(app: &mut app::App) {
+    app.show_move_worktree_popup = false;
+    app.move_worktree_target = None;
+    app.move_worktree_candidates.clear();
+    app.move_worktree_cursor = 0;
 }
 
 /// アーカイブ確認ダイアログのキー処理

@@ -119,6 +119,24 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "move_worktree".to_string(),
+            description: "Move a worktree under a new parent in the caller's project, or detach it by passing parent: null".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "child": {
+                        "type": "string",
+                        "description": "付け替え対象の子worktree名（呼び出し元と同一project内）"
+                    },
+                    "parent": {
+                        "type": ["string", "null"],
+                        "description": "新しい親worktree名。nullで独立化"
+                    }
+                },
+                "required": ["child"]
+            }),
+        },
+        ToolDefinition {
             name: "broadcast".to_string(),
             description: "Broadcast a message to other sessions. By default (scope: project) only sessions in the sender's project receive it; scope: machine reaches every session on the machine.".to_string(),
             input_schema: serde_json::json!({
@@ -283,7 +301,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -293,6 +311,7 @@ mod tests {
         assert!(names.contains(&"list_sessions"));
         assert!(names.contains(&"send_message"));
         assert!(names.contains(&"dispatch"));
+        assert!(names.contains(&"move_worktree"));
         assert!(names.contains(&"broadcast"));
         assert!(names.contains(&"set_summary"));
         assert!(names.contains(&"handoff"));

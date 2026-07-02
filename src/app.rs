@@ -305,6 +305,14 @@ pub struct App {
     pub grep_cursor: usize,
     pub show_archive_confirm: bool,
     pub archive_target: Option<WorktreeId>,
+    /// worktree 親付け替えポップアップ表示フラグ
+    pub show_move_worktree_popup: bool,
+    /// 親付け替え対象の worktree
+    pub move_worktree_target: Option<WorktreeId>,
+    /// 親候補リスト（None は親なし）
+    pub move_worktree_candidates: Vec<Option<usize>>,
+    /// 親候補リストのカーソル位置
+    pub move_worktree_cursor: usize,
     pub show_remove_project_confirm: bool,
     pub remove_project_target: Option<usize>,
     pub show_siki_json_confirm: bool,
@@ -474,6 +482,10 @@ impl App {
             grep_cursor: 0,
             show_archive_confirm: false,
             archive_target: None,
+            show_move_worktree_popup: false,
+            move_worktree_target: None,
+            move_worktree_candidates: Vec::new(),
+            move_worktree_cursor: 0,
             show_remove_project_confirm: false,
             remove_project_target: None,
             show_siki_json_confirm: false,
