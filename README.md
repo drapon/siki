@@ -161,12 +161,58 @@ siki includes a built-in MCP server that enables Claude Code sessions to communi
 
 | Tool | Description |
 |------|-------------|
-| `list_sessions` | List all active sessions with summaries and pending messages |
+| `list_sessions` | List all active sessions with summaries and pending messages (scope: `machine`/`project`/`worktree`/`children` — `children` limits results to the caller's descendant worktrees) |
 | `send_message` | Send a message to a specific session, worktree, or project |
 | `broadcast` | Broadcast a message to all sessions (or scoped to project/worktree) |
 | `set_summary` | Update the current session's work summary |
 | `handoff` | Hand off context to another session (includes git state) |
 | `get_context` | Fetch context from another session or worktree |
+| `dispatch` | Auto-inject a prompt into a worktree's (or a whole subtree's) Claude terminal — no human approval step, delivered by the TUI within ~100ms |
+| `move_worktree` | Re-parent a worktree under a different conductor worktree, or detach it (`parent: null`) |
+| `spawn_child_worktree` | Create a new child worktree under a conductor worktree and set its parent link (processed asynchronously by the TUI) |
+
+## Conductor Pattern
+
+A worktree becomes a "conductor" simply by having child worktrees attached to it via
+`move_worktree` (or the `M` key in the left panel) or `spawn_child_worktree` — there is
+no separate "conductor" entity to create. Any worktree can act as a conductor for zero
+or more children, children can be re-parented between conductors at any time, and the
+left panel renders the parent/child hierarchy as a tree with status badges rolled up
+from descendants.
+
+The division of responsibility:
+
+- **Conductor side**: runs `/loop` to reactively poll its children (via
+  `list_sessions` with `scope: "children"`, or by checking PR comments), and issues
+  the next instruction to a child — or to the whole subtree at once — via `dispatch`.
+- **Worker side**: does *not* need to run `/loop`. A worker wakes up when `dispatch`
+  auto-injects a prompt into its Claude terminal, does the work, and returns to idle —
+  costing zero tokens while waiting for the next dispatch.
+
+Notes on delivery: `dispatch` inserts a row into the shared SQLite queue and returns
+immediately; the TUI polls the queue every 100ms and writes the prompt into the target
+worktree's first Claude tab. If the target tab is not running, delivery is retried for
+about 3 seconds and then dropped with an on-screen error. Dangerous tool calls on the
+worker side are still gated by Claude Code's own built-in permission prompts.
+
+### Use case 1: Implementation conducting
+
+The conductor Claude tracks the implementation progress of each child worktree while
+the actual coding happens inside the children. The conductor dispatches implementation
+tasks to idle children and checks progress via `list_sessions({scope: "children"})`.
+
+### Use case 2: Review-response conducting
+
+The conductor runs `/loop`, reactively polling for new PR review comments. When a
+comment arrives, the conductor dispatches a fix instruction to the worktree responsible
+for that PR; that worktree makes the fix and returns to idle.
+
+### Use case 3: Review conducting
+
+The conductor runs a review loop while treating review targets as child worktrees
+(created via `spawn_child_worktree`). The conductor dispatches review instructions to
+the whole subtree at once (`dispatch({target: {type: "subtree", id: "<self>"}, ...})`),
+and each child reviews its assigned target independently.
 
 ## Configuration
 
