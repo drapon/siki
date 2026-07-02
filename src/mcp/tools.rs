@@ -80,6 +80,11 @@ fn list_sessions_with_cwd(
             }
         }
     };
+    let descendants = if scope == "children" && !proj.is_empty() && !wt.is_empty() {
+        crate::config::get_descendants(&proj, &wt)
+    } else {
+        Vec::new()
+    };
 
     // scope に応じてフィルタ。enum 外の値はサイレントに machine 扱いにせず拒否する
     // （broadcast と同じコントラクト。タイポが全件返却で気付かれないのを防ぐ）。
@@ -87,6 +92,10 @@ fn list_sessions_with_cwd(
         "worktree" => all_sessions
             .iter()
             .filter(|s| !wt.is_empty() && s.worktree_name == wt && s.project_name == proj)
+            .collect(),
+        "children" => all_sessions
+            .iter()
+            .filter(|s| !proj.is_empty() && s.project_name == proj && descendants.contains(&s.worktree_name))
             .collect(),
         "project" => all_sessions
             .iter()
@@ -298,8 +307,6 @@ fn broadcast(conn: &Connection, params: &Value, from_session: &str) -> Result<Va
 ///
 /// DB へ message_type='dispatch' の行を INSERT するのみで、実際の PTY 書き込みは
 /// TUI 本体の Tick が担う（人間の承認ステップは挟まない）。
-/// target.type "subtree" はスキーマ上先行宣言されているが、Phase 2 で
-/// get_descendants が配線されるまで明示的にエラーとする。
 fn dispatch(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
     let target = params.get("target").ok_or_else(|| anyhow::anyhow!("target is required"))?;
     let target_type = target
@@ -325,7 +332,8 @@ fn dispatch(conn: &Connection, params: &Value, from_session: &str) -> Result<Val
 
     let targets: Vec<String> = match target_type {
         "worktree" => vec![target_id.to_string()],
-        _ => anyhow::bail!("Invalid or not-yet-supported target type: {}", target_type),
+        "subtree" => crate::config::get_descendants(&project_name, target_id),
+        _ => anyhow::bail!("Invalid target type: {}", target_type),
     };
 
     for wt_name in &targets {
@@ -767,6 +775,17 @@ mod tests {
         db::init(Path::new(":memory:")).unwrap()
     }
 
+    fn session_worktrees(result: &Value) -> Vec<String> {
+        let mut names: Vec<String> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["worktree_name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
     struct TestProject {
         name: String,
     }
@@ -1086,6 +1105,51 @@ mod tests {
     }
 
     #[test]
+    fn test_list_sessions_scope_children_filters_descendants() {
+        let conn = test_db();
+        let project = TestProject::new("children-scope", &["A", "B", "C", "D"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "D", None).unwrap();
+        db::upsert_session(&conn, "sA", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        db::upsert_session(&conn, "sB", "default", "B", &project.name, "/tmp/B", "idle").unwrap();
+        db::upsert_session(&conn, "sC", "default", "C", &project.name, "/tmp/C", "idle").unwrap();
+        db::upsert_session(&conn, "sD", "default", "D", &project.name, "/tmp/D", "idle").unwrap();
+
+        let result = list_sessions(&conn, "sA", &json!({"scope": "children"})).unwrap();
+
+        assert_eq!(session_worktrees(&result), vec!["B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
+    fn test_list_sessions_scope_children_empty_for_leaf() {
+        let conn = test_db();
+        let project = TestProject::new("children-empty", &["A", "B"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        db::upsert_session(&conn, "sA", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        db::upsert_session(&conn, "sB", "default", "B", &project.name, "/tmp/B", "idle").unwrap();
+
+        let result = list_sessions(&conn, "sB", &json!({"scope": "children"})).unwrap();
+
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_list_sessions_scope_children_includes_grandchildren() {
+        let conn = test_db();
+        let project = TestProject::new("children-grandchild", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        db::upsert_session(&conn, "sA", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        db::upsert_session(&conn, "sB", "default", "B", &project.name, "/tmp/B", "idle").unwrap();
+        db::upsert_session(&conn, "sC", "default", "C", &project.name, "/tmp/C", "idle").unwrap();
+
+        let result = list_sessions(&conn, "sA", &json!({"scope": "children"})).unwrap();
+
+        assert_eq!(session_worktrees(&result), vec!["B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
     fn test_send_message_to_session() {
         let conn = test_db();
         let params = json!({
@@ -1262,22 +1326,98 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_rejects_not_yet_supported_target_types() {
+    fn test_dispatch_subtree_fans_out_to_descendants() {
+        let conn = test_db();
+        let project = TestProject::new("subtree-dispatch", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        db::upsert_session(&conn, "parent", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "subtree", "id": "A" },
+            "prompt": "do X"
+        });
+
+        let result = dispatch(&conn, &params, "parent").unwrap();
+        let mut targets: Vec<String> = result["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        targets.sort();
+
+        assert_eq!(result["dispatched"], 2);
+        assert_eq!(targets, vec!["B".to_string(), "C".to_string()]);
+        let dispatches = db::get_pending_dispatches(&conn).unwrap();
+        let mut rows: Vec<(String, String)> = dispatches
+            .iter()
+            .map(|d| (d.to_worktree.clone().unwrap(), d.content.clone()))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![
+            ("B".to_string(), "do X".to_string()),
+            ("C".to_string(), "do X".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn test_dispatch_subtree_with_no_descendants_is_noop() {
+        let conn = test_db();
+        let project = TestProject::new("subtree-empty", &["A"]);
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        db::upsert_session(&conn, "parent", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "subtree", "id": "A" },
+            "prompt": "do X"
+        });
+
+        let result = dispatch(&conn, &params, "parent").unwrap();
+
+        assert_eq!(result, json!({"dispatched": 0, "targets": []}));
+        assert!(db::get_pending_dispatches(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_dispatch_subtree_rows_are_independently_readable() {
+        let conn = test_db();
+        let project = TestProject::new("subtree-independent", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        db::upsert_session(&conn, "parent", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "subtree", "id": "A" },
+            "prompt": "do X"
+        });
+        dispatch(&conn, &params, "parent").unwrap();
+        let dispatches = db::get_pending_dispatches(&conn).unwrap();
+        let read_id = dispatches
+            .iter()
+            .find(|d| d.to_worktree.as_deref() == Some("B"))
+            .unwrap()
+            .id;
+
+        db::mark_messages_read(&conn, &[read_id]).unwrap();
+
+        let remaining = db::get_pending_dispatches(&conn).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].to_worktree.as_deref(), Some("C"));
+        assert_eq!(remaining[0].content, "do X");
+    }
+
+    #[test]
+    fn test_dispatch_rejects_invalid_target_type() {
         let conn = test_db();
         db::upsert_session(&conn, "parent", "default", "main", "myapp", "/tmp/main", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "invalid", "id": "child-a" },
+            "prompt": "do X"
+        });
+        let err = dispatch(&conn, &params, "parent").unwrap_err();
 
-        // "subtree" は Phase 2（TASK-0007）まで意図的にエラーとする
-        for target_type in ["subtree", "invalid"] {
-            let params = json!({
-                "target": { "type": target_type, "id": "child-a" },
-                "prompt": "do X"
-            });
-            let err = dispatch(&conn, &params, "parent").unwrap_err();
-            assert!(
-                err.to_string().contains("Invalid or not-yet-supported target type"),
-                "unexpected error: {err}"
-            );
-        }
+        assert!(
+            err.to_string().contains("Invalid target type"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

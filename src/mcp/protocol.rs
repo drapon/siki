@@ -70,8 +70,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "scope": {
                         "type": "string",
-                        "enum": ["machine", "project", "worktree"],
-                        "description": "Filter scope for the returned sessions (default: project). 'machine' = all worktrees/projects on this machine, 'project' = current project, 'worktree' = current worktree only."
+                        "enum": ["machine", "project", "worktree", "children"],
+                        "description": "Filter scope for the returned sessions (default: project). 'machine' = all worktrees/projects on this machine, 'project' = current project, 'worktree' = current worktree only, 'children' = sessions of the caller's descendant worktrees."
                     },
                     "include_bodies": {
                         "type": "boolean",
@@ -327,5 +327,14 @@ mod tests {
         let values = enum_values.as_array().unwrap();
         assert!(values.contains(&serde_json::json!("worktree")));
         assert!(values.contains(&serde_json::json!("subtree")));
+    }
+
+    #[test]
+    fn test_list_sessions_tool_schema_includes_children_scope() {
+        let tools = tool_definitions();
+        let list_sessions = tools.iter().find(|t| t.name == "list_sessions").unwrap();
+        let enum_values = &list_sessions.input_schema["properties"]["scope"]["enum"];
+        let values = enum_values.as_array().unwrap();
+        assert!(values.contains(&serde_json::json!("children")));
     }
 }
