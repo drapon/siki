@@ -78,6 +78,34 @@ fn sync_worktree_parents_from_meta(app: &mut app::App) {
     }
 }
 
+fn detach_children_of_removed_worktree(app: &mut app::App, pi: usize, removed_name: &str) {
+    let Some(project) = app.projects.get(pi) else {
+        return;
+    };
+    let project_name = project.name.clone();
+    let Some(meta) = config::load_project_meta(&project_name) else {
+        return;
+    };
+
+    let children: Vec<String> = meta
+        .worktrees
+        .iter()
+        .filter(|(_, wt_meta)| wt_meta.parent.as_deref() == Some(removed_name))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    for child_name in &children {
+        // EDGE-002（同時競合の整合性）はスコープ外。ここでは panic しないことのみ担保する。
+        let _ = config::save_worktree_parent(&project_name, child_name, None);
+    }
+
+    for worktree in &mut app.projects[pi].worktrees {
+        if children.iter().any(|child_name| child_name == &worktree.name) {
+            worktree.parent = None;
+        }
+    }
+}
+
 /// reader thread が spawn 時に保持した tab_index/worktree_id に対応する terminals の key を返す。
 ///
 /// resolve_claude_term_key と同型のパターン（まず直接キー引き、次に terminal_id のみで
@@ -4806,6 +4834,8 @@ fn handle_archive_confirm_key(
                     claude_terms.remove(&key);
                 }
 
+                detach_children_of_removed_worktree(app, pi, &wt_name);
+
                 // project.json から worktree メタデータを削除
                 let _ = config::save_worktree_display_name(&app.projects[pi].name, &wt_name, None);
 
@@ -5929,6 +5959,94 @@ mod tests {
 
     fn test_broker_db() -> Arc<Mutex<rusqlite::Connection>> {
         Arc::new(Mutex::new(db::init(std::path::Path::new(":memory:")).unwrap()))
+    }
+
+    struct TestProjectMeta {
+        name: String,
+    }
+
+    impl TestProjectMeta {
+        fn new(suffix: &str) -> Self {
+            let name = format!("task-0006-main-{}-{}", std::process::id(), suffix);
+            let _ = config::remove_project_meta(&name);
+            config::save_project_meta(&name, std::path::Path::new("/tmp/siki-task-0006-main")).unwrap();
+            Self { name }
+        }
+    }
+
+    impl Drop for TestProjectMeta {
+        fn drop(&mut self) {
+            let _ = config::remove_project_meta(&self.name);
+        }
+    }
+
+    fn config_with_worktrees(project_name: &str, worktree_names: &[&str]) -> Config {
+        Config {
+            siki: SikiConfig::default(),
+            projects: vec![ProjectConfig {
+                name: project_name.to_string(),
+                path: "/tmp/siki-task-0006-main".to_string(),
+                display_name: None,
+                worktrees: worktree_names
+                    .iter()
+                    .map(|name| WorktreeConfig {
+                        name: name.to_string(),
+                        branch: format!("feature/{}", name),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn worktree_parent(app: &app::App, name: &str) -> Option<String> {
+        app.projects[0]
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.name == name)
+            .and_then(|worktree| worktree.parent.clone())
+    }
+
+    #[test]
+    fn detach_children_of_removed_worktree_clears_project_meta_and_memory() {
+        let project = TestProjectMeta::new("detach-children");
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        let config = config_with_worktrees(&project.name, &["A", "B", "C"]);
+        let mut app = app::App::new(&config);
+
+        detach_children_of_removed_worktree(&mut app, 0, "A");
+
+        let b_meta = config::load_worktree_meta(&project.name, "B").unwrap();
+        let c_meta = config::load_worktree_meta(&project.name, "C").unwrap();
+        assert_eq!(b_meta.parent, None);
+        assert_eq!(c_meta.parent, None);
+        assert_eq!(worktree_parent(&app, "B"), None);
+        assert_eq!(worktree_parent(&app, "C"), None);
+    }
+
+    #[test]
+    fn detach_children_of_removed_worktree_keeps_unrelated_parents() {
+        let project = TestProjectMeta::new("keep-unrelated");
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        config::save_worktree_parent(&project.name, "D", None).unwrap();
+        let config = config_with_worktrees(&project.name, &["A", "B", "C", "D"]);
+        let mut app = app::App::new(&config);
+
+        detach_children_of_removed_worktree(&mut app, 0, "D");
+
+        assert_eq!(
+            config::load_worktree_meta(&project.name, "B").unwrap().parent.as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            config::load_worktree_meta(&project.name, "C").unwrap().parent.as_deref(),
+            Some("B")
+        );
+        assert_eq!(worktree_parent(&app, "B").as_deref(), Some("A"));
+        assert_eq!(worktree_parent(&app, "C").as_deref(), Some("B"));
     }
 
     #[test]
