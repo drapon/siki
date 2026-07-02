@@ -438,6 +438,8 @@ pub struct App {
     pub blink_counter: u8,
     /// 点滅フェーズ（true: 表示、false: 非表示）
     pub blink_phase: bool,
+    /// worktree親リンク同期の間引きカウンタ（Tick毎にインクリメント）
+    pub parent_sync_counter: u8,
 }
 
 impl App {
@@ -552,6 +554,7 @@ impl App {
             running: true,
             blink_counter: 0,
             blink_phase: true,
+            parent_sync_counter: 0,
         }
     }
 

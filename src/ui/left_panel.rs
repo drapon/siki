@@ -1,7 +1,8 @@
-use crate::app::{App, Project, WorktreeId};
+use crate::app::{App, Project, Worktree, WorktreeId};
 use crate::session::SessionRegistry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use std::collections::{HashMap, HashSet};
 
 /// フラット化リストの各行の種類
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,7 +10,12 @@ pub enum ListEntry {
     /// プロジェクトヘッダ行
     Project { index: usize },
     /// Worktree 行
-    Worktree { project_index: usize, worktree_index: usize },
+    Worktree {
+        project_index: usize,
+        worktree_index: usize,
+        depth: usize,
+        is_last: bool,
+    },
 }
 
 /// 左パネルの状態
@@ -33,15 +39,80 @@ impl LeftPanel {
         for (pi, project) in projects.iter().enumerate() {
             entries.push(ListEntry::Project { index: pi });
             if !project.collapsed {
-                for (wi, _wt) in project.worktrees.iter().enumerate() {
+                let mut children_of: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+                for (wi, wt) in project.worktrees.iter().enumerate() {
+                    children_of.entry(wt.parent.as_deref()).or_default().push(wi);
+                }
+                let mut visited = HashSet::new();
+                Self::push_worktree_entries(
+                    pi,
+                    None,
+                    0,
+                    &project.worktrees,
+                    &children_of,
+                    &mut entries,
+                    &mut visited,
+                );
+                let remaining: Vec<usize> = (0..project.worktrees.len())
+                    .filter(|wi| !visited.contains(wi))
+                    .collect();
+                for (position, wi) in remaining.iter().enumerate() {
+                    if !visited.insert(*wi) {
+                        continue;
+                    }
                     entries.push(ListEntry::Worktree {
                         project_index: pi,
-                        worktree_index: wi,
+                        worktree_index: *wi,
+                        depth: 0,
+                        is_last: position == remaining.len() - 1,
                     });
+                    Self::push_worktree_entries(
+                        pi,
+                        Some(project.worktrees[*wi].name.as_str()),
+                        1,
+                        &project.worktrees,
+                        &children_of,
+                        &mut entries,
+                        &mut visited,
+                    );
                 }
             }
         }
         entries
+    }
+
+    fn push_worktree_entries<'a>(
+        project_index: usize,
+        parent_key: Option<&'a str>,
+        depth: usize,
+        worktrees: &'a [Worktree],
+        children_of: &HashMap<Option<&'a str>, Vec<usize>>,
+        entries: &mut Vec<ListEntry>,
+        visited: &mut HashSet<usize>,
+    ) {
+        let Some(children) = children_of.get(&parent_key) else {
+            return;
+        };
+        for (position, wi) in children.iter().enumerate() {
+            if !visited.insert(*wi) {
+                continue;
+            }
+            entries.push(ListEntry::Worktree {
+                project_index,
+                worktree_index: *wi,
+                depth,
+                is_last: position == children.len() - 1,
+            });
+            Self::push_worktree_entries(
+                project_index,
+                Some(worktrees[*wi].name.as_str()),
+                depth + 1,
+                worktrees,
+                children_of,
+                entries,
+                visited,
+            );
+        }
     }
 
     /// カーソルを下に移動
@@ -88,6 +159,7 @@ impl LeftPanel {
             ListEntry::Worktree {
                 project_index,
                 worktree_index,
+                ..
             } => Some((*project_index, *worktree_index)),
             ListEntry::Project { .. } => None,
         }
@@ -125,12 +197,12 @@ impl LeftPanel {
                     ListEntry::Worktree {
                         project_index,
                         worktree_index,
+                        depth,
+                        is_last,
                     } => {
                         let wt = &app.projects[*project_index].worktrees[*worktree_index];
                         let project_name = &app.projects[*project_index].name;
-                        let is_last = *worktree_index
-                            == app.projects[*project_index].worktrees.len() - 1;
-                        let branch_char = if is_last { "└" } else { "├" };
+                        let branch_char = if *is_last { "└" } else { "├" };
                         // セッションレジストリから状態バッジを取得（なければ既存アイコン）
                         let has_alert = session_registry
                             .map(|reg| reg.has_alert(project_name, &wt.name))
@@ -157,7 +229,7 @@ impl LeftPanel {
                             Color::DarkGray
                         };
 
-                        let prefix = format!("  {} ", branch_char);
+                        let prefix = Self::worktree_prefix(*depth, branch_char);
                         let display = wt.display_name.as_deref().unwrap_or(&wt.name);
                         let name_part = format!(" {} ", display);
                         let branch_part = format!(" {}", wt.branch);
@@ -204,6 +276,10 @@ impl LeftPanel {
 
         // 描画後のスクロールオフセットを保存（マウスクリック時の行計算に使用）
         self.scroll_offset = list_state.offset();
+    }
+
+    fn worktree_prefix(depth: usize, branch_char: &str) -> String {
+        format!("{}{} ", "  ".repeat(depth + 1), branch_char)
     }
 }
 
@@ -298,6 +374,40 @@ mod tests {
         ]
     }
 
+    fn test_worktree(name: &str, parent: Option<&str>) -> Worktree {
+        Worktree {
+            name: name.to_string(),
+            display_name: None,
+            parent: parent.map(|p| p.to_string()),
+            branch: format!("branch/{}", name),
+            path: PathBuf::from(format!("/tmp/{}", name)),
+            chat_history: vec![],
+            open_files: vec![],
+            active_tab: 0,
+            claude_tabs: 0,
+            claude_tab_llm: Vec::new(),
+            right_panel_mode: RightPanelMode::Tree,
+            diff_focus: DiffFocus::PrDiff,
+            active_terminal: 0,
+            chat_scroll_offset: 0,
+            claude_scroll_offsets: std::collections::HashMap::new(),
+            pr: None,
+            claude_session_id: None,
+            context_items: Vec::new(),
+            context_cursor: 0,
+        }
+    }
+
+    fn project_with_worktrees(worktrees: Vec<Worktree>) -> Project {
+        Project {
+            name: "tree".to_string(),
+            display_name: None,
+            path: PathBuf::from("/tmp/tree"),
+            collapsed: false,
+            worktrees,
+        }
+    }
+
     #[test]
     fn test_build_entries_all_expanded() {
         let projects = sample_projects();
@@ -310,14 +420,18 @@ mod tests {
             entries[1],
             ListEntry::Worktree {
                 project_index: 0,
-                worktree_index: 0
+                worktree_index: 0,
+                depth: 0,
+                is_last: false
             }
         );
         assert_eq!(
             entries[2],
             ListEntry::Worktree {
                 project_index: 0,
-                worktree_index: 1
+                worktree_index: 1,
+                depth: 0,
+                is_last: true
             }
         );
         assert_eq!(entries[3], ListEntry::Project { index: 1 });
@@ -325,7 +439,9 @@ mod tests {
             entries[4],
             ListEntry::Worktree {
                 project_index: 1,
-                worktree_index: 0
+                worktree_index: 0,
+                depth: 0,
+                is_last: true
             }
         );
     }
@@ -344,7 +460,9 @@ mod tests {
             entries[2],
             ListEntry::Worktree {
                 project_index: 1,
-                worktree_index: 0
+                worktree_index: 0,
+                depth: 0,
+                is_last: true
             }
         );
     }
@@ -365,6 +483,126 @@ mod tests {
     fn test_build_entries_empty() {
         let entries = LeftPanel::build_entries(&[]);
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_build_entries_parent_dfs_depth() {
+        let project = project_with_worktrees(vec![
+            test_worktree("A", None),
+            test_worktree("B", Some("A")),
+            test_worktree("C", Some("B")),
+        ]);
+        let entries = LeftPanel::build_entries(&[project]);
+
+        assert_eq!(
+            entries[1],
+            ListEntry::Worktree {
+                project_index: 0,
+                worktree_index: 0,
+                depth: 0,
+                is_last: true
+            }
+        );
+        assert_eq!(
+            entries[2],
+            ListEntry::Worktree {
+                project_index: 0,
+                worktree_index: 1,
+                depth: 1,
+                is_last: true
+            }
+        );
+        assert_eq!(
+            entries[3],
+            ListEntry::Worktree {
+                project_index: 0,
+                worktree_index: 2,
+                depth: 2,
+                is_last: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_entries_flat_order_and_depth_regression() {
+        let project = project_with_worktrees(vec![
+            test_worktree("X", None),
+            test_worktree("Y", None),
+            test_worktree("Z", None),
+        ]);
+        let entries = LeftPanel::build_entries(&[project]);
+        let worktrees: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Worktree { worktree_index, depth, .. } => Some((*worktree_index, *depth)),
+                ListEntry::Project { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(worktrees, vec![(0, 0), (1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn test_build_entries_keeps_dangling_parent_as_root() {
+        let project = project_with_worktrees(vec![
+            test_worktree("A", None),
+            test_worktree("B", Some("missing")),
+        ]);
+        let entries = LeftPanel::build_entries(&[project]);
+
+        assert_eq!(
+            entries[2],
+            ListEntry::Worktree {
+                project_index: 0,
+                worktree_index: 1,
+                depth: 0,
+                is_last: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_entries_is_last_by_siblings() {
+        let project = project_with_worktrees(vec![
+            test_worktree("A", None),
+            test_worktree("B", Some("A")),
+            test_worktree("C", Some("A")),
+            test_worktree("D", None),
+            test_worktree("E", Some("D")),
+        ]);
+        let entries = LeftPanel::build_entries(&[project]);
+
+        assert!(matches!(entries[1], ListEntry::Worktree { worktree_index: 0, is_last: false, .. }));
+        assert!(matches!(entries[2], ListEntry::Worktree { worktree_index: 1, is_last: false, .. }));
+        assert!(matches!(entries[3], ListEntry::Worktree { worktree_index: 2, is_last: true, .. }));
+        assert!(matches!(entries[4], ListEntry::Worktree { worktree_index: 3, is_last: true, .. }));
+        assert!(matches!(entries[5], ListEntry::Worktree { worktree_index: 4, is_last: true, .. }));
+    }
+
+    #[test]
+    fn test_build_entries_cycle_does_not_recurse_forever() {
+        let project = project_with_worktrees(vec![
+            test_worktree("X", Some("Y")),
+            test_worktree("Y", Some("X")),
+        ]);
+        let entries = LeftPanel::build_entries(&[project]);
+        let worktree_indices: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Worktree { worktree_index, .. } => Some(*worktree_index),
+                ListEntry::Project { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(worktree_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_worktree_prefix_depth_zero_matches_existing_bytes() {
+        let branch_char = "└";
+        let old_prefix = format!("  {} ", branch_char);
+
+        assert_eq!(LeftPanel::worktree_prefix(0, branch_char).as_bytes(), old_prefix.as_bytes());
     }
 
     #[test]
@@ -463,7 +701,9 @@ mod tests {
             *entry,
             ListEntry::Worktree {
                 project_index: 0,
-                worktree_index: 0
+                worktree_index: 0,
+                depth: 0,
+                is_last: false
             }
         );
     }

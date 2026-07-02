@@ -33,6 +33,7 @@ type TerminalKey = (app::WorktreeId, usize);
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 const DISPATCH_RETRY_LIMIT: u32 = 30;
+const PARENT_SYNC_INTERVAL_TICKS: u8 = 10;
 
 #[derive(Debug, PartialEq, Eq)]
 enum DispatchAction {
@@ -57,6 +58,23 @@ fn decide_dispatch_action(
         DispatchAction::MarkReadAndAlert
     } else {
         DispatchAction::IncrementRetry(next_count)
+    }
+}
+
+fn sync_worktree_parents_from_meta(app: &mut app::App) {
+    for project in &mut app.projects {
+        let Some(meta) = config::load_project_meta(&project.name) else {
+            continue;
+        };
+        for worktree in &mut project.worktrees {
+            let parent = meta
+                .worktrees
+                .get(&worktree.name)
+                .and_then(|wt_meta| wt_meta.parent.clone());
+            if worktree.parent != parent {
+                worktree.parent = parent;
+            }
+        }
     }
 }
 
@@ -1277,7 +1295,7 @@ async fn handle_event(
                                 if target_index < entries.len() {
                                     left_panel.cursor_index = target_index;
                                     match &entries[target_index] {
-                                        ui::left_panel::ListEntry::Worktree { project_index, worktree_index } => {
+                                        ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. } => {
                                             let wt_id = (*project_index, *worktree_index);
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
@@ -1816,6 +1834,13 @@ async fn handle_event(
                         reg.sync_alerts_from_db(&alerted);
                     }
                 }
+            }
+            // project.json の親リンク変更（MCP move_worktree 等の別プロセス由来）を
+            // インメモリへ反映する（毎Tickでは IO 過剰なため間引く）
+            app.parent_sync_counter = app.parent_sync_counter.wrapping_add(1);
+            if app.parent_sync_counter >= PARENT_SYNC_INTERVAL_TICKS {
+                app.parent_sync_counter = 0;
+                sync_worktree_parents_from_meta(app);
             }
             if let Ok(conn) = broker_db.lock() {
                 if let Ok(dispatches) = db::get_pending_dispatches(&conn) {
@@ -2902,7 +2927,7 @@ fn handle_left_panel_key(
         }
         KeyCode::Char('r') => {
             // worktree 行にカーソルがある場合のみ run スクリプトを実行
-            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) =
+            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) =
                 left_panel.current_entry(&entries)
             {
                 let pi = *project_index;
@@ -2930,7 +2955,7 @@ fn handle_left_panel_key(
         }
         KeyCode::Char('d') => {
             match left_panel.current_entry(&entries) {
-                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) => {
+                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) => {
                     app.archive_target = Some((*project_index, *worktree_index));
                     app.show_archive_confirm = true;
                 }
@@ -2942,7 +2967,7 @@ fn handle_left_panel_key(
             }
         }
         KeyCode::Char('M') => {
-            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) =
+            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) =
                 left_panel.current_entry(&entries)
             {
                 let pi = *project_index;
@@ -3105,7 +3130,7 @@ fn handle_left_panel_key(
                     app.rename_project_input = current_display;
                     app.show_rename_project_popup = true;
                 }
-                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) => {
+                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) => {
                     let pi = *project_index;
                     let wi = *worktree_index;
                     let current_display = app.projects[pi].worktrees[wi]
