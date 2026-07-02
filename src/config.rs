@@ -339,10 +339,12 @@ pub fn discover_symlink_candidates(project_path: &Path) -> Vec<String> {
 }
 
 /// worktree メタデータ
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct WorktreeMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// worktree メタデータを project.json から読み込む
@@ -366,20 +368,71 @@ pub fn save_worktree_display_name(
         .map(crate::text::sanitize_text)
         .filter(|s| !s.is_empty());
     if let Some(name) = clean {
+        let parent = meta
+            .worktrees
+            .get(worktree_name)
+            .and_then(|wt_meta| wt_meta.parent.clone());
         meta.worktrees.insert(
             worktree_name.to_string(),
             WorktreeMeta {
                 display_name: Some(name),
+                parent,
             },
         );
     } else {
-        meta.worktrees.remove(worktree_name);
+        // display_name 以外のメタデータ（parent 等）が残っていればエントリは保持する
+        match meta.worktrees.get_mut(worktree_name) {
+            Some(entry) if entry.parent.is_some() => entry.display_name = None,
+            _ => {
+                meta.worktrees.remove(worktree_name);
+            }
+        }
     }
     let content =
         serde_json::to_string_pretty(&meta).context("project.json のシリアライズに失敗")?;
     std::fs::write(&meta_path, content)
         .with_context(|| format!("project.json の保存に失敗: {}", meta_path.display()))?;
     Ok(())
+}
+
+/// worktree の親リンクを設定する
+pub fn save_worktree_parent(
+    project_name: &str,
+    worktree_name: &str,
+    parent: Option<&str>,
+) -> Result<()> {
+    let meta_path = project_meta_path(project_name);
+    let mut meta = load_project_meta(project_name)
+        .ok_or_else(|| anyhow::anyhow!("project.json が見つかりません: {}", project_name))?;
+    let entry = meta.worktrees.entry(worktree_name.to_string()).or_default();
+    entry.parent = parent.map(|s| s.to_string());
+    let content =
+        serde_json::to_string_pretty(&meta).context("project.json のシリアライズに失敗")?;
+    std::fs::write(&meta_path, content)
+        .with_context(|| format!("project.json の保存に失敗: {}", meta_path.display()))?;
+    Ok(())
+}
+
+/// project_name 内で root_worktree の子孫の名前一覧をDFSで返す
+pub fn get_descendants(project_name: &str, root_worktree: &str) -> Vec<String> {
+    let Some(meta) = load_project_meta(project_name) else { return Vec::new() };
+    let mut result = Vec::new();
+    let mut stack = vec![root_worktree.to_string()];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(current) = stack.pop() {
+        for (name, wt_meta) in &meta.worktrees {
+            if wt_meta.parent.as_deref() == Some(current.as_str()) && visited.insert(name.clone()) {
+                result.push(name.clone());
+                stack.push(name.clone());
+            }
+        }
+    }
+    result
+}
+
+/// 付け替え前の循環参照チェック
+pub fn would_create_cycle(project_name: &str, child: &str, new_parent: &str) -> bool {
+    new_parent == child || get_descendants(project_name, child).iter().any(|d| d == new_parent)
 }
 
 /// 既存の worktree.json を project.json に統合するマイグレーション
@@ -810,6 +863,25 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    struct TestProject {
+        name: String,
+    }
+
+    impl TestProject {
+        fn new(suffix: &str) -> Self {
+            let name = format!("task-0003-{}-{}", std::process::id(), suffix);
+            let _ = remove_project_meta(&name);
+            save_project_meta(&name, Path::new("/tmp/siki-task-0003")).unwrap();
+            Self { name }
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = remove_project_meta(&self.name);
+        }
+    }
+
     #[test]
     fn test_bytes_to_kb_rounds_half_up() {
         assert_eq!(bytes_to_kb(0), 0);
@@ -1131,6 +1203,91 @@ worktrees = [
         let content = std::fs::read_to_string(&meta_path).unwrap();
         let loaded: ProjectMeta = serde_json::from_str(&content).unwrap();
         assert_eq!(loaded.path, "/tmp/my-project");
+    }
+
+    #[test]
+    fn test_save_worktree_parent_roundtrip() {
+        let project = TestProject::new("parent-roundtrip");
+
+        save_worktree_parent(&project.name, "child", Some("parent")).unwrap();
+
+        let meta = load_project_meta(&project.name).unwrap();
+        assert_eq!(
+            meta.worktrees.get("child").and_then(|m| m.parent.as_deref()),
+            Some("parent")
+        );
+    }
+
+    #[test]
+    fn test_save_worktree_parent_none_keeps_entry_and_display_name() {
+        let project = TestProject::new("parent-none-keeps-display");
+        save_worktree_display_name(&project.name, "child", Some("Child Display")).unwrap();
+        save_worktree_parent(&project.name, "child", Some("A")).unwrap();
+
+        save_worktree_parent(&project.name, "child", None).unwrap();
+
+        let meta = load_worktree_meta(&project.name, "child").unwrap();
+        assert_eq!(meta.parent, None);
+        assert_eq!(meta.display_name.as_deref(), Some("Child Display"));
+    }
+
+    #[test]
+    fn test_clear_display_name_keeps_parent() {
+        let project = TestProject::new("clear-display-keeps-parent");
+        save_worktree_display_name(&project.name, "child", Some("Child Display")).unwrap();
+        save_worktree_parent(&project.name, "child", Some("A")).unwrap();
+
+        // display_name をクリアしても parent リンクは道連れに消えない
+        save_worktree_display_name(&project.name, "child", None).unwrap();
+
+        let meta = load_worktree_meta(&project.name, "child").unwrap();
+        assert_eq!(meta.display_name, None);
+        assert_eq!(meta.parent.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn test_clear_display_name_without_parent_removes_entry() {
+        let project = TestProject::new("clear-display-removes-entry");
+        save_worktree_display_name(&project.name, "child", Some("Child Display")).unwrap();
+
+        // parent 等の他メタデータが無ければ従来通りエントリごと削除する
+        save_worktree_display_name(&project.name, "child", None).unwrap();
+
+        assert!(load_worktree_meta(&project.name, "child").is_none());
+    }
+
+    #[test]
+    fn test_get_descendants_returns_chain_without_unrelated_worktrees() {
+        let project = TestProject::new("descendants");
+        save_worktree_parent(&project.name, "solo", None).unwrap();
+        save_worktree_parent(&project.name, "A", None).unwrap();
+        save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        save_worktree_parent(&project.name, "D", None).unwrap();
+
+        assert!(get_descendants(&project.name, "solo").is_empty());
+        let descendants: std::collections::HashSet<_> =
+            get_descendants(&project.name, "A").into_iter().collect();
+
+        assert_eq!(
+            descendants,
+            ["B".to_string(), "C".to_string()].into_iter().collect()
+        );
+        assert!(!descendants.contains("D"));
+    }
+
+    #[test]
+    fn test_would_create_cycle_detects_self_and_descendant_parent() {
+        let project = TestProject::new("cycle");
+        save_worktree_parent(&project.name, "A", None).unwrap();
+        save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        save_worktree_parent(&project.name, "D", None).unwrap();
+
+        assert!(would_create_cycle(&project.name, "X", "X"));
+        assert!(would_create_cycle(&project.name, "A", "C"));
+        assert!(!would_create_cycle(&project.name, "C", "A"));
+        assert!(!would_create_cycle(&project.name, "D", "A"));
     }
 
     #[test]

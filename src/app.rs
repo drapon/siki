@@ -228,6 +228,7 @@ pub struct PrInfo {
 pub struct Worktree {
     pub name: String,
     pub display_name: Option<String>,
+    pub parent: Option<String>,
     pub branch: String,
     pub path: PathBuf,
     pub chat_history: Vec<ChatMessage>,
@@ -715,11 +716,13 @@ impl Project {
             .worktrees
             .iter()
             .map(|wc| {
-                let display_name = config::load_worktree_meta(&pc.name, &wc.name)
-                    .and_then(|m| m.display_name);
+                let wt_meta = config::load_worktree_meta(&pc.name, &wc.name);
+                let display_name = wt_meta.as_ref().and_then(|m| m.display_name.clone());
+                let parent = wt_meta.and_then(|m| m.parent);
                 Worktree {
                 name: wc.name.clone(),
                 display_name,
+                parent,
                 branch: wc.branch.clone(),
                 path: config::worktree_path(&pc.name, &wc.name),
                 chat_history: Vec::new(),
@@ -754,6 +757,26 @@ impl Project {
 mod tests {
     use super::*;
     use crate::config::{SikiConfig, WorktreeConfig};
+    use std::path::Path;
+
+    struct TestProject {
+        name: String,
+    }
+
+    impl TestProject {
+        fn new(suffix: &str) -> Self {
+            let name = format!("task-0003-app-{}-{}", std::process::id(), suffix);
+            let _ = config::remove_project_meta(&name);
+            config::save_project_meta(&name, Path::new("/tmp/siki-task-0003-app")).unwrap();
+            Self { name }
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = config::remove_project_meta(&self.name);
+        }
+    }
 
     fn sample_config() -> Config {
         Config {
@@ -830,6 +853,28 @@ mod tests {
         assert!(wt.open_files.is_empty());
         assert_eq!(wt.active_tab, 0);
         assert_eq!(wt.right_panel_mode, RightPanelMode::Tree);
+    }
+
+    #[test]
+    fn test_project_from_config_loads_worktree_parent() {
+        let project = TestProject::new("parent-load");
+        config::save_worktree_parent(&project.name, "child", Some("A")).unwrap();
+        let config = Config {
+            siki: SikiConfig::default(),
+            projects: vec![ProjectConfig {
+                name: project.name.clone(),
+                path: "/tmp/siki-task-0003-app".to_string(),
+                display_name: None,
+                worktrees: vec![WorktreeConfig {
+                    name: "child".to_string(),
+                    branch: "feature/child".to_string(),
+                }],
+            }],
+        };
+
+        let app = App::new(&config);
+
+        assert_eq!(app.projects[0].worktrees[0].parent.as_deref(), Some("A"));
     }
 
     #[test]

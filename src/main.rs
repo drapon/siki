@@ -2305,6 +2305,7 @@ fn finalize_add_worktree(
     app.projects[pi].worktrees.push(app::Worktree {
         name: wt_name.clone(),
         display_name: display_name.map(|s| s.to_string()),
+        parent: None,
         branch: branch.to_string(),
         path: wt_path.clone(),
         chat_history: Vec::new(),

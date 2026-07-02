@@ -224,6 +224,7 @@ mod tests {
                     Worktree {
                         name: "feature-auth".to_string(),
                         display_name: None,
+                        parent: None,
                         branch: "feature/auth".to_string(),
                         path: PathBuf::from("/tmp/wt1"),
 
@@ -245,6 +246,7 @@ mod tests {
                     Worktree {
                         name: "fix-bug".to_string(),
                         display_name: None,
+                        parent: None,
                         branch: "fix/bug-123".to_string(),
                         path: PathBuf::from("/tmp/wt2"),
 
@@ -273,6 +275,7 @@ mod tests {
                 worktrees: vec![Worktree {
                     name: "refactor".to_string(),
                     display_name: None,
+                    parent: None,
                     branch: "refactor/db".to_string(),
                     path: PathBuf::from("/tmp/wt3"),
 
