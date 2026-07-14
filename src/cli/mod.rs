@@ -46,7 +46,14 @@ fn find_project_index(projects: &[config::ProjectConfig], name: &str) -> Result<
     })
 }
 
-/// プロジェクトを解決する。`None` の場合は対話セレクタで選択する。
+/// cwd が属するプロジェクトのインデックスを返す（検出できなければ None）。
+fn detect_project_index_from_cwd(projects: &[config::ProjectConfig]) -> Option<usize> {
+    let cwd = std::env::current_dir().ok()?;
+    let name = config::detect_project_from_cwd(projects, &cwd)?;
+    projects.iter().position(|p| p.name == name)
+}
+
+/// プロジェクトを解決する。`None` の場合は cwd から検出し、できなければ対話セレクタ。
 fn resolve_project_cfg(name: Option<&str>) -> Result<config::ProjectConfig> {
     let mut projects = config::discover_projects();
     let idx = match name {
@@ -55,12 +62,21 @@ fn resolve_project_cfg(name: Option<&str>) -> Result<config::ProjectConfig> {
             if projects.is_empty() {
                 bail!("プロジェクトが見つかりません（~/.siki/workspaces 配下に git リポジトリがありません）");
             }
-            let items: Vec<SelectItem> = projects
-                .iter()
-                .map(|p| SelectItem::new(p.name.clone(), Some(p.path.clone())))
-                .collect();
-            prompt::select_one("プロジェクトを選択", &items)?
-                .ok_or_else(|| anyhow::anyhow!("中止しました"))?
+            match detect_project_index_from_cwd(&projects) {
+                Some(i) => {
+                    // TUI 起動時の cwd 絞り込みと同じ挙動。暗黙選択なのでどれを選んだか通知する。
+                    eprintln!("プロジェクト: {}（cwd から検出）", projects[i].name);
+                    i
+                }
+                None => {
+                    let items: Vec<SelectItem> = projects
+                        .iter()
+                        .map(|p| SelectItem::new(p.name.clone(), Some(p.path.clone())))
+                        .collect();
+                    prompt::select_one("プロジェクトを選択", &items)?
+                        .ok_or_else(|| anyhow::anyhow!("中止しました"))?
+                }
+            }
         }
     };
     Ok(projects.swap_remove(idx))
@@ -326,16 +342,32 @@ fn format_listing(projects: &[config::ProjectConfig], filter: Option<&str>) -> S
     out
 }
 
-/// `siki list [project]` — プロジェクト/worktree 一覧（非対話）。
+/// list の実効フィルタを決める純粋関数。優先度: 明示指定 > --all（絞らない） > cwd 検出。
+fn resolve_list_filter(explicit: Option<&str>, all: bool, detected: Option<String>) -> Option<String> {
+    if let Some(e) = explicit {
+        return Some(e.to_string());
+    }
+    if all {
+        return None;
+    }
+    detected
+}
+
+/// `siki list [project] [--all]` — プロジェクト/worktree 一覧（非対話）。
+/// プロジェクト未指定でも cwd がプロジェクト配下ならそのプロジェクトに絞る（--all で全件）。
 pub fn cmd_list(args: &[String]) -> Result<()> {
-    let scan = ArgScan::parse(args, &[], &[])?;
+    let scan = ArgScan::parse(args, &[], &["--all"])?;
     let pos = scan.positionals_opt(1)?;
-    let filter = pos.first().map(|s| s.as_str());
+    let explicit = pos.first().map(|s| s.as_str());
 
     let projects = config::discover_projects();
-    let listing = format_listing(&projects, filter);
+    let detected = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::detect_project_from_cwd(&projects, &cwd));
+    let filter = resolve_list_filter(explicit, scan.has("--all"), detected);
+    let listing = format_listing(&projects, filter.as_deref());
     if listing.is_empty() {
-        match filter {
+        match filter.as_deref() {
             Some(f) => bail!("プロジェクトが見つかりません: {}", f),
             None => println!("No projects found."),
         }
@@ -552,6 +584,23 @@ mod tests {
         assert!(!only.contains("beta"));
 
         assert!(format_listing(&projects, Some("zzz")).is_empty());
+    }
+
+    #[test]
+    fn resolve_list_filter_priority() {
+        let detected = || Some("siki".to_string());
+
+        // 明示指定が最優先（--all や cwd 検出より強い）
+        assert_eq!(
+            resolve_list_filter(Some("alpha"), true, detected()),
+            Some("alpha".to_string())
+        );
+        // --all は cwd 検出を無効化して全件表示
+        assert_eq!(resolve_list_filter(None, true, detected()), None);
+        // 指定なしなら cwd 検出に従う
+        assert_eq!(resolve_list_filter(None, false, detected()), Some("siki".to_string()));
+        // 何も無ければフィルタなし
+        assert_eq!(resolve_list_filter(None, false, None), None);
     }
 
     #[test]

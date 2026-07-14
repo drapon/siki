@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         println!("                                     Launch the LLM in a worktree (creates if missing)");
         println!("  rm  [proj] [name] [--yes]          Remove a worktree (confirms unless --yes)");
         println!("  path <proj> <name>                 Print the worktree's absolute path");
-        println!("  list [proj]                        List projects and worktrees");
+        println!("  list [proj] [--all]                List projects and worktrees (narrows to the current project inside one; --all shows every project)");
         println!("  mcp            Start MCP stdio server");
         println!("  session-start  Internal: SessionStart hook (reads stdin, emits additionalContext)");
         println!("  hook-event <s> Internal: state hook (reads stdin session_id, notifies broker)");
