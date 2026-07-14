@@ -107,7 +107,8 @@ pub fn select_one(title: &str, items: &[SelectItem]) -> Result<Option<usize>> {
     let _guard = TermGuard;
 
     // 折り返し防止に使う表示幅（取得失敗時は 80 にフォールバック）。
-    let width = size().map(|(c, _)| c as usize).unwrap_or(80);
+    // 選択中のリサイズに追従するため mut。
+    let mut width = size().map(|(c, _)| c as usize).unwrap_or(80);
 
     out.queue(cursor::Hide)?;
     write!(out, "{}\r\n", title)?;
@@ -116,22 +117,29 @@ pub fn select_one(title: &str, items: &[SelectItem]) -> Result<Option<usize>> {
     out.flush()?;
 
     let chosen = loop {
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Release {
-                continue;
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => cur = next_cursor(cur, items.len(), true),
+                    KeyCode::Down | KeyCode::Char('j') => cur = next_cursor(cur, items.len(), false),
+                    KeyCode::Enter => break Some(cur),
+                    KeyCode::Esc => break None,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break None
+                    }
+                    _ => continue,
+                }
             }
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => cur = next_cursor(cur, items.len(), true),
-                KeyCode::Down | KeyCode::Char('j') => cur = next_cursor(cur, items.len(), false),
-                KeyCode::Enter => break Some(cur),
-                KeyCode::Esc => break None,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
-                _ => continue,
-            }
-            out.queue(cursor::MoveUp(items.len() as u16))?;
-            write_items(&mut out, items, cur, width)?;
-            out.flush()?;
+            // 端末リサイズに追従して幅を更新する（古い幅のままだと折り返し→MoveUp ずれで崩れる）。
+            Event::Resize(new_w, _) => width = new_w as usize,
+            _ => continue,
         }
+        out.queue(cursor::MoveUp(items.len() as u16))?;
+        write_items(&mut out, items, cur, width)?;
+        out.flush()?;
     };
 
     // 次の出力が項目行の直後ではなく行頭から始まるよう改行を 1 つ出す。

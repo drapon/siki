@@ -9,7 +9,7 @@
 pub mod args;
 pub mod prompt;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use args::ArgScan;
 use prompt::SelectItem;
 use std::path::{Path, PathBuf};
@@ -193,6 +193,31 @@ fn validate_worktree_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `target` の実体（canonicalize 後）が `root` 配下を逸脱していれば true（純粋寄りヘルパ）。
+/// 両者を canonicalize して比較するため、symlink で外部を指すパスを検出できる。
+/// どちらかが解決できない場合はエラー（呼び出し側は存在確認済みの前提）。
+fn path_escapes_root(root: &Path, target: &Path) -> Result<bool> {
+    let root_c = root
+        .canonicalize()
+        .with_context(|| format!("パスを解決できません: {}", root.display()))?;
+    let target_c = target
+        .canonicalize()
+        .with_context(|| format!("パスを解決できません: {}", target.display()))?;
+    Ok(!target_c.starts_with(&root_c))
+}
+
+/// 解決済み worktree パスが `~/.siki/workspaces` 配下に収まっているか検証する。
+/// symlink で workspaces 外（外部ディレクトリ）を指す worktree で LLM を exec する事故を防ぐ。
+fn ensure_within_workspaces(wt_path: &Path) -> Result<()> {
+    if path_escapes_root(&config::workspaces_dir(), wt_path)? {
+        bail!(
+            "worktree が workspaces の外を指しています（symlink の可能性）: {}",
+            wt_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// プロジェクトと worktree 名から worktree を作成し、作成パスを返す。
 fn create_worktree(proj: &ResolvedProject, name: &str, base: Option<&str>) -> Result<PathBuf> {
     validate_worktree_name(name)?;
@@ -281,6 +306,7 @@ pub fn cmd_path(args: &[String]) -> Result<()> {
     if !wt_path.exists() {
         bail!("worktree が見つかりません: {}", wt_path.display());
     }
+    ensure_within_workspaces(&wt_path)?;
     println!("{}", wt_path.display());
     Ok(())
 }
@@ -330,6 +356,8 @@ fn resolve_or_create_worktree(
     validate_worktree_name(name)?;
     let wt_path = config::worktree_path(&proj.name, name);
     if wt_path.exists() {
+        // symlink で workspaces 外を指す worktree を exec の cwd にしない。
+        ensure_within_workspaces(&wt_path)?;
         return Ok(wt_path);
     }
     if create_if_missing {
@@ -558,6 +586,23 @@ mod tests {
         // sec-f1: 単一ドット '.' は worktree_path で <proj>/ に解決され、
         // rm の fallback remove_dir_all がプロジェクト配下を一掃するため必ず弾く。
         assert!(validate_worktree_name(".").is_err());
+    }
+
+    #[test]
+    fn path_escapes_root_detects_symlink_escape() {
+        // sec-f3: workspaces 内の通常ディレクトリは収まり、外部への symlink は逸脱と判定する
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        // 通常の子ディレクトリ（収まる）
+        let inside = root.path().join("tokyo");
+        std::fs::create_dir(&inside).unwrap();
+        assert!(!path_escapes_root(root.path(), &inside).unwrap());
+
+        // 外部を指す symlink（逸脱）
+        let escape = root.path().join("evil");
+        std::os::unix::fs::symlink(outside.path(), &escape).unwrap();
+        assert!(path_escapes_root(root.path(), &escape).unwrap());
     }
 
     #[test]
