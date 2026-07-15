@@ -198,7 +198,9 @@ fn validate_worktree_name(name: &str) -> Result<()> {
     if name.starts_with('-') {
         bail!("worktree 名はハイフンで始められません: {}", name);
     }
-    if name.contains('/') || name.contains('\\') || name.split(std::path::MAIN_SEPARATOR).any(|c| c == "..") || name == ".." {
+    // worktree 名は単一セグメント前提。パス区切りを含む時点で拒否するので、
+    // 親参照はそれ自体（".."）との完全一致だけ弾けば十分。
+    if name.contains('/') || name.contains('\\') || name == ".." {
         bail!("worktree 名にパス区切りや親参照（.. /）は使えません: {}", name);
     }
     // 単一ドット '.' は worktree_path(<proj>, ".") が <proj>/ 自体に解決され、
@@ -296,6 +298,14 @@ pub fn cmd_rm(args: &[String]) -> Result<()> {
     };
     validate_worktree_name(&name)?;
     let wt_path = config::worktree_path(&proj.name, &name);
+
+    // 削除は最も破壊的なので、確認を出す前に存在と workspaces 内であることを検証する。
+    // symlink で workspaces 外を指す worktree に対し remove_worktree の
+    // remove_dir_all フォールバックが外部実体を消す事故を防ぐ（path/run/sw と同じガード）。
+    if !wt_path.exists() {
+        bail!("worktree が見つかりません: {}", wt_path.display());
+    }
+    ensure_within_workspaces(&wt_path)?;
 
     // 既定で削除確認（誤削除防止）。--yes でスキップ。非対話/パイプでは空入力→中止。
     if !scan.has("--yes")

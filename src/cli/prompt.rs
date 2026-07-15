@@ -16,7 +16,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType},
     QueueableCommand,
 };
-use std::io::{stderr, stdin, Write};
+use std::io::{stderr, stdin, IsTerminal, Write};
 use unicode_width::UnicodeWidthChar;
 
 /// セレクタの 1 行（ラベル + 右側補助表示。例: "tokyo" + "[feature/auth]"）。
@@ -100,6 +100,13 @@ fn write_items<W: Write>(out: &mut W, items: &[SelectItem], cur: usize, width: u
 pub fn select_one(title: &str, items: &[SelectItem]) -> Result<Option<usize>> {
     if items.is_empty() {
         bail!("選択肢がありません");
+    }
+
+    // 非対話環境（CI/パイプ）では raw mode + event::read が制御端末に依存し、
+    // 到達しないキー入力を待ってハング（あるいは不明瞭な OS エラー）になる。
+    // 事前に stdin が端末かを確認し、明快なエラーで即座に中止する。
+    if !stdin().is_terminal() {
+        bail!("対話選択できません（非対話環境）。引数でプロジェクト/worktree 名を指定してください");
     }
 
     let mut out = stderr();
