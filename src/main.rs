@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
         println!("  rm  [proj] [name] [--yes]          Remove a worktree (confirms unless --yes)");
         println!("  path <proj> <name>                 Print the worktree's absolute path");
         println!("  list [proj] [--all]                List projects and worktrees (narrows to the current project inside one; --all shows every project)");
+        println!("  sw  [proj] [name]                  Pick a worktree (branch / PR# / ● active session) and open a subshell there");
         println!("  mcp            Start MCP stdio server");
         println!("  session-start  Internal: SessionStart hook (reads stdin, emits additionalContext)");
         println!("  hook-event <s> Internal: state hook (reads stdin session_id, notifies broker)");
@@ -103,6 +104,7 @@ async fn main() -> Result<()> {
             "rm" => return cli::cmd_rm(&args[2..]),
             "path" => return cli::cmd_path(&args[2..]),
             "list" => return cli::cmd_list(&args[2..]),
+            "sw" => return cli::cmd_sw(&args[2..]),
             _ => {}
         }
     }

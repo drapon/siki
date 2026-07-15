@@ -14,7 +14,7 @@ use args::ArgScan;
 use prompt::SelectItem;
 use std::path::{Path, PathBuf};
 
-use crate::{config, git, hooks};
+use crate::{config, db, git, hooks};
 
 /// 解決済みプロジェクト（`discover_projects` の 1 要素に相当）。
 struct ResolvedProject {
@@ -481,6 +481,123 @@ pub fn cmd_run(args: &[String]) -> Result<()> {
     exec_llm(&proj, &wt_path, scan.has("--resume"), scan.rest())
 }
 
+/// セレクタ 1 行の注記を組み立てる純粋関数。例: `[feature/x] #12 ●`
+/// pr は open PR の番号、active はその worktree で LLM セッションが生きているか。
+fn worktree_note(branch: &str, pr: Option<u64>, active: bool) -> String {
+    let mut s = format!("[{}]", branch);
+    if let Some(n) = pr {
+        s.push_str(&format!(" #{}", n));
+    }
+    if active {
+        s.push_str(" ●");
+    }
+    s
+}
+
+/// `gh pr list --json number,headRefName` の出力を branch → PR 番号にパースする純粋関数。
+/// 不正な JSON は空マップ（PR 表示は補助情報なので落とさない）。
+fn parse_pr_numbers(json: &str) -> std::collections::HashMap<String, u64> {
+    #[derive(serde::Deserialize)]
+    struct Pr {
+        number: u64,
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+    }
+    serde_json::from_str::<Vec<Pr>>(json)
+        .map(|v| v.into_iter().map(|p| (p.head_ref_name, p.number)).collect())
+        .unwrap_or_default()
+}
+
+/// gh CLI で open PR の branch → 番号を引く。gh 不在・未認証・失敗時は空マップ。
+fn fetch_pr_numbers(project_path: &str) -> std::collections::HashMap<String, u64> {
+    let out = std::process::Command::new("gh")
+        .args(["pr", "list", "--json", "number,headRefName", "--limit", "200"])
+        .current_dir(project_path)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_pr_numbers(&String::from_utf8_lossy(&o.stdout)),
+        _ => Default::default(),
+    }
+}
+
+/// LLM セッションが生きている（state != dead）worktree 名の集合。DB 不調時は空集合。
+fn active_worktrees(project: &str) -> std::collections::HashSet<String> {
+    let Ok(conn) = db::init(&config::db_path()) else {
+        return Default::default();
+    };
+    let Ok(rows) = db::list_sessions(&conn) else {
+        return Default::default();
+    };
+    rows.into_iter()
+        .filter(|s| s.project_name == project)
+        .map(|s| s.worktree_name)
+        .collect()
+}
+
+/// worktree を branch / PR 番号 / セッション稼働マーク付きの対話セレクタで選ぶ。
+fn pick_worktree_rich(cfg: &config::ProjectConfig) -> Result<String> {
+    if cfg.worktrees.is_empty() {
+        bail!("worktree がありません: {}", cfg.name);
+    }
+    let prs = fetch_pr_numbers(&cfg.path);
+    let active = active_worktrees(&cfg.name);
+    let items: Vec<SelectItem> = cfg
+        .worktrees
+        .iter()
+        .map(|w| {
+            let note = worktree_note(&w.branch, prs.get(&w.branch).copied(), active.contains(&w.name));
+            SelectItem::new(w.name.clone(), Some(note))
+        })
+        .collect();
+    let idx = prompt::select_one(&format!("worktree を選択  ({})", cfg.name), &items)?
+        .ok_or_else(|| anyhow::anyhow!("中止しました"))?;
+    Ok(cfg.worktrees[idx].name.clone())
+}
+
+/// worktree を cwd にして対話シェルを起動する。exit で呼び出し元のシェルに戻る。
+/// setup スクリプトと同じ `SIKI_*` 環境変数を注入するので、シェル側でプロジェクト/worktree を参照できる。
+fn open_subshell(proj: &ResolvedProject, wt_path: &Path) -> Result<()> {
+    ensure_within_workspaces(wt_path)?;
+
+    // サブシェル内で生の `claude` を打ってもセッション追跡が効くよう、入る前にフックを注入する。
+    // （exec_llm と同様、失敗しても続行して警告のみ）
+    if let Err(e) = hooks::ensure_hooks_configured(wt_path, &proj.name) {
+        eprintln!("hook 注入に失敗しました（監視なしで続行）: {}", e);
+    }
+
+    let config = config::load_config(&config::default_config_path())?;
+    let shell = config::resolve_shell(&config);
+
+    eprintln!("worktree: {} （exit で戻る）", wt_path.display());
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.current_dir(wt_path);
+    for (k, v) in setup_env(proj, wt_path) {
+        cmd.env(k, v);
+    }
+    cmd.status()
+        .with_context(|| format!("シェルの起動に失敗しました: {}", shell))?;
+    Ok(())
+}
+
+/// `siki sw [project] [name]` — worktree を選んでサブシェルを開く（不足分は対話補完）。
+pub fn cmd_sw(args: &[String]) -> Result<()> {
+    let scan = ArgScan::parse(args, &[], &[])?;
+    let pos = scan.positionals_opt(2)?;
+    let cfg = resolve_project_cfg(pos.first().map(|s| s.as_str()))?;
+    let proj = ResolvedProject::from_cfg(&cfg);
+
+    let name = match pos.get(1).map(|s| s.as_str()) {
+        Some(n) => n.to_string(),
+        None => pick_worktree_rich(&cfg)?,
+    };
+    validate_worktree_name(&name)?;
+    let wt_path = config::worktree_path(&proj.name, &name);
+    if !wt_path.exists() {
+        bail!("worktree が見つかりません: {}", wt_path.display());
+    }
+    open_subshell(&proj, &wt_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +701,30 @@ mod tests {
         assert!(!only.contains("beta"));
 
         assert!(format_listing(&projects, Some("zzz")).is_empty());
+    }
+
+    #[test]
+    fn worktree_note_composes_parts() {
+        assert_eq!(worktree_note("feature/x", None, false), "[feature/x]");
+        assert_eq!(worktree_note("feature/x", Some(12), false), "[feature/x] #12");
+        assert_eq!(worktree_note("feature/x", None, true), "[feature/x] ●");
+        assert_eq!(worktree_note("feature/x", Some(12), true), "[feature/x] #12 ●");
+    }
+
+    #[test]
+    fn parse_pr_numbers_maps_branch_to_number() {
+        let json = r#"[
+            {"number": 12, "headRefName": "feature/x"},
+            {"number": 34, "headRefName": "fix/y"}
+        ]"#;
+        let map = parse_pr_numbers(json);
+        assert_eq!(map.get("feature/x"), Some(&12));
+        assert_eq!(map.get("fix/y"), Some(&34));
+        assert_eq!(map.len(), 2);
+
+        // 不正な JSON / 空配列は空マップ（エラーにしない）
+        assert!(parse_pr_numbers("not json").is_empty());
+        assert!(parse_pr_numbers("[]").is_empty());
     }
 
     #[test]
