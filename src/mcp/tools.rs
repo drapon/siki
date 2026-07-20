@@ -14,7 +14,15 @@ pub fn execute_tool(
     session_id: &str,
 ) -> Result<Value> {
     match tool_name {
-        "list_sessions" => list_sessions(conn, session_id, params),
+        "list_sessions" => {
+            // 未登録呼び出し元のフォールバック用に MCP サーバープロセスの cwd を渡す。
+            // MCP サーバーはその session の worktree で spawn されるため current_dir が
+            // worktree パスになる（session_start.rs の cwd フォールバックと同方針）。
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            list_sessions_with_cwd(conn, session_id, &cwd, params)
+        }
         "send_message" => send_message(conn, params, session_id),
         "broadcast" => broadcast(conn, params, session_id),
         "set_summary" => set_summary(conn, params, session_id),
@@ -28,21 +36,51 @@ pub fn execute_tool(
     }
 }
 
-fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<Value> {
+fn list_sessions_with_cwd(
+    conn: &Connection,
+    session_id: &str,
+    cwd: &str,
+    params: &Value,
+) -> Result<Value> {
+    // 既定スコープは "project"。"machine" を既定にするとマシン上の全 worktree・
+    // 全 project のセッションを返してしまい、無関係なノイズで応答が膨らむ。
+    // マシン全体を見たいときは scope:"machine" を明示する。
     let scope = params
         .get("scope")
         .and_then(|v| v.as_str())
-        .unwrap_or("machine");
+        .unwrap_or("project");
+
+    // worktree コンテキスト .md と過去会話サマリの本文を同梱するか。
+    // 既定 false。本文は worktree の寿命とともに無制限に増えるため、既定で同梱すると
+    // list_sessions の応答が肥大化し harness 側で「巨大なため省略」と切り詰められる。
+    // 既定では件数ポインタ（SessionStart hook と同じ方針）のみ返す。
+    let include_bodies = params
+        .get("include_bodies")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let all_sessions = db::list_sessions(conn)?;
 
-    // 自セッションの worktree/project を特定（スコープフィルタに使用）
+    // 自セッションの worktree/project を特定（スコープフィルタに使用）。
+    // 登録済みなら DB の proj/wt を使う。DB 未登録（siki への register と upsert 完了の
+    // 間のレース中など）は cwd から補完する。補完しないと自分の proj/wt が特定できず、
+    // project スコープのフィルタと project broadcast の受信で空・取りこぼしになる
+    // （session_start.rs の cwd 派生と同方針。"unknown" センチネルは無効扱い）。
     let my_worktree = all_sessions.iter().find(|s| s.session_id == session_id);
-    let (wt, proj) = my_worktree
-        .map(|s| (s.worktree_name.as_str(), s.project_name.as_str()))
-        .unwrap_or(("", ""));
+    let (wt, proj): (String, String) = match my_worktree {
+        Some(s) => (s.worktree_name.clone(), s.project_name.clone()),
+        None => {
+            let (p, w) = crate::session::guess_names_from_cwd(cwd);
+            if p == "unknown" || w == "unknown" {
+                (String::new(), String::new())
+            } else {
+                (w, p)
+            }
+        }
+    };
 
-    // scope に応じてフィルタ
+    // scope に応じてフィルタ。enum 外の値はサイレントに machine 扱いにせず拒否する
+    // （broadcast と同じコントラクト。タイポが全件返却で気付かれないのを防ぐ）。
     let sessions: Vec<&db::SessionRow> = match scope {
         "worktree" => all_sessions
             .iter()
@@ -52,7 +90,11 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
             .iter()
             .filter(|s| !proj.is_empty() && s.project_name == proj)
             .collect(),
-        _ => all_sessions.iter().collect(), // "machine" = 全件
+        "machine" => all_sessions.iter().collect(),
+        _ => anyhow::bail!(
+            "Invalid scope: {} (expected \"machine\", \"project\", or \"worktree\")",
+            scope
+        ),
     };
 
     let items: Vec<Value> = sessions
@@ -72,7 +114,7 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         })
         .collect();
 
-    let pending = db::get_pending_messages(conn, session_id, wt, proj)?;
+    let pending = db::get_pending_messages(conn, session_id, &wt, &proj)?;
     let msg_ids: Vec<i64> = pending.iter().map(|m| m.id).collect();
     let messages: Vec<Value> = pending
         .iter()
@@ -92,34 +134,46 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
         let _ = db::mark_messages_read_for_session(conn, session_id, &msg_ids);
     }
 
-    // DB から自分のセッション情報で worktree のコンテキストを読み込む
+    // 自分のセッション情報（proj/wt）で worktree コンテキストと会話サマリを引く。
     // （std::env::current_dir() はMCPサーバーの起動元CWDであり、worktreeパスと異なる場合がある）
-    let worktree_contexts = if !proj.is_empty() && !wt.is_empty() {
-        let contexts = crate::config::load_contexts(proj, wt);
-        if contexts.is_empty() {
-            None
-        } else {
-            let items: Vec<Value> = contexts
+    let valid_worktree = !proj.is_empty() && !wt.is_empty();
+    let contexts = if valid_worktree {
+        crate::config::load_contexts(&proj, &wt)
+    } else {
+        Vec::new()
+    };
+    // messages 本文を載せない軽量クエリを使う（件数・サマリのみ必要なため）。
+    // DB エラーは握り潰さず呼び出し元へ伝播させる（同関数冒頭の db::list_sessions(conn)? と一貫）。
+    let summaries = if valid_worktree {
+        db::get_conversation_log_summaries_by_worktree(conn, &wt, &proj)?
+    } else {
+        Vec::new()
+    };
+
+    let mut result = json!({ "sessions": items, "pending_messages": messages });
+
+    // 呼び出し元セッションが DB 未登録（siki TUI 未起動など）の場合、project/worktree
+    // スコープでは自分の proj/wt を特定できず sessions が空になる。黙って空を返すと
+    // 原因が分からないため、診断フラグを添えて scope:"machine" への切り替えを促す。
+    if my_worktree.is_none() {
+        result["caller_unregistered"] = json!(true);
+    }
+
+    if include_bodies {
+        // 明示要求時のみフル本文を返す。
+        if !contexts.is_empty() {
+            let ctx_items: Vec<Value> = contexts
                 .iter()
                 .map(|(name, content)| json!({ "name": name, "content": content }))
                 .collect();
-            Some(json!({
+            result["worktree_contexts"] = json!({
                 "project": proj,
                 "worktree": wt,
-                "contexts": items
-            }))
+                "contexts": ctx_items
+            });
         }
-    } else {
-        None
-    };
-
-    // SQLite から会話サマリを取得（JSONLパース不要）
-    let conversation_summaries = if !wt.is_empty() && !proj.is_empty() {
-        let logs = db::get_conversation_logs_by_worktree(conn, wt, proj).unwrap_or_default();
-        if logs.is_empty() {
-            None
-        } else {
-            let items: Vec<Value> = logs
+        if !summaries.is_empty() {
+            let sum_items: Vec<Value> = summaries
                 .iter()
                 .map(|log| {
                     json!({
@@ -130,20 +184,36 @@ fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<
                     })
                 })
                 .collect();
-            Some(json!(items))
+            result["conversation_summaries"] = json!(sum_items);
         }
-    } else {
-        None
-    };
+    } else if !contexts.is_empty() || !summaries.is_empty() {
+        // 既定: 件数ポインタのみ。本文は include_bodies:true で取得させる。
+        // KB 見積もりは worktree context（.md）と会話サマリ本文の両方を計上する。
+        // どちらも include_bodies:true で返るため、合計サイズが分からないと呼び出し元が
+        // 取得コストを過小評価してしまう。
+        let total_bytes: usize = contexts.iter().map(|(_, c)| c.len()).sum();
+        let summary_bytes: usize = summaries
+            .iter()
+            .filter_map(|s| s.summary.as_deref())
+            .map(|s| s.len())
+            .sum();
+        result["background"] = json!({
+            "conversation_summary_count": summaries.len(),
+            "conversation_summary_kb": crate::config::bytes_to_kb(summary_bytes),
+            "worktree_context_files": contexts.len(),
+            "worktree_context_kb": crate::config::bytes_to_kb(total_bytes),
+            "hint": "Pass include_bodies:true to fetch the full conversation summaries and worktree context bodies (independent of scope). These can be large — prefer fetching only when the current task needs them.",
+        });
+    }
 
-    let mut result = json!({ "sessions": items, "pending_messages": messages });
-    if let Some(ctx) = worktree_contexts {
-        result["worktree_contexts"] = ctx;
-    }
-    if let Some(summaries) = conversation_summaries {
-        result["conversation_summaries"] = summaries;
-    }
     Ok(result)
+}
+
+/// テスト用の薄いラッパ。cwd フォールバックを効かせない（cwd 空）決定的な入口。
+/// 本番経路は execute_tool が current_dir を渡して list_sessions_with_cwd を呼ぶ。
+#[cfg(test)]
+fn list_sessions(conn: &Connection, session_id: &str, params: &Value) -> Result<Value> {
+    list_sessions_with_cwd(conn, session_id, "", params)
 }
 
 fn send_message(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
@@ -179,9 +249,47 @@ fn broadcast(conn: &Connection, params: &Value, from_session: &str) -> Result<Va
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("message is required"))?;
 
-    db::insert_message(conn, from_session, None, None, None, message, "message", None)?;
+    // 既定スコープは "project"（スキーマの宣言に合わせる）。送信元と同じ project の
+    // セッションにのみ配信する。"machine" は全 NULL でマシン全体へ送る。
+    let scope = params
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("project");
+    match scope {
+        "machine" | "project" => {}
+        _ => anyhow::bail!("Invalid scope: {} (expected \"machine\" or \"project\")", scope),
+    }
 
-    Ok(json!({ "delivered": true }))
+    // project スコープでは送信元の project を sessions から引く。送信元が未登録で
+    // project を特定できない場合は machine 扱い（全 NULL）にフォールバックし、
+    // メッセージを取りこぼさないようにする。
+    // "unknown" は guess_names_from_cwd（workspaces 外起動時）と DB デフォルトの
+    // センチネルであり、有効な project 名ではない。これを to_project に採用すると
+    // 他の "unknown" セッション群へ誤配信されるため、空文字と同様に machine
+    // フォールバック扱いにする（session_start.rs の valid_worktree 判定と一致）。
+    let to_project: Option<String> = if scope == "project" {
+        db::list_sessions(conn)?
+            .iter()
+            .find(|s| s.session_id == from_session)
+            .map(|s| s.project_name.clone())
+            .filter(|p| !p.is_empty() && p != "unknown")
+    } else {
+        None
+    };
+
+    db::insert_message(
+        conn,
+        from_session,
+        None,
+        None,
+        to_project.as_deref(),
+        message,
+        "message",
+        None,
+    )?;
+
+    let effective_scope = if to_project.is_some() { "project" } else { "machine" };
+    Ok(json!({ "delivered": true, "scope": effective_scope }))
 }
 
 fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
@@ -589,13 +697,16 @@ mod tests {
         let result = list_sessions(&conn, "me", &json!({})).unwrap();
         assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
         assert_eq!(result["pending_messages"].as_array().unwrap().len(), 0);
+        // データが無ければ background ポインタは付かない
+        assert!(result.get("background").is_none());
     }
 
     #[test]
     fn test_list_sessions_with_data() {
         let conn = test_db();
         db::upsert_session(&conn, "s1", "frontend", "osaka", "myapp", "/tmp", "idle").unwrap();
-        let result = list_sessions(&conn, "s2", &json!({})).unwrap();
+        // 既定スコープは project。呼び出し元は同 project に登録済みの s1 とする。
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["id"], "s1");
@@ -693,21 +804,187 @@ mod tests {
         db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
         db::upsert_session(&conn, "s2", "default", "osaka", "myapp", "/tmp/osaka", "working").unwrap();
         db::upsert_session(&conn, "s3", "default", "tokyo", "myapp", "/tmp/tokyo", "idle").unwrap();
+        // 別 project のセッション（既定 project スコープから除外されることの確認用）
+        db::upsert_session(&conn, "s4", "default", "berlin", "other", "/tmp/berlin", "idle").unwrap();
 
         // scope: worktree → s1のworktree(osaka)のみ
         let result = list_sessions(&conn, "s1", &json!({"scope": "worktree"})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 2);
 
-        // scope: project → myapp全体
+        // scope: project → myapp全体（別 project の s4 は含まない）
         let result = list_sessions(&conn, "s1", &json!({"scope": "project"})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 3);
 
-        // scope: machine（デフォルト）→ 全件
+        // デフォルト → project スコープ。別 project の s4 は出ない
         let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        let ids: Vec<&str> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains(&"s4"), "default scope must be project, got: {:?}", ids);
+
+        // scope: machine → 別 project も含め全件
+        let result = list_sessions(&conn, "s1", &json!({"scope": "machine"})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
-        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions.len(), 4);
+    }
+
+    #[test]
+    fn test_list_sessions_unregistered_caller() {
+        // 呼び出し元が DB 未登録の場合、project 既定スコープでは proj を特定できず
+        // sessions が空になる。診断フラグ caller_unregistered が付くこと、
+        // scope:"machine" を明示すれば全件見えることを保証する。
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp/osaka", "idle").unwrap();
+        db::upsert_session(&conn, "s2", "default", "tokyo", "myapp", "/tmp/tokyo", "idle").unwrap();
+
+        // 未登録の "ghost" が既定（project）で呼ぶ → 空 + caller_unregistered
+        let result = list_sessions(&conn, "ghost", &json!({})).unwrap();
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(result["caller_unregistered"], true);
+
+        // scope:"machine" を明示すれば全件返る
+        let result = list_sessions(&conn, "ghost", &json!({"scope": "machine"})).unwrap();
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
+        // machine でも未登録であることは変わらないので診断は付く
+        assert_eq!(result["caller_unregistered"], true);
+
+        // 登録済み呼び出し元には診断フラグは付かない
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        assert!(result.get("caller_unregistered").is_none());
+    }
+
+    #[test]
+    fn test_list_sessions_unregistered_caller_derives_proj_from_cwd() {
+        // DB 未登録の呼び出し元でも、cwd が workspaces 配下なら proj/wt を補完し、
+        // 同 project のセッション表示と project broadcast の受信ができる（登録レース対策）。
+        // guess_names_from_cwd は FS を読まず文字列でパスを分解するため実ファイル作成は不要。
+        let proj = "m2proj";
+        let wt = "m2wt";
+        let cwd = crate::config::workspaces_dir()
+            .join(proj)
+            .join(wt)
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        // 同 project の登録済みセッションと送信者
+        db::upsert_session(&conn, "peer", "default", "otherwt", proj, "/tmp/p", "idle").unwrap();
+        db::upsert_session(&conn, "sender", "default", "otherwt", proj, "/tmp/s", "idle").unwrap();
+        // 別 project のセッション（project スコープから除外される確認用）
+        db::upsert_session(&conn, "outsider", "default", "bwt", "bproj", "/tmp/o", "idle").unwrap();
+        // 登録済み sender が project broadcast（to_project = m2proj）
+        broadcast(&conn, &json!({ "message": "for the project" }), "sender").unwrap();
+
+        // 未登録 "ghost" が cwd 付きで既定（project）スコープで呼ぶ
+        let result = list_sessions_with_cwd(&conn, "ghost", &cwd, &json!({})).unwrap();
+
+        // DB 未登録の診断は付く（登録は完了していない）
+        assert_eq!(result["caller_unregistered"], true);
+        // cwd から proj を補完 → 同 project のセッションだけが見える（別 project は除外）
+        let ids: Vec<&str> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"peer"), "should see same-project peer, got {:?}", ids);
+        assert!(ids.contains(&"sender"), "should see same-project sender, got {:?}", ids);
+        assert!(!ids.contains(&"outsider"), "must exclude other project, got {:?}", ids);
+        // project broadcast を取りこぼさない
+        let msgs = result["pending_messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "unregistered caller should receive project broadcast via cwd");
+        assert_eq!(msgs[0]["content"], "for the project");
+
+        // cwd が空（従来の未登録経路）なら補完できず空のまま（回帰の確認）
+        let empty = list_sessions_with_cwd(&conn, "ghost", "", &json!({})).unwrap();
+        assert_eq!(empty["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(empty["pending_messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_list_sessions_background_pointer_by_default_and_bodies_on_request() {
+        // worktree に過去会話ログがあると、既定では本文を返さず件数ポインタのみ。
+        // include_bodies:true のときだけフル本文 (conversation_summaries) を返す。
+        let workspaces = crate::config::workspaces_dir();
+        let cwd = workspaces
+            .join("proj-z")
+            .join("wt-z")
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt-z", "proj-z", &cwd, "idle").unwrap();
+        db::upsert_conversation_log(&conn, "old", "wt-z", "proj-z", None, "[]").unwrap();
+        db::update_conversation_log_summary(&conn, "old", "past summary text").unwrap();
+
+        // 既定: background ポインタのみ、本文キーは無し
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        assert!(result.get("conversation_summaries").is_none());
+        assert!(result.get("worktree_contexts").is_none());
+        let bg = result.get("background").expect("background pointer expected");
+        assert_eq!(bg["conversation_summary_count"], 1);
+
+        // include_bodies:true: フル本文を返す
+        let result = list_sessions(&conn, "s1", &json!({"include_bodies": true})).unwrap();
+        assert!(result.get("background").is_none());
+        let summaries = result["conversation_summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["summary"], "past summary text");
+    }
+
+    #[test]
+    fn test_list_sessions_context_files_pointer_and_bodies() {
+        // worktree context .md がある場合: 既定では background の件数ポインタ
+        // (worktree_context_files / worktree_context_kb) のみ、include_bodies:true で
+        // worktree_contexts に本文をシリアライズして返すことを検証する。
+        // load_contexts は実ファイルシステム (workspaces_dir 配下) を読むため、
+        // 衝突しない一意な proj/wt 名で実ファイルを作り、結果取得後に必ず削除する。
+        let proj = "ctxtest-proj";
+        let wt = "ctxtest-wt";
+        let ctx_dir = crate::config::worktree_contexts_dir(proj, wt);
+        std::fs::create_dir_all(&ctx_dir).unwrap();
+        std::fs::write(ctx_dir.join("alpha.md"), "alpha body").unwrap();
+        std::fs::write(ctx_dir.join("beta.md"), "beta body content").unwrap();
+
+        let cwd = crate::config::workspaces_dir()
+            .join(proj)
+            .join(wt)
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", wt, proj, &cwd, "idle").unwrap();
+
+        // 結果を取得してから（panic でファイルが残らないよう）後始末する
+        let default_result = list_sessions(&conn, "s1", &json!({}));
+        let bodies_result = list_sessions(&conn, "s1", &json!({"include_bodies": true}));
+        std::fs::remove_dir_all(&ctx_dir).ok();
+
+        // 既定: 本文キーは無く、background に件数ポインタ
+        let default_result = default_result.unwrap();
+        assert!(default_result.get("worktree_contexts").is_none());
+        let bg = default_result
+            .get("background")
+            .expect("background pointer expected");
+        assert_eq!(bg["worktree_context_files"], 2);
+        // "alpha body"(10) + "beta body content"(17) = 27 bytes → (27+512)/1024 = 0 KB
+        assert_eq!(bg["worktree_context_kb"], 0);
+
+        // include_bodies:true: worktree_contexts に本文を返す（名前順 alpha, beta）
+        let bodies_result = bodies_result.unwrap();
+        assert!(bodies_result.get("background").is_none());
+        let wc = &bodies_result["worktree_contexts"];
+        assert_eq!(wc["project"], proj);
+        assert_eq!(wc["worktree"], wt);
+        let items = wc["contexts"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], "alpha");
+        assert_eq!(items[0]["content"], "alpha body");
+        assert_eq!(items[1]["name"], "beta");
+        assert_eq!(items[1]["content"], "beta body content");
     }
 
     #[test]
@@ -734,14 +1011,132 @@ mod tests {
 
     #[test]
     fn test_broadcast() {
+        // 送信元が未登録の場合、project スコープは project を特定できず machine に
+        // フォールバックする（全 NULL）。よって別 worktree/project の受信者にも届く。
         let conn = test_db();
         let params = json!({ "message": "hello everyone" });
         let result = broadcast(&conn, &params, "s1").unwrap();
         assert_eq!(result["delivered"], true);
+        assert_eq!(result["scope"], "machine");
 
         let msgs = db::get_pending_messages(&conn, "s2", "wt", "proj").unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello everyone");
+    }
+
+    #[test]
+    fn test_broadcast_project_scope_limits_to_sender_project() {
+        let conn = test_db();
+        // 送信元 sender は myapp に登録済み
+        db::upsert_session(&conn, "sender", "default", "osaka", "myapp", "/tmp/o", "idle").unwrap();
+
+        // 既定（project）で broadcast → 送信元の project (myapp) 宛
+        let result = broadcast(&conn, &json!({ "message": "team only" }), "sender").unwrap();
+        assert_eq!(result["scope"], "project");
+
+        // 同 project の別セッションは受信できる（to_project = myapp に一致）
+        let same = db::get_pending_messages(&conn, "peer", "tokyo", "myapp").unwrap();
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].content, "team only");
+
+        // 別 project のセッションには届かない
+        let other = db::get_pending_messages(&conn, "outsider", "berlin", "other").unwrap();
+        assert_eq!(other.len(), 0);
+    }
+
+    #[test]
+    fn test_broadcast_machine_scope_reaches_all_projects() {
+        let conn = test_db();
+        db::upsert_session(&conn, "sender", "default", "osaka", "myapp", "/tmp/o", "idle").unwrap();
+
+        let result =
+            broadcast(&conn, &json!({ "message": "all hands", "scope": "machine" }), "sender")
+                .unwrap();
+        assert_eq!(result["scope"], "machine");
+
+        // 別 project のセッションにも届く
+        let other = db::get_pending_messages(&conn, "outsider", "berlin", "other").unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].content, "all hands");
+    }
+
+    #[test]
+    fn test_broadcast_rejects_invalid_scope() {
+        let conn = test_db();
+        let result = broadcast(&conn, &json!({ "message": "x", "scope": "worktree" }), "s1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_broadcast_unknown_project_falls_back_to_machine() {
+        // project_name が "unknown"（workspaces 外で起動し guess_names_from_cwd が
+        // フォールバックした登録）の送信元は project を特定できないものとして扱い、
+        // machine フォールバックする。"unknown" を project 名として配信すると、無関係な
+        // 別 "unknown" セッション群へ誤配信されてしまうため。
+        let conn = test_db();
+        db::upsert_session(&conn, "ghost", "default", "unknown", "unknown", "/elsewhere", "idle")
+            .unwrap();
+
+        let result = broadcast(&conn, &json!({ "message": "hi" }), "ghost").unwrap();
+        // "unknown" は project として採用せず machine フォールバック
+        assert_eq!(result["scope"], "machine");
+
+        // machine 扱いなので無関係な project のセッションにも届く
+        let other = db::get_pending_messages(&conn, "outsider", "berlin", "other").unwrap();
+        assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn test_broadcast_does_not_echo_to_sender() {
+        // 送信元自身は自分が送った broadcast / project fanout を受信しない。
+        let conn = test_db();
+        db::upsert_session(&conn, "sender", "default", "osaka", "myapp", "/tmp/o", "idle").unwrap();
+
+        // project スコープ broadcast（to_project = myapp）
+        broadcast(&conn, &json!({ "message": "to my team" }), "sender").unwrap();
+        let mine = db::get_pending_messages(&conn, "sender", "osaka", "myapp").unwrap();
+        assert_eq!(mine.len(), 0, "sender must not receive own project broadcast");
+
+        // 同 project の別セッションは受信する
+        let peer = db::get_pending_messages(&conn, "peer", "tokyo", "myapp").unwrap();
+        assert_eq!(peer.len(), 1);
+
+        // machine broadcast（全 NULL）でも送信元には返らない
+        broadcast(&conn, &json!({ "message": "all", "scope": "machine" }), "sender").unwrap();
+        let mine2 = db::get_pending_messages(&conn, "sender", "osaka", "myapp").unwrap();
+        assert_eq!(mine2.len(), 0, "sender must not receive own machine broadcast");
+    }
+
+    #[test]
+    fn test_list_sessions_rejects_invalid_scope() {
+        // 不正な scope はサイレントに machine 扱い（全件）にせず、broadcast と同様に拒否する。
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "osaka", "myapp", "/tmp", "idle").unwrap();
+        let result = list_sessions(&conn, "s1", &json!({"scope": "bogus"}));
+        assert!(result.is_err(), "invalid scope must error, not silently return all");
+    }
+
+    #[test]
+    fn test_background_pointer_includes_conversation_summary_kb() {
+        // background ポインタは worktree context だけでなく会話サマリ本文のサイズも
+        // KB で見積もる（include_bodies のコストを呼び出し元が事前判断できるように）。
+        let workspaces = crate::config::workspaces_dir();
+        let cwd = workspaces
+            .join("proj-kb")
+            .join("wt-kb")
+            .to_string_lossy()
+            .to_string();
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "wt-kb", "proj-kb", &cwd, "idle").unwrap();
+        db::upsert_conversation_log(&conn, "old", "wt-kb", "proj-kb", None, "[]").unwrap();
+        // 約 2000 bytes のサマリ本文
+        let big = "x".repeat(2000);
+        db::update_conversation_log_summary(&conn, "old", &big).unwrap();
+
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
+        let bg = result.get("background").expect("background pointer expected");
+        // 2000 bytes → (2000 + 512) / 1024 = 2 KB
+        assert_eq!(bg["conversation_summary_kb"], 2);
     }
 
     #[test]
@@ -836,7 +1231,7 @@ mod tests {
         db::upsert_session(&conn, "s1", "default", "wt", "proj", "/tmp", "idle").unwrap();
         db::update_session_alert(&conn, "s1", true, Some("CI failed")).unwrap();
 
-        let result = list_sessions(&conn, "s2", &json!({})).unwrap();
+        let result = list_sessions(&conn, "s1", &json!({})).unwrap();
         let sessions = result["sessions"].as_array().unwrap();
         assert_eq!(sessions[0]["alert"], true);
         assert_eq!(sessions[0]["alert_message"], "CI failed");

@@ -256,8 +256,9 @@ pub fn build_additional_context(conn: &Connection, session_id: &str, cwd: &str) 
     }
 
     if valid_worktree {
+        // 件数しか使わないため messages 本文を載せない軽量クエリを使う。
         let summaries =
-            db::get_conversation_logs_by_worktree(conn, &wt, &proj).unwrap_or_default();
+            db::get_conversation_log_summaries_by_worktree(conn, &wt, &proj).unwrap_or_default();
         let contexts = crate::config::load_contexts(&proj, &wt);
 
         let mut lines: Vec<String> = Vec::new();
@@ -272,7 +273,7 @@ pub fn build_additional_context(conn: &Connection, session_id: &str, cwd: &str) 
             lines.push(format!(
                 "- {} worktree context file(s) (~{} KB total)",
                 contexts.len(),
-                (total_bytes + 512) / 1024
+                crate::config::bytes_to_kb(total_bytes)
             ));
         }
         if !lines.is_empty() {
@@ -283,7 +284,7 @@ pub fn build_additional_context(conn: &Connection, session_id: &str, cwd: &str) 
             }
             s.push_str(
                 "\nFetch only what the current task needs:\n\
-                - `siki:list_sessions { scope: \"worktree\" }` returns summaries and context bodies.\n\
+                - `siki:list_sessions { include_bodies: true }` returns the full conversation summaries and context bodies (by default it returns counts only).\n\
                 - `siki:get_context { target: { type: \"worktree\", id: \"<name>\" }, include_conversation_log: true }` is large — call it via an Explore or general-purpose subagent so the full log stays out of your main context.\n",
             );
             sections.push(s);

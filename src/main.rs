@@ -34,25 +34,70 @@ type TerminalKey = (app::WorktreeId, usize);
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
 
-/// reader thread が spawn 時に保持した tab_index に対応する claude_terms の key を返す。
+/// reader thread が spawn 時に保持した tab_index/worktree_id に対応する terminals の key を返す。
+///
+/// resolve_claude_term_key と同型のパターン（まず直接キー引き、次に terminal_id のみで
+/// マップ全体を走査）。terminals には従来この種の再探索処理が存在せず、worktree 削除による
+/// reindex 後は直接キー引きに失敗したイベントがすべて黙って破棄されていた。
+fn resolve_terminal_key(
+    terminals: &HashMap<TerminalKey, terminal::TerminalEmulator>,
+    worktree_id: app::WorktreeId,
+    tab_index: usize,
+    terminal_id: u64,
+) -> Option<TerminalKey> {
+    if let Some(emu) = terminals.get(&(worktree_id, tab_index))
+        && emu.id() == terminal_id
+    {
+        return Some((worktree_id, tab_index));
+    }
+    terminals
+        .iter()
+        .find(|(_, emu)| emu.id() == terminal_id)
+        .map(|(key, _)| *key)
+}
+
+/// reader thread が spawn 時に保持した tab_index/worktree_id に対応する claude_terms の key を返す。
 ///
 /// Ctrl+W で Claude タブを閉じると `handle_claude_terminal_key` が HashMap key を詰めるため、
-/// reader thread が送ってくる event の `tab_index` は古くなる。まず元の位置を試し、
-/// terminal_id が一致しなければ同 worktree 内を scan して現在の key を再特定する。
+/// reader thread が送ってくる event の `tab_index` は古くなる。また worktree 削除による
+/// reindex（`reindex_worktree_maps`/`reindex_project_maps`）で `worktree_id` 自体も
+/// シフトすることがある。まず元の位置を試し、terminal_id が一致しなければ
+/// claude_terms 全体を terminal_id のみで走査して現在の key を再特定する。
 fn resolve_claude_term_key(
     claude_terms: &HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
     worktree_id: app::WorktreeId,
     claude_idx: usize,
     terminal_id: u64,
 ) -> Option<(app::WorktreeId, usize)> {
-    if let Some(emu) = claude_terms.get(&(worktree_id, claude_idx)) {
-        if emu.id() == terminal_id {
-            return Some((worktree_id, claude_idx));
-        }
+    if let Some(emu) = claude_terms.get(&(worktree_id, claude_idx))
+        && emu.id() == terminal_id
+    {
+        return Some((worktree_id, claude_idx));
     }
     claude_terms
         .iter()
-        .find(|(key, emu)| key.0 == worktree_id && emu.id() == terminal_id)
+        .find(|(_, emu)| emu.id() == terminal_id)
+        .map(|(key, _)| *key)
+}
+
+/// sessions 内の ClaudeSession を session_id で再特定し、現在のキー（worktree_id）を返す。
+///
+/// worktree 削除の reindex で sessions のキーがシフトしても、send_to_claude が起動した
+/// 読み取りタスクは spawn 時点の古い worktree_id を送り続ける。呼び出し側はこの関数が返す
+/// 「現在のキー」を worktree 特定に使うこと（イベントの生の worktree_id を直接使わない）。
+fn resolve_session_key(
+    sessions: &HashMap<app::WorktreeId, claude::ClaudeSession>,
+    worktree_id: app::WorktreeId,
+    session_id: u64,
+) -> Option<app::WorktreeId> {
+    if let Some(session) = sessions.get(&worktree_id)
+        && session.id() == session_id
+    {
+        return Some(worktree_id);
+    }
+    sessions
+        .iter()
+        .find(|(_, session)| session.id() == session_id)
         .map(|(key, _)| *key)
 }
 
@@ -249,10 +294,13 @@ async fn main() -> Result<()> {
             let tx = event_tx.clone();
             let wt_id = (pi, wi);
             let wt_path = wt.path.clone();
+            let wt_name = wt.name.clone();
             tokio::spawn(async move {
                 let info = fetch_pr_info(&wt_path).await;
                 let _ = tx.send(event::AppEvent::PrInfo {
                     worktree_id: wt_id,
+                    worktree_name: wt_name,
+                    worktree_path: wt_path.to_string_lossy().to_string(),
                     info,
                 });
             });
@@ -657,65 +705,72 @@ async fn handle_event(
         }
         AppEvent::ClaudeOutput {
             worktree_id,
+            session_id,
             event: ref stream_event,
         } => {
-            // Init イベントの claude_session_id を DB に保存
-            if let event::ClaudeStreamEvent::Init { session_id } = stream_event {
-                if !session_id.is_empty() {
-                    if let Some(wt) = app.worktree_by_id(worktree_id) {
-                        let wt_name = wt.name.clone();
-                        let project_name = app
-                            .projects
-                            .iter()
-                            .find(|p| {
-                                p.worktrees.iter().any(|w| w.name == wt_name)
-                            })
-                            .map(|p| p.name.clone())
-                            .unwrap_or_default();
-                        if let Ok(conn) = broker_db.lock() {
-                            // worktree に紐づくアクティブなセッションの claude_session_id を更新
-                            let _ = conn.execute(
-                                "UPDATE sessions SET claude_session_id = ?1
-                                 WHERE worktree_name = ?2 AND project_name = ?3 AND state != 'dead'",
-                                rusqlite::params![session_id, wt_name, project_name],
-                            );
+            // session_id が一致する現在のキーを再特定する（REQ-006: イベントの生の
+            // worktree_id は worktree 削除の reindex でシフトしている可能性があるため
+            // 直接使わない）。解決できない場合はイベントを黙って破棄する（REQ-401）。
+            if let Some(key) = resolve_session_key(sessions, worktree_id, session_id) {
+                // Init イベントの claude_session_id を DB に保存
+                if let event::ClaudeStreamEvent::Init { session_id: claude_session_id } = stream_event {
+                    if !claude_session_id.is_empty() {
+                        if let Some(wt) = app.worktree_by_id(key) {
+                            let wt_name = wt.name.clone();
+                            let project_name = app.projects[key.0].name.clone();
+                            if let Ok(conn) = broker_db.lock() {
+                                // worktree に紐づくアクティブなセッションの claude_session_id を更新
+                                let _ = conn.execute(
+                                    "UPDATE sessions SET claude_session_id = ?1
+                                     WHERE worktree_name = ?2 AND project_name = ?3 AND state != 'dead'",
+                                    rusqlite::params![claude_session_id, wt_name, project_name],
+                                );
+                            }
                         }
                     }
                 }
+                app.handle_claude_output(key, stream_event.clone());
             }
-            app.handle_claude_output(worktree_id, stream_event.clone());
         }
-        AppEvent::ClaudeComplete { worktree_id } => {
-            app.handle_claude_complete(worktree_id);
-            // 選択中の worktree が完了した場合、Diff と SourceTree を自動更新
-            if app.selected_worktree == Some(worktree_id) {
-                if let Some(wt) = app.worktree_by_id(worktree_id) {
-                    let wt_path = wt.path.clone();
-                    let base = config::resolve_base_branch(&app.projects[worktree_id.0].path, &app.projects[worktree_id.0].name);
-                    diff_view.load(&wt_path, &base);
-                    local_changes.load(&wt_path);
-                    source_tree.load(&wt_path);
+        AppEvent::ClaudeComplete { worktree_id, session_id } => {
+            if let Some(key) = resolve_session_key(sessions, worktree_id, session_id) {
+                app.handle_claude_complete(key);
+                // 選択中の worktree が完了した場合、Diff と SourceTree を自動更新
+                if app.selected_worktree == Some(key) {
+                    if let Some(wt) = app.worktree_by_id(key) {
+                        let wt_path = wt.path.clone();
+                        let base = config::resolve_base_branch(&app.projects[key.0].path, &app.projects[key.0].name);
+                        diff_view.load(&wt_path, &base);
+                        local_changes.load(&wt_path);
+                        source_tree.load(&wt_path);
+                    }
                 }
-            }
-            // Claude セッション中に PR が作成された可能性があるため再取得
-            if let Some(wt) = app.worktree_by_id(worktree_id) {
-                let tx = event_tx.clone();
-                let wt_path = wt.path.clone();
-                let wt_id = worktree_id;
-                tokio::spawn(async move {
-                    let info = fetch_pr_info(&wt_path).await;
-                    let _ = tx.send(event::AppEvent::PrInfo {
-                        worktree_id: wt_id,
-                        info,
+                // Claude セッション中に PR が作成された可能性があるため再取得
+                if let Some(wt) = app.worktree_by_id(key) {
+                    let tx = event_tx.clone();
+                    let wt_path = wt.path.clone();
+                    let wt_id = key;
+                    let wt_name = wt.name.clone();
+                    tokio::spawn(async move {
+                        let info = fetch_pr_info(&wt_path).await;
+                        let _ = tx.send(event::AppEvent::PrInfo {
+                            worktree_id: wt_id,
+                            worktree_name: wt_name,
+                            worktree_path: wt_path.to_string_lossy().to_string(),
+                            info,
+                        });
                     });
-                });
+                }
             }
         }
         AppEvent::ClaudeError {
             worktree_id,
+            session_id,
             error,
         } => {
-            app.handle_claude_error(worktree_id, &error);
+            if let Some(key) = resolve_session_key(sessions, worktree_id, session_id) {
+                app.handle_claude_error(key, &error);
+            }
         }
         AppEvent::TerminalOutput {
             worktree_id,
@@ -742,14 +797,16 @@ async fn handle_event(
                         // 調整するため、外部保持のオフセットを同期する
                         let current = emu.scrollback();
                         if current > 0 {
-                            if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
+                            // worktree_id ではなく解決済み key.0 を使う（worktree 削除の
+                            // reindex で worktree_id 自体がシフトしている可能性があるため）
+                            if let Some(wt) = app.worktree_by_id_mut(key.0) {
                                 wt.claude_scroll_offsets.insert(key.1, current);
                             }
                         }
                     }
                 }
-            } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
-                if emu.id() == terminal_id {
+            } else if let Some(key) = resolve_terminal_key(terminals, worktree_id, tab_index, terminal_id) {
+                if let Some(emu) = terminals.get_mut(&key) {
                     emu.process(&data);
                 }
             }
@@ -773,8 +830,8 @@ async fn handle_event(
                         emu.mark_exited();
                     }
                 }
-            } else if let Some(emu) = terminals.get_mut(&(worktree_id, tab_index)) {
-                if emu.id() == terminal_id {
+            } else if let Some(key) = resolve_terminal_key(terminals, worktree_id, tab_index, terminal_id) {
+                if let Some(emu) = terminals.get_mut(&key) {
                     emu.mark_exited();
                 }
             }
@@ -1432,8 +1489,20 @@ async fn handle_event(
                 _ => {}
             }
         }
-        AppEvent::PrInfo { worktree_id, info } => {
-            if let Some(wt) = app.worktree_by_id_mut(worktree_id) {
+        AppEvent::PrInfo {
+            worktree_id,
+            worktree_name,
+            worktree_path,
+            info,
+        } => {
+            // fetch開始時点でキャプチャしたworktree名・pathと現在のworktreeが一致する場合のみ
+            // 書き込む。worktree/project削除のreindexでworktree_idがシフトしていた場合、
+            // 同じキーへ来た別の実在worktreeへ誤って上書きすることを防ぐ（uradori裏取りで
+            // 確認済み）。名前・pathが一致しない、またはworktreeが既に存在しない場合は黙って破棄する。
+            if let Some(wt) = app.worktree_by_id_mut(worktree_id)
+                && wt.name == worktree_name
+                && wt.path == worktree_path
+            {
                 wt.pr = info;
             }
         }
@@ -2186,10 +2255,13 @@ fn finalize_add_worktree(
     let wi = app.projects[pi].worktrees.len() - 1;
     let tx = event_tx.clone();
     let pr_path = wt_path.clone();
+    let pr_wt_name = wt_name.clone();
     tokio::spawn(async move {
         let info = fetch_pr_info(&pr_path).await;
         let _ = tx.send(event::AppEvent::PrInfo {
             worktree_id: (pi, wi),
+            worktree_name: pr_wt_name,
+            worktree_path: pr_path.to_string_lossy().to_string(),
             info,
         });
     });
@@ -4463,6 +4535,10 @@ fn handle_remove_project_confirm_key(
                 // メモリから削除
                 app.projects.remove(pi);
 
+                // 削除位置より後ろの project_index を持つ sessions/terminals/claude_terms を
+                // 1つ前方へシフトする（REQ-102: プロジェクト削除の連鎖ズレ対策）
+                reindex_project_maps(sessions, terminals, claude_terms, pi);
+
                 // selected_worktree をリセット
                 if let Some((sel_pi, sel_wi)) = app.selected_worktree {
                     if sel_pi == pi {
@@ -4601,11 +4677,14 @@ fn reindex_worktree_maps(
     removed_worktree_index: usize,
 ) {
     // sessions: HashMap<(pi, wi), _>
-    let keys: Vec<_> = sessions
+    // wi 昇順で処理する。降順や不定順で処理すると、まだシフトしていない
+    // (wi-1) の生きたエントリを insert が上書きしてしまう（uradori裏取りで確認済み）。
+    let mut keys: Vec<_> = sessions
         .keys()
         .filter(|(pi, wi)| *pi == project_index && *wi > removed_worktree_index)
         .cloned()
         .collect();
+    keys.sort_by_key(|(_, wi)| *wi);
     for (pi, wi) in keys {
         if let Some(val) = sessions.remove(&(pi, wi)) {
             sessions.insert((pi, wi - 1), val);
@@ -4613,11 +4692,12 @@ fn reindex_worktree_maps(
     }
 
     // terminals: HashMap<((pi, wi), tab), _>
-    let keys: Vec<_> = terminals
+    let mut keys: Vec<_> = terminals
         .keys()
         .filter(|((pi, wi), _)| *pi == project_index && *wi > removed_worktree_index)
         .cloned()
         .collect();
+    keys.sort_by_key(|((_, wi), _)| *wi);
     for ((pi, wi), tab) in keys {
         if let Some(val) = terminals.remove(&((pi, wi), tab)) {
             terminals.insert(((pi, wi - 1), tab), val);
@@ -4625,14 +4705,66 @@ fn reindex_worktree_maps(
     }
 
     // claude_terms: HashMap<((pi, wi), tab), _>
-    let keys: Vec<_> = claude_terms
+    let mut keys: Vec<_> = claude_terms
         .keys()
         .filter(|((pi, wi), _)| *pi == project_index && *wi > removed_worktree_index)
         .cloned()
         .collect();
+    keys.sort_by_key(|((_, wi), _)| *wi);
     for ((pi, wi), tab) in keys {
         if let Some(val) = claude_terms.remove(&((pi, wi), tab)) {
             claude_terms.insert(((pi, wi - 1), tab), val);
+        }
+    }
+}
+
+/// プロジェクト削除後、削除位置より後ろの project_index を持つ
+/// sessions / terminals / claude_terms のキーを1つ前にずらす。
+/// reindex_worktree_maps と対になる、project_index シフト専用の新設関数。
+fn reindex_project_maps(
+    sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    removed_project_index: usize,
+) {
+    // sessions: HashMap<(pi, wi), _>
+    // pi 昇順で処理する。降順や不定順で処理すると、まだシフトしていない
+    // (pi-1) の生きたエントリを insert が上書きしてしまう（uradori裏取りで確認済み）。
+    let mut keys: Vec<_> = sessions
+        .keys()
+        .filter(|(pi, _)| *pi > removed_project_index)
+        .cloned()
+        .collect();
+    keys.sort_by_key(|(pi, _)| *pi);
+    for (pi, wi) in keys {
+        if let Some(val) = sessions.remove(&(pi, wi)) {
+            sessions.insert((pi - 1, wi), val);
+        }
+    }
+
+    // terminals: HashMap<((pi, wi), tab), _>
+    let mut keys: Vec<_> = terminals
+        .keys()
+        .filter(|((pi, _), _)| *pi > removed_project_index)
+        .cloned()
+        .collect();
+    keys.sort_by_key(|((pi, _), _)| *pi);
+    for ((pi, wi), tab) in keys {
+        if let Some(val) = terminals.remove(&((pi, wi), tab)) {
+            terminals.insert(((pi - 1, wi), tab), val);
+        }
+    }
+
+    // claude_terms: HashMap<((pi, wi), tab), _>
+    let mut keys: Vec<_> = claude_terms
+        .keys()
+        .filter(|((pi, _), _)| *pi > removed_project_index)
+        .cloned()
+        .collect();
+    keys.sort_by_key(|((pi, _), _)| *pi);
+    for ((pi, wi), tab) in keys {
+        if let Some(val) = claude_terms.remove(&((pi, wi), tab)) {
+            claude_terms.insert(((pi - 1, wi), tab), val);
         }
     }
 }
@@ -6243,6 +6375,7 @@ mod tests {
         let mut local_changes = ui::diff_view::LocalChangesView::new();
         let mut history_view = ui::history_view::HistoryView::new();
         let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
         let mut siki_init_terminal = None;
@@ -6263,6 +6396,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::ClaudeOutput {
                 worktree_id: (0, 0),
+                session_id: 1,
                 event: event::ClaudeStreamEvent::ContentDelta {
                     text: "hello".to_string(),
                 },
@@ -6276,6 +6410,234 @@ mod tests {
         let wt = app.worktree_by_id((0, 0)).unwrap();
         assert_eq!(wt.chat_history.len(), 1);
         assert_eq!(wt.chat_history[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_claude_output_event_dropped_when_session_id_mismatches() {
+        // REQ-401: sessions に一致する session_id が無ければ、イベントは黙って破棄され
+        // chat_history は変更されない
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeOutput {
+                worktree_id: (0, 0),
+                session_id: 999, // sessions[(0,0)] の id=1 と一致しない
+                event: event::ClaudeStreamEvent::ContentDelta {
+                    text: "hello".to_string(),
+                },
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.chat_history.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_claude_output_event_finds_shifted_session_key() {
+        // Bug B 回帰防止: worktree 削除の reindex で sessions のキーが (0,1) → (0,0) に
+        // シフトしていても、session_id 一致で正しいキーへ書き込まれる。
+        // 別 worktree（(0,1) 側、id=2）を誤って更新しないことも併せて確認する。
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![ProjectConfig {
+                name: "test-project".to_string(),
+                path: "/tmp/test-project".to_string(),
+                display_name: None,
+                worktrees: vec![
+                    WorktreeConfig {
+                        name: "feature-a".to_string(),
+                        branch: "feature/a".to_string(),
+                    },
+                    WorktreeConfig {
+                        name: "feature-b".to_string(),
+                        branch: "feature/b".to_string(),
+                    },
+                ],
+            }],
+        };
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        sessions.insert((0, 1), claude::ClaudeSession::new_for_test(2));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeOutput {
+                // reader task は reindex 前の古い worktree_id=(0,1) を送り続ける想定
+                worktree_id: (0, 1),
+                session_id: 1, // 実際は id=1（現在キー (0,0)）に属する
+                event: event::ClaudeStreamEvent::ContentDelta {
+                    text: "hello".to_string(),
+                },
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let wt0 = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt0.chat_history.len(), 1, "session_id一致で(0,0)に書き込まれるべき");
+        let wt1 = app.worktree_by_id((0, 1)).unwrap();
+        assert_eq!(wt1.chat_history.len(), 0, "別worktreeの(0,1)は誤って更新されない");
+    }
+
+    #[tokio::test]
+    async fn test_init_event_updates_wrong_project_row_when_worktree_names_collide_bug() {
+        // uradori裏取り: Init イベントの claude_session_id DB更新は、既に resolve_session_key で
+        // 解決済みの key.0 (project_index) を使わず、`app.projects.iter().find(worktree名一致)`
+        // という名前ベースの再探索で project_name を決めている。同名 worktree を持つ複数
+        // プロジェクトが存在すると、Vec 内で最初にマッチした（=無関係な）プロジェクトの
+        // sessions 行が更新されてしまうことを実際の (in-memory) DB で再現する。
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![
+                ProjectConfig {
+                    name: "project-a".to_string(),
+                    path: "/tmp/project-a".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/a".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "project-b".to_string(),
+                    path: "/tmp/project-b".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/b".to_string(),
+                    }],
+                },
+            ],
+        };
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        // 実際のセッションは project-b (project_index=1) の worktree "wt0" に属する
+        sessions.insert((1, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let broker_db = test_broker_db();
+        {
+            let conn = broker_db.lock().unwrap();
+            db::upsert_session(&conn, "sess-a", "claude", "wt0", "project-a", "/tmp/project-a", "idle").unwrap();
+            db::upsert_session(&conn, "sess-b", "claude", "wt0", "project-b", "/tmp/project-b", "idle").unwrap();
+        }
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeOutput {
+                worktree_id: (1, 0),
+                session_id: 1,
+                event: event::ClaudeStreamEvent::Init {
+                    session_id: "claude-resume-id-for-project-b".to_string(),
+                },
+            },
+            None,
+            &None,
+            &broker_db,
+        )
+        .await;
+
+        let conn = broker_db.lock().unwrap();
+        let sess_a_claude_id: Option<String> = conn
+            .query_row(
+                "SELECT claude_session_id FROM sessions WHERE session_id = 'sess-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sess_b_claude_id: Option<String> = conn
+            .query_row(
+                "SELECT claude_session_id FROM sessions WHERE session_id = 'sess-b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            sess_a_claude_id, None,
+            "project-bのセッションのInitイベントで、無関係なproject-aの行が更新されてはならない"
+        );
+        assert_eq!(
+            sess_b_claude_id,
+            Some("claude-resume-id-for-project-b".to_string()),
+            "project-b(実際にイベントが属するプロジェクト)の行が更新されるべき"
+        );
     }
 
     #[tokio::test]
@@ -6308,6 +6670,7 @@ mod tests {
             "/bin/sh",
             event::AppEvent::ClaudeComplete {
                 worktree_id: (0, 0),
+                session_id: 1,
             },
             None,
             &None,
@@ -6319,7 +6682,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claude_error_event() {
+    async fn test_prinfo_event_ignored_when_worktree_name_mismatches_after_shift() {
+        // uradori裏取りで確認済みの回帰: fetch_pr_info の非同期タスクは古い worktree_id を
+        // そのまま PrInfo イベントに乗せて送るが、reindex により同じキーへ別の worktree が
+        // 来ていた場合、worktree_name の照合が無いと誤って上書きしてしまっていた。
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // sample_config() の (0,0) は現在 "feature" という名前だが、イベントは
+        // fetch開始時点の別worktree "old-worktree" 用にキャプチャされた想定
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::PrInfo {
+                worktree_id: (0, 0),
+                worktree_name: "old-worktree".to_string(),
+                worktree_path: "/tmp/old-test-project".to_string(),
+                info: Some(app::PrInfo {
+                    number: 1,
+                    title: "誤って上書きされるべきでないPR".to_string(),
+                    url: "https://example.com/pr/1".to_string(),
+                    status: app::PrStatus::Ready,
+                }),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert!(
+            wt.pr.is_none(),
+            "worktree_name が現在の名前と一致しないPrInfoは書き込まれてはならない"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prinfo_event_applies_when_worktree_name_matches() {
+        // 名前が一致する通常ケースでは従来通り書き込まれることを確認する
         let config = sample_config();
         let mut app = app::App::new(&config);
         let mut left_panel = LeftPanel::new();
@@ -6346,8 +6767,155 @@ mod tests {
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
+            event::AppEvent::PrInfo {
+                worktree_id: (0, 0),
+                worktree_name: "feature".to_string(),
+                worktree_path: crate::config::worktree_path("test-project", "feature")
+                    .to_string_lossy()
+                    .to_string(),
+                info: Some(app::PrInfo {
+                    number: 2,
+                    title: "正しく書き込まれるべきPR".to_string(),
+                    url: "https://example.com/pr/2".to_string(),
+                    status: app::PrStatus::Approved,
+                }),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert_eq!(wt.pr.as_ref().map(|p| p.number), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_prinfo_event_cross_project_name_collision_after_project_removal_bug() {
+        // uradori裏取り: worktree_name の一意性は同一プロジェクト内でしか保証されない
+        // （config::generate_worktree_name は同一プロジェクトのworktree名のみを避ける、
+        // main.rs の add_worktree 起動処理 (existing_names 収集箇所) 参照）。
+        // プロジェクト削除で app.projects がシフトした後、削除されたプロジェクトの
+        // fetch_pr_info タスクが送る古いPrInfoイベントが、同じ index に来た別プロジェクトの
+        // 同名 worktree へ誤って書き込まれてしまうことを再現する。
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![
+                ProjectConfig {
+                    name: "project-a".to_string(),
+                    path: "/tmp/project-a".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/a".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "project-b".to_string(),
+                    path: "/tmp/project-b".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "feature/b".to_string(),
+                    }],
+                },
+            ],
+        };
+        let mut app = app::App::new(&config);
+
+        // project-a (index 0) が削除された状況をシミュレートする。
+        // Vec::remove により project-b が index 0 へシフトする。
+        app.projects.remove(0);
+        assert_eq!(app.projects[0].name, "project-b");
+
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // project-a の worktree "wt0" 用に fetch開始時点でキャプチャされた、削除前の古いイベント。
+        // worktree_id=(0,0) は project-a 削除前の座標だが、シフト後は project-b の "wt0" を指す。
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::PrInfo {
+                worktree_id: (0, 0),
+                worktree_name: "wt0".to_string(), // project-a側のworktree名（project-bと偶然同名）
+                worktree_path: config::worktree_path("project-a", "wt0")
+                    .to_string_lossy()
+                    .to_string(),
+                info: Some(app::PrInfo {
+                    number: 999,
+                    title: "project-a向けのPRがproject-bに誤って書き込まれる".to_string(),
+                    url: "https://example.com/pr/999".to_string(),
+                    status: app::PrStatus::Ready,
+                }),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let wt = app.worktree_by_id((0, 0)).unwrap();
+        assert!(
+            wt.pr.is_none(),
+            "project-a向けのPrInfoがproject-bのworktreeへ誤って書き込まれてはならない\
+             （worktree_nameだけでなくプロジェクト識別子も照合すべき）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claude_error_event() {
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
             event::AppEvent::ClaudeError {
                 worktree_id: (0, 0),
+                session_id: 1,
                 error: "test error".to_string(),
             },
             None,
@@ -6359,6 +6927,244 @@ mod tests {
         let msg = app.status_message.as_ref().unwrap();
         assert_eq!(msg.level, app::StatusLevel::Error);
         assert!(msg.text.contains("test error"));
+    }
+
+    #[tokio::test]
+    async fn test_claude_error_event_dropped_when_session_id_mismatches() {
+        // uradori裏取りで確認済みの回帰: ClaudeError も ClaudeOutput と同じ
+        // resolve_session_key ゲートを使うが、mismatch時の破棄が未検証だった。
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeError {
+                worktree_id: (0, 0),
+                session_id: 999, // sessions[(0,0)] の id=1 と一致しない
+                error: "should be dropped".to_string(),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        assert!(
+            app.status_message.is_none(),
+            "session_id不一致のClaudeErrorは破棄されるべき"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claude_error_event_finds_shifted_session_key() {
+        // worktree削除のreindexでsessionsのキーが(0,1)→(0,0)にシフトしていても、
+        // session_id一致で正しいキーへ処理されることを確認する
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![ProjectConfig {
+                name: "test-project".to_string(),
+                path: "/tmp/test-project".to_string(),
+                display_name: None,
+                worktrees: vec![
+                    WorktreeConfig {
+                        name: "feature-a".to_string(),
+                        branch: "feature/a".to_string(),
+                    },
+                    WorktreeConfig {
+                        name: "feature-b".to_string(),
+                        branch: "feature/b".to_string(),
+                    },
+                ],
+            }],
+        };
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeError {
+                // reader task は reindex 前の古い worktree_id=(0,1) を送り続ける想定
+                worktree_id: (0, 1),
+                session_id: 1, // 実際は id=1（現在キー (0,0)）に属する
+                error: "shifted error".to_string(),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let msg = app.status_message.as_ref().expect("shift後も処理されるべき");
+        assert_eq!(msg.level, app::StatusLevel::Error);
+        assert!(msg.text.contains("shifted error"));
+    }
+
+    #[tokio::test]
+    async fn test_claude_complete_event_dropped_when_session_id_mismatches() {
+        // uradori裏取りで確認済みの回帰: ClaudeCompleteはresolve_session_keyが失敗した
+        // 場合、PR再取得タスクをspawnしてはならない
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeComplete {
+                worktree_id: (0, 0),
+                session_id: 999, // sessions[(0,0)] の id=1 と一致しない
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            received.is_err() || received.unwrap().is_none(),
+            "session_id不一致時はPR再取得タスクがspawnされてはならない"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claude_complete_event_finds_shifted_session_key() {
+        // worktree削除のreindexでsessionsのキーがシフトしていても、
+        // session_id一致で正しいキー(現在のworktree)に対してPR再取得タスクがspawnされる
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![ProjectConfig {
+                name: "test-project".to_string(),
+                path: "/tmp/test-project".to_string(),
+                display_name: None,
+                worktrees: vec![
+                    WorktreeConfig {
+                        name: "feature-a".to_string(),
+                        branch: "feature/a".to_string(),
+                    },
+                    WorktreeConfig {
+                        name: "feature-b".to_string(),
+                        branch: "feature/b".to_string(),
+                    },
+                ],
+            }],
+        };
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::ClaudeComplete {
+                // reader task は reindex 前の古い worktree_id=(0,1) を送り続ける想定
+                worktree_id: (0, 1),
+                session_id: 1, // 実際は id=1（現在キー (0,0)）に属する
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(2000), rx.recv())
+            .await
+            .expect("shift後もPR再取得タスクがspawnされるべき")
+            .expect("channelが閉じていないこと");
+        match received {
+            event::AppEvent::PrInfo { worktree_id, .. } => {
+                assert_eq!(worktree_id, (0, 0), "解決済みキー(0,0)に対してspawnされるべき");
+            }
+            other => panic!("PrInfoイベントが来るべきところ別のイベントが来た: {:?}", other),
+        }
     }
 
     // --- 左パネルキーの状態遷移テスト ---
@@ -7989,6 +8795,445 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_terminal_key_direct_hit() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+        let emu = spawn_dummy_term(&tx, wt_id, 0);
+        let id = emu.id();
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_id, 0), emu);
+
+        let key = resolve_terminal_key(&terminals, wt_id, 0, id);
+        assert_eq!(key, Some((wt_id, 0)));
+    }
+
+    #[test]
+    fn test_resolve_terminal_key_finds_after_worktree_shift() {
+        // worktree 削除の reindex で terminals のキーの worktree_id 側がシフトしても、
+        // reader thread が送り続ける古い worktree_id では発見できてはならない
+        // （直接キー引きは失敗するが、terminal_id のみの全体走査で救う）
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_old: app::WorktreeId = (0, 3);
+        let wt_new: app::WorktreeId = (0, 2);
+
+        let emu = spawn_dummy_term(&tx, wt_old, 0);
+        let id = emu.id();
+
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_new, 0), emu);
+
+        let key = resolve_terminal_key(&terminals, wt_old, 0, id);
+        assert_eq!(key, Some((wt_new, 0)));
+    }
+
+    #[test]
+    fn test_resolve_terminal_key_none_for_dropped() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+        let other = spawn_dummy_term(&tx, wt_id, 0);
+        let other_id = other.id();
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_id, 0), other);
+
+        let dropped_id = other_id + 999;
+        let key = resolve_terminal_key(&terminals, wt_id, 0, dropped_id);
+        assert_eq!(key, None);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_event_finds_shifted_terminal_key() {
+        // uradori裏取りで確認済みの回帰: resolve_terminal_key 自体の純粋関数テストは
+        // あったが、実際に配線されている handle_event 経由の統合テストが無かった。
+        // worktree 削除の reindex で terminals のキーがシフトしていても、
+        // AppEvent::TerminalOutput 経由で正しい実体へ process() されることを確認する。
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_old: app::WorktreeId = (0, 3); // reader thread が保持し続ける古い worktree_id
+        let wt_new: app::WorktreeId = (0, 2); // reindex 後の実際の格納先
+        let emu = spawn_dummy_term(&tx, wt_old, 0);
+        let terminal_id = emu.id();
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_new, 0), emu);
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::TerminalOutput {
+                worktree_id: wt_old,
+                tab_index: 0,
+                terminal_id,
+                data: b"hello-shifted".to_vec(),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let emu = terminals.get(&(wt_new, 0)).expect("shifted key should exist");
+        assert!(
+            emu.screen().contents().contains("hello-shifted"),
+            "reindex後の正しいキー({:?})へ process() されるべき",
+            (wt_new, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_output_event_dropped_when_terminal_id_mismatches() {
+        // terminal_id が一致しない場合、イベントは黙って破棄され画面は変化しない
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_id: app::WorktreeId = (0, 0);
+        let emu = spawn_dummy_term(&tx, wt_id, 0);
+        let terminal_id = emu.id();
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_id, 0), emu);
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::TerminalOutput {
+                worktree_id: wt_id,
+                tab_index: 0,
+                terminal_id: terminal_id + 999,
+                data: b"should-not-appear".to_vec(),
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let emu = terminals.get(&(wt_id, 0)).unwrap();
+        assert!(!emu.screen().contents().contains("should-not-appear"));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_exited_event_finds_shifted_terminal_key() {
+        // TerminalExited も TerminalOutput と同じ resolve_terminal_key ゲートを使うため、
+        // reindex 後のシフトを経ても正しい実体へ mark_exited() されることを確認する
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut left_panel = LeftPanel::new();
+        let mut source_tree = SourceTree::new();
+        let mut diff_view = DiffView::new();
+        let mut local_changes = ui::diff_view::LocalChangesView::new();
+        let mut history_view = ui::history_view::HistoryView::new();
+        let mut sessions = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_old: app::WorktreeId = (0, 3);
+        let wt_new: app::WorktreeId = (0, 2);
+        let emu = spawn_dummy_term(&tx, wt_old, 0);
+        let terminal_id = emu.id();
+        let mut terminals = HashMap::new();
+        terminals.insert((wt_new, 0), emu);
+        let mut claude_terms = HashMap::new();
+        let mut siki_init_terminal = None;
+
+        handle_event(
+            &mut app,
+            &mut left_panel,
+            &mut source_tree,
+            &mut diff_view,
+            &mut local_changes,
+            &mut history_view,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            &mut siki_init_terminal,
+            &tx,
+            "/bin/sh",
+            event::AppEvent::TerminalExited {
+                worktree_id: wt_old,
+                tab_index: 0,
+                terminal_id,
+            },
+            None,
+            &None,
+            &test_broker_db(),
+        )
+        .await;
+
+        let emu = terminals.get(&(wt_new, 0)).expect("shifted key should exist");
+        assert!(!emu.is_alive(), "reindex後の正しいキーへ mark_exited() されるべき");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_key_direct_hit() {
+        // ClaudeSession::new_for_test は tokio::process::Command を使うため
+        // Tokio ランタイム上で実行する必要がある
+        let wt_id: app::WorktreeId = (0, 0);
+        let session = claude::ClaudeSession::new_for_test(1);
+        let mut sessions = HashMap::new();
+        sessions.insert(wt_id, session);
+
+        let key = resolve_session_key(&sessions, wt_id, 1);
+        assert_eq!(key, Some(wt_id));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_key_finds_after_worktree_shift() {
+        // worktree 削除の reindex で sessions のキーがシフトしても、
+        // 古い worktree_id では発見できず、session_id のみの全体走査で救う
+        let wt_old: app::WorktreeId = (0, 2);
+        let wt_new: app::WorktreeId = (0, 1);
+        let session = claude::ClaudeSession::new_for_test(5);
+        let mut sessions = HashMap::new();
+        sessions.insert(wt_new, session);
+
+        let key = resolve_session_key(&sessions, wt_old, 5);
+        assert_eq!(key, Some(wt_new));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_key_ignores_worktree_id_mismatch() {
+        // 別worktreeのsessionしか無くても、session_idが一致すればそちらを返す
+        // （シフト後に別の実在worktreeへ誤って書き込むことを防ぐための前提）
+        let wt_a: app::WorktreeId = (0, 0);
+        let wt_b: app::WorktreeId = (0, 1);
+        let mut sessions = HashMap::new();
+        sessions.insert(wt_a, claude::ClaudeSession::new_for_test(1));
+        sessions.insert(wt_b, claude::ClaudeSession::new_for_test(2));
+
+        let key = resolve_session_key(&sessions, wt_b, 1);
+        assert_eq!(key, Some(wt_a));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_key_none_for_unknown_id() {
+        let wt_id: app::WorktreeId = (0, 0);
+        let mut sessions = HashMap::new();
+        sessions.insert(wt_id, claude::ClaudeSession::new_for_test(1));
+
+        let key = resolve_session_key(&sessions, wt_id, 999);
+        assert_eq!(key, None);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_project_maps_shifts_later_projects() {
+        // project_index=1 を削除した想定。project_index=2 だったエントリはすべて
+        // project_index=1 のキーへ移動し、project_index=0 は変化しない
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        sessions.insert((2, 0), claude::ClaudeSession::new_for_test(2));
+
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        terminals.insert(((0, 0), 0), spawn_dummy_term(&tx, (0, 0), 0));
+        terminals.insert(((2, 1), 0), spawn_dummy_term(&tx, (2, 1), 0));
+
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert(((2, 0), 0), spawn_dummy_term(&tx, (2, 0), CLAUDE_TAB_BASE));
+
+        reindex_project_maps(&mut sessions, &mut terminals, &mut claude_terms, 1);
+
+        assert!(sessions.contains_key(&(0, 0)), "project_index=0 は変化しない");
+        assert!(!sessions.contains_key(&(2, 0)), "旧キーは残らない");
+        assert!(sessions.contains_key(&(1, 0)), "project_index=2 → 1 へシフトする");
+
+        assert!(terminals.contains_key(&((0, 0), 0)));
+        assert!(!terminals.contains_key(&((2, 1), 0)));
+        assert!(terminals.contains_key(&((1, 1), 0)));
+
+        assert!(!claude_terms.contains_key(&((2, 0), 0)));
+        assert!(claude_terms.contains_key(&((1, 0), 0)));
+    }
+
+    #[tokio::test]
+    async fn test_reindex_project_maps_noop_when_removing_last_project() {
+        // 末尾プロジェクト削除時はシフト対象が存在せず、何も変化しない（境界値 EDGE-101）
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        sessions.insert((1, 0), claude::ClaudeSession::new_for_test(2));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+
+        reindex_project_maps(&mut sessions, &mut terminals, &mut claude_terms, 1);
+
+        assert!(sessions.contains_key(&(0, 0)));
+        assert!(sessions.contains_key(&(1, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_reindex_project_maps_noop_with_single_project() {
+        // プロジェクトが1件のみの状態で削除する場合、シフト対象がなく正常終了する（EDGE-102）
+        let mut sessions = HashMap::new();
+        sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+
+        reindex_project_maps(&mut sessions, &mut terminals, &mut claude_terms, 0);
+
+        assert!(sessions.contains_key(&(0, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_reindex_project_maps_preserves_all_entries_on_multi_shift() {
+        // uradori裏取りで確認済みの回帰テスト: 削除位置より後ろに project_index が
+        // 2件以上連続してシフトする場合、HashMap の反復順序次第で
+        // insert が既存の未処理エントリを上書きし、データが消失/誤配置しうる。
+        // 10件のシフト対象を用意し、反復順序に依存せず全件が正しい新キーへ
+        // 移動することを保証する。
+        let mut sessions = HashMap::new();
+        for i in 1..=10u64 {
+            sessions.insert((i as usize, 0), claude::ClaudeSession::new_for_test(i));
+        }
+
+        reindex_project_maps(&mut sessions, &mut HashMap::new(), &mut HashMap::new(), 0);
+
+        assert_eq!(sessions.len(), 10, "10件のセッションが1件も消失してはならない");
+        for i in 1..=10u64 {
+            let key = ((i - 1) as usize, 0);
+            match sessions.get(&key) {
+                Some(s) => assert_eq!(
+                    s.id(),
+                    i,
+                    "key {:?} には元id={} のセッションが入っているべき",
+                    key,
+                    i
+                ),
+                None => panic!("key {:?} (元project_index={}) が消失している", key, i),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reindex_worktree_maps_preserves_all_entries_on_multi_shift() {
+        // reindex_project_maps と同型のバグが reindex_worktree_maps にも存在する
+        // （uradori裏取りで構造的に同一と確認）。10件の worktree_index シフトを
+        // 用意し、反復順序に依存せず全件が正しい新キーへ移動することを保証する。
+        let mut sessions = HashMap::new();
+        for i in 1..=10u64 {
+            sessions.insert((0, i as usize), claude::ClaudeSession::new_for_test(i));
+        }
+
+        reindex_worktree_maps(&mut sessions, &mut HashMap::new(), &mut HashMap::new(), 0, 0);
+
+        assert_eq!(sessions.len(), 10, "10件のセッションが1件も消失してはならない");
+        for i in 1..=10u64 {
+            let key = (0, (i - 1) as usize);
+            match sessions.get(&key) {
+                Some(s) => assert_eq!(
+                    s.id(),
+                    i,
+                    "key {:?} には元id={} のセッションが入っているべき",
+                    key,
+                    i
+                ),
+                None => panic!("key {:?} (元worktree_index={}) が消失している", key, i),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_project_confirm_reindexes_later_projects() {
+        // 3プロジェクト構成で中間（project_index=1）を削除すると、後続プロジェクト
+        // （project_index=2 だった "web"）の sessions が (1, 0) にシフトし、
+        // selected_worktree も (2,0) → (1,0) に補正される（REQ-102, REQ-103）
+        let config = Config {
+            siki: SikiConfig {
+                shell: Some("/bin/sh".to_string()),
+                ..Default::default()
+            },
+            projects: vec![
+                ProjectConfig {
+                    name: "siki".to_string(),
+                    path: "/tmp/test-siki".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "b0".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "api".to_string(),
+                    path: "/tmp/test-api".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "b0".to_string(),
+                    }],
+                },
+                ProjectConfig {
+                    name: "web".to_string(),
+                    path: "/tmp/test-web".to_string(),
+                    display_name: None,
+                    worktrees: vec![WorktreeConfig {
+                        name: "wt0".to_string(),
+                        branch: "b0".to_string(),
+                    }],
+                },
+            ],
+        };
+        let mut app = app::App::new(&config);
+        app.show_remove_project_confirm = true;
+        app.remove_project_target = Some(1); // "api" (project_index=1) を削除
+        app.selected_worktree = Some((2, 0)); // "web" を選択中だった
+
+        let mut sessions = HashMap::new();
+        sessions.insert((2, 0), claude::ClaudeSession::new_for_test(9));
+        let mut terminals = HashMap::new();
+        let mut claude_terms = HashMap::new();
+
+        let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        handle_remove_project_confirm_key(
+            &mut app,
+            &mut sessions,
+            &mut terminals,
+            &mut claude_terms,
+            key,
+        );
+
+        assert_eq!(app.projects.len(), 2);
+        assert_eq!(app.projects[1].name, "web");
+        assert!(sessions.contains_key(&(1, 0)), "project_index=2 → 1 へシフトする");
+        assert!(!sessions.contains_key(&(2, 0)), "旧キーは残らない");
+        assert_eq!(
+            app.selected_worktree,
+            Some((1, 0)),
+            "selected_worktree も project_index シフトに追従する"
+        );
+    }
+
+    #[test]
     fn test_resolve_claude_term_key_direct_hit() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let wt_id: app::WorktreeId = (0, 0);
@@ -8033,7 +9278,31 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_claude_term_key_isolates_worktrees() {
+    fn test_resolve_claude_term_key_finds_across_worktree_shift() {
+        // worktree 削除による reindex_worktree_maps/reindex_project_maps で
+        // emulator の実キーの worktree_id 側がシフトすることがある（Bug A）。
+        // reader thread は spawn 時の古い worktree_id を送り続けるため、
+        // key.0 の一致に絞らず terminal_id のみで発見できなければならない（REQ-004）。
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let wt_old: app::WorktreeId = (0, 3); // reader thread が保持し続ける古い worktree_id
+        let wt_new: app::WorktreeId = (0, 2); // reindex 後の実際の格納先
+
+        let emu = spawn_dummy_term(&tx, wt_old, CLAUDE_TAB_BASE);
+        let id = emu.id();
+
+        let mut claude_terms = HashMap::new();
+        // reindex_worktree_maps 相当: (wt_old, 0) → (wt_new, 0) へ移動済みの状態を再現
+        claude_terms.insert((wt_new, 0), emu);
+
+        // イベントは古い wt_old のまま届くが、terminal_id 一致で wt_new を発見できる
+        let key = resolve_claude_term_key(&claude_terms, wt_old, 0, id);
+        assert_eq!(key, Some((wt_new, 0)));
+    }
+
+    #[test]
+    fn test_resolve_claude_term_key_ignores_worktree_id_mismatch() {
+        // 別 worktree の emulator しか存在しない場合でも、terminal_id が一致すれば
+        // その emulator を返す（worktree_id はもはやヒントに過ぎない、REQ-004）。
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let wt_a: app::WorktreeId = (0, 0);
         let wt_b: app::WorktreeId = (0, 1);
@@ -8046,8 +9315,27 @@ mod tests {
         claude_terms.insert((wt_a, 0), emu_a);
         claude_terms.insert((wt_b, 0), emu_b);
 
-        // wt_b で id_a を問い合わせても、別 worktree の emulator は返さない
         let key = resolve_claude_term_key(&claude_terms, wt_b, 0, id_a);
-        assert_eq!(key, None);
+        assert_eq!(key, Some((wt_a, 0)));
+    }
+
+    #[test]
+    fn test_resolve_claude_term_key_handles_combined_tab_and_worktree_shift() {
+        // EDGE-001: 同一 worktree 内での Ctrl+W によるタブ整理（claude_idx シフト）と、
+        // 別 worktree 削除による worktree_id シフトが同時に絡んでも解決できる。
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // reader thread は spawn 時の古い worktree_id=(0,3) と古い claude_idx=1 を
+        // 送り続ける想定（Ctrl+W でタブ1が閉じられタブ0に詰められ、かつ worktree 削除で
+        // (0,3) → (0,2) にシフト済み）
+        let wt_old: app::WorktreeId = (0, 3);
+        let wt_new: app::WorktreeId = (0, 2);
+
+        let emu = spawn_dummy_term(&tx, wt_old, CLAUDE_TAB_BASE + 1);
+        let id = emu.id();
+        let mut claude_terms = HashMap::new();
+        claude_terms.insert((wt_new, 0), emu);
+
+        let key = resolve_claude_term_key(&claude_terms, wt_old, 1, id);
+        assert_eq!(key, Some((wt_new, 0)));
     }
 }
