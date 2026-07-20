@@ -201,8 +201,20 @@ impl WorktreeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // worktree が存在しない場合は手動でディレクトリ削除を試行
+            // worktree が存在しない場合は手動でディレクトリ削除を試行。
+            // ただしパス自体が symlink の場合は remove_dir_all がリンク先の実体を
+            // 再帰削除してしまうため拒否する（多層防御。呼び出し側の workspaces 検証が
+            // 漏れても外部ディレクトリを消さない）。
             if worktree_path.exists() {
+                let is_symlink = std::fs::symlink_metadata(&worktree_path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if is_symlink {
+                    anyhow::bail!(
+                        "worktree パスが symlink のため削除を中止しました（リンク先の誤削除防止）: {}",
+                        worktree_path.display()
+                    );
+                }
                 std::fs::remove_dir_all(&worktree_path)
                     .with_context(|| {
                         format!("worktree ディレクトリの削除に失敗: {}", worktree_path.display())
@@ -572,6 +584,26 @@ mod tests {
         // 存在しない worktree の削除 → エラーにならない（ディレクトリも存在しないため）
         let result = WorktreeManager::remove_worktree(project_path, &wt_dest);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_remove_worktree_refuses_symlink_and_keeps_target() {
+        // worktree パスが外部ディレクトリへの symlink の場合、git worktree remove は
+        // 失敗し、fallback の remove_dir_all がリンク先の実体を消してはならない。
+        let repo = init_test_repo();
+        let project_path = repo.path();
+
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("data.txt");
+        fs::write(&victim, "IMPORTANT").unwrap();
+
+        let link = project_path.join("evil-link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let result = WorktreeManager::remove_worktree(project_path, &link);
+        assert!(result.is_err(), "symlink 経由の削除はエラーにすべき");
+        assert!(victim.exists(), "リンク先の実体が削除されてはならない");
     }
 
     #[test]

@@ -69,8 +69,13 @@ siki [OPTIONS] [COMMAND]
 
 | Command | Description |
 |---------|-------------|
-| `siki` | Launch the TUI |
-| `siki list` | List all projects and worktrees |
+| `siki` | Launch the TUI (narrows to the current project when run inside one) |
+| `siki new [proj] [name] [--base <ref>]` | Create a worktree (prompts for missing args) |
+| `siki run [proj] [name] [--base <ref>] [--resume] [-- <llm args>]` | Launch the LLM in a worktree (creates it if missing) |
+| `siki sw [proj] [name]` | Pick a worktree (branch / PR# / ● active session) and open a subshell there |
+| `siki rm [proj] [name] [--yes]` | Remove a worktree (confirms unless `--yes`) |
+| `siki path <proj> <name>` | Print the worktree's absolute path |
+| `siki list [proj] [--all]` | List projects and worktrees (narrows to the current project inside one) |
 | `siki mcp` | Start MCP stdio server (for Claude Code integration) |
 
 ### Options

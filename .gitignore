@@ -1,6 +1,6 @@
 /target
+/docs
 *.swp
 *.swo
 *~
 .DS_Store
-/docs
