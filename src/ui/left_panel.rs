@@ -82,6 +82,17 @@ impl LeftPanel {
         }
     }
 
+    /// カーソル位置から所属プロジェクトの index を解決する。
+    ///
+    /// プロジェクト行ならその index、worktree 行でもその worktree が属する
+    /// プロジェクトの index を返す（REQ-106）。エントリが無ければ None。
+    pub fn resolve_project_index(&self, entries: &[ListEntry]) -> Option<usize> {
+        match self.current_entry(entries)? {
+            ListEntry::Project { index } => Some(*index),
+            ListEntry::Worktree { project_index, .. } => Some(*project_index),
+        }
+    }
+
     /// Worktree を選択する（カーソルが worktree 行にある場合）
     pub fn select_worktree(&self, entries: &[ListEntry]) -> Option<WorktreeId> {
         match self.current_entry(entries)? {
@@ -436,6 +447,38 @@ mod tests {
 
         panel.clamp_cursor(5);
         assert_eq!(panel.cursor_index, 2); // そのまま
+    }
+
+    #[test]
+    fn resolve_project_from_project_row() {
+        // プロジェクト行カーソルではその index を返す
+        let entries = vec![
+            ListEntry::Project { index: 0 },
+            ListEntry::Worktree { project_index: 0, worktree_index: 0 },
+            ListEntry::Project { index: 1 },
+        ];
+        let mut panel = LeftPanel::new();
+        panel.cursor_index = 2; // Project 1
+        assert_eq!(panel.resolve_project_index(&entries), Some(1));
+    }
+
+    #[test]
+    fn resolve_project_from_worktree_row() {
+        // worktree 行カーソルでも所属 project の index を返す（REQ-106）
+        let entries = vec![
+            ListEntry::Project { index: 0 },
+            ListEntry::Worktree { project_index: 0, worktree_index: 0 },
+            ListEntry::Worktree { project_index: 0, worktree_index: 1 },
+        ];
+        let mut panel = LeftPanel::new();
+        panel.cursor_index = 2; // worktree (project 0)
+        assert_eq!(panel.resolve_project_index(&entries), Some(0));
+    }
+
+    #[test]
+    fn resolve_project_none_when_empty() {
+        let panel = LeftPanel::new();
+        assert_eq!(panel.resolve_project_index(&[]), None);
     }
 
     #[test]

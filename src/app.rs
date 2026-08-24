@@ -424,6 +424,16 @@ pub struct App {
     pub grep_view_cursor: usize,
     /// grep 結果ビューのスクロールオフセット
     pub grep_view_scroll: usize,
+    /// プロジェクト別エージェント監視ポップアップ表示中か（REQ-003）
+    pub show_agent_popup: bool,
+    /// 対象プロジェクトの index（左ペイン projects の添字, REQ-106）
+    pub agent_popup_project_index: usize,
+    /// プロジェクト別ポップアップのスクロール位置（REQ-301）
+    pub agent_popup_scroll: usize,
+    /// 全体エージェント監視ダッシュボード表示中か（REQ-004）
+    pub show_agent_dashboard: bool,
+    /// 全体ダッシュボードのスクロール位置（REQ-301）
+    pub agent_dashboard_scroll: usize,
     pub running: bool,
     /// 点滅タイマーカウンタ（Tick毎にインクリメント、5回で1周期）
     pub blink_counter: u8,
@@ -536,6 +546,11 @@ impl App {
             show_grep_results_view: false,
             grep_view_cursor: 0,
             grep_view_scroll: 0,
+            show_agent_popup: false,
+            agent_popup_project_index: 0,
+            agent_popup_scroll: 0,
+            show_agent_dashboard: false,
+            agent_dashboard_scroll: 0,
             running: true,
             blink_counter: 0,
             blink_phase: true,
