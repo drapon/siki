@@ -277,6 +277,7 @@ pub fn get_pending_messages(
         "SELECT id, from_session, content, message_type, metadata, created_at
          FROM messages
          WHERE read_at IS NULL
+           AND message_type NOT IN ('dispatch', 'spawn_request')
            AND (to_session = ?1
                 OR to_worktree = ?2
                 OR to_project = ?3
@@ -294,6 +295,54 @@ pub fn get_pending_messages(
             message_type: row.get(3)?,
             metadata: row.get(4)?,
             created_at: row.get(5)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// dispatch専用の未読メッセージを取得する
+///
+/// 通常の保留メッセージ配信（get_pending_messages / SessionStart hook）とは
+/// 独立した経路で、TUI の Tick が対象 worktree の PTY へ自動投入するために使う。
+pub fn get_pending_dispatches(conn: &Connection) -> Result<Vec<DispatchRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, to_worktree, to_project, content
+         FROM messages
+         WHERE read_at IS NULL AND message_type = 'dispatch'
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(DispatchRow {
+            id: row.get(0)?,
+            to_worktree: row.get(1)?,
+            to_project: row.get(2)?,
+            content: row.get(3)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// spawn_request 専用の未読メッセージを取得する
+pub fn get_pending_spawn_requests(conn: &Connection) -> Result<Vec<SpawnRequestRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, to_project, content
+         FROM messages
+         WHERE read_at IS NULL AND message_type = 'spawn_request'
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SpawnRequestRow {
+            id: row.get(0)?,
+            to_project: row.get(1)?,
+            content: row.get(2)?,
         })
     })?;
     let mut result = Vec::new();
@@ -385,6 +434,25 @@ pub struct MessageRow {
     pub message_type: String,
     pub metadata: Option<String>,
     pub created_at: i64,
+}
+
+/// dispatch 専用の取得行
+///
+/// to_worktree / to_project は dispatch 挿入時に必ずセットされるはずだが、
+/// DB 上は NULL を許容するため防御的に Option のまま扱う。
+#[derive(Debug, Clone)]
+pub struct DispatchRow {
+    pub id: i64,
+    pub to_worktree: Option<String>,
+    pub to_project: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpawnRequestRow {
+    pub id: i64,
+    pub to_project: Option<String>,
+    pub content: String,
 }
 
 // ── conversation_logs ──
@@ -684,6 +752,97 @@ mod tests {
 
         let msgs = get_pending_messages(&conn, "s2", "wt", "proj").unwrap();
         assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn test_get_pending_dispatches_returns_dispatch_only() {
+        let conn = test_db();
+        let dispatch_id =
+            insert_message(&conn, "s1", None, Some("child-a"), Some("myapp"), "do X", "dispatch", None).unwrap();
+        insert_message(&conn, "s1", None, Some("child-a"), Some("myapp"), "hello", "message", None).unwrap();
+
+        let dispatches = get_pending_dispatches(&conn).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].id, dispatch_id);
+        assert_eq!(dispatches[0].to_worktree.as_deref(), Some("child-a"));
+        assert_eq!(dispatches[0].to_project.as_deref(), Some("myapp"));
+        assert_eq!(dispatches[0].content, "do X");
+    }
+
+    #[test]
+    fn test_get_pending_dispatches_excludes_read_rows() {
+        let conn = test_db();
+        let id = insert_message(&conn, "s1", None, Some("child-a"), Some("myapp"), "do X", "dispatch", None)
+            .unwrap();
+        mark_messages_read(&conn, &[id]).unwrap();
+
+        let dispatches = get_pending_dispatches(&conn).unwrap();
+        assert!(dispatches.is_empty());
+    }
+
+    #[test]
+    fn test_get_pending_dispatches_orders_by_created_at() {
+        let conn = test_db();
+        // created_at を明示指定するため insert_message を使わず直接 INSERT する
+        conn.execute(
+            "INSERT INTO messages (from_session, to_worktree, to_project, content, message_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["s1", "child-b", "myapp", "second", "dispatch", 20_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (from_session, to_worktree, to_project, content, message_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["s1", "child-a", "myapp", "first", "dispatch", 10_i64],
+        )
+        .unwrap();
+
+        let dispatches = get_pending_dispatches(&conn).unwrap();
+        let contents: Vec<&str> = dispatches.iter().map(|d| d.content.as_str()).collect();
+        assert_eq!(contents, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn test_get_pending_messages_excludes_dispatch_rows() {
+        let conn = test_db();
+        insert_message(&conn, "s1", None, Some("osaka"), Some("myapp"), "dispatch prompt", "dispatch", None)
+            .unwrap();
+        insert_message(&conn, "s1", None, Some("osaka"), Some("myapp"), "normal message", "message", None)
+            .unwrap();
+
+        let msgs = get_pending_messages(&conn, "s2", "osaka", "myapp").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message_type, "message");
+        assert_eq!(msgs[0].content, "normal message");
+    }
+
+    #[test]
+    fn test_get_pending_spawn_requests_returns_spawn_request_only() {
+        let conn = test_db();
+        let spawn_id =
+            insert_message(&conn, "s1", None, None, Some("myapp"), "{}", "spawn_request", None).unwrap();
+        insert_message(&conn, "s1", None, Some("osaka"), Some("myapp"), "normal", "message", None)
+            .unwrap();
+
+        let rows = get_pending_spawn_requests(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, spawn_id);
+        assert_eq!(rows[0].to_project.as_deref(), Some("myapp"));
+        assert_eq!(rows[0].content, "{}");
+    }
+
+    #[test]
+    fn test_get_pending_messages_excludes_spawn_request_rows() {
+        let conn = test_db();
+        insert_message(&conn, "s1", None, None, Some("myapp"), "spawn", "spawn_request", None)
+            .unwrap();
+        insert_message(&conn, "s1", None, None, Some("myapp"), "normal", "message", None)
+            .unwrap();
+
+        let msgs = get_pending_messages(&conn, "s2", "osaka", "myapp").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message_type, "message");
+        assert_eq!(msgs[0].content, "normal");
     }
 
     #[test]

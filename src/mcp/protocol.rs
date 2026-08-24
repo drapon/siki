@@ -70,8 +70,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "scope": {
                         "type": "string",
-                        "enum": ["machine", "project", "worktree"],
-                        "description": "Filter scope for the returned sessions (default: project). 'machine' = all worktrees/projects on this machine, 'project' = current project, 'worktree' = current worktree only."
+                        "enum": ["machine", "project", "worktree", "children"],
+                        "description": "Filter scope for the returned sessions (default: project). 'machine' = all worktrees/projects on this machine, 'project' = current project, 'worktree' = current worktree only, 'children' = sessions of the caller's descendant worktrees."
                     },
                     "include_bodies": {
                         "type": "boolean",
@@ -97,6 +97,62 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "message": { "type": "string" }
                 },
                 "required": ["target", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "dispatch".to_string(),
+            description: "Send a prompt to a worktree's Claude terminal for fully-automatic injection (no human approval step, TUI Tick delivers it)".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["worktree", "subtree"] },
+                            "id": { "type": "string", "description": "worktree名（typeがsubtreeの場合は指揮者worktree名）" }
+                        },
+                        "required": ["type", "id"]
+                    },
+                    "prompt": { "type": "string" }
+                },
+                "required": ["target", "prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "move_worktree".to_string(),
+            description: "Move a worktree under a new parent in the caller's project, or detach it by passing parent: null".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "child": {
+                        "type": "string",
+                        "description": "付け替え対象の子worktree名（呼び出し元と同一project内）"
+                    },
+                    "parent": {
+                        "type": ["string", "null"],
+                        "description": "新しい親worktree名。nullで独立化"
+                    }
+                },
+                "required": ["child"]
+            }),
+        },
+        ToolDefinition {
+            name: "spawn_child_worktree".to_string(),
+            description: "Request creation of a child worktree under a parent in the caller's project. TUI Tick processes the request asynchronously.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "parent": {
+                        "type": "string",
+                        "description": "生成した子の親とするworktree名（通常は呼び出し元自身）"
+                    },
+                    "branch": { "type": "string" },
+                    "worktree_name": {
+                        "type": "string",
+                        "description": "省略時は既存のworktree名自動採番規則に従う"
+                    }
+                },
+                "required": ["parent", "branch"]
             }),
         },
         ToolDefinition {
@@ -264,7 +320,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -273,8 +329,32 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"list_sessions"));
         assert!(names.contains(&"send_message"));
+        assert!(names.contains(&"dispatch"));
+        assert!(names.contains(&"move_worktree"));
+        assert!(names.contains(&"spawn_child_worktree"));
         assert!(names.contains(&"broadcast"));
         assert!(names.contains(&"set_summary"));
         assert!(names.contains(&"handoff"));
+    }
+
+    #[test]
+    fn test_dispatch_tool_schema_includes_subtree_target_type() {
+        // "subtree" は Phase 2 で実装されるが、スキーマ変更を避けるため enum には先行して含める
+        let tools = tool_definitions();
+        let dispatch = tools.iter().find(|t| t.name == "dispatch").unwrap();
+        let enum_values =
+            &dispatch.input_schema["properties"]["target"]["properties"]["type"]["enum"];
+        let values = enum_values.as_array().unwrap();
+        assert!(values.contains(&serde_json::json!("worktree")));
+        assert!(values.contains(&serde_json::json!("subtree")));
+    }
+
+    #[test]
+    fn test_list_sessions_tool_schema_includes_children_scope() {
+        let tools = tool_definitions();
+        let list_sessions = tools.iter().find(|t| t.name == "list_sessions").unwrap();
+        let enum_values = &list_sessions.input_schema["properties"]["scope"]["enum"];
+        let values = enum_values.as_array().unwrap();
+        assert!(values.contains(&serde_json::json!("children")));
     }
 }

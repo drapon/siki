@@ -20,6 +20,7 @@ mod ui;
 
 use anyhow::Result;
 use config::load_config;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,167 @@ type TerminalKey = (app::WorktreeId, usize);
 /// Claude ターミナルを識別する特殊なタブインデックスの基底値
 /// 実際のタブインデックス = CLAUDE_TAB_BASE + claude_tab_index
 const CLAUDE_TAB_BASE: usize = usize::MAX - 100;
+const DISPATCH_RETRY_LIMIT: u32 = 30;
+const PARENT_SYNC_INTERVAL_TICKS: u8 = 10;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchAction {
+    MarkReadAndClear,
+    IncrementRetry(u32),
+    MarkReadAndAlert,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpawnRequestPayload {
+    parent: String,
+    branch: String,
+    worktree_name: Option<String>,
+}
+
+fn decide_dispatch_action(
+    is_resolved: bool,
+    is_alive: bool,
+    write_ok: bool,
+    retry_count: u32,
+    limit: u32,
+) -> DispatchAction {
+    if is_resolved && is_alive && write_ok {
+        return DispatchAction::MarkReadAndClear;
+    }
+
+    let next_count = retry_count.saturating_add(1);
+    if next_count >= limit {
+        DispatchAction::MarkReadAndAlert
+    } else {
+        DispatchAction::IncrementRetry(next_count)
+    }
+}
+
+fn sync_worktree_parents_from_meta(app: &mut app::App) {
+    for project in &mut app.projects {
+        let Some(meta) = config::load_project_meta(&project.name) else {
+            continue;
+        };
+        for worktree in &mut project.worktrees {
+            let parent = meta
+                .worktrees
+                .get(&worktree.name)
+                .and_then(|wt_meta| wt_meta.parent.clone());
+            if worktree.parent != parent {
+                worktree.parent = parent;
+            }
+        }
+    }
+}
+
+fn process_spawn_requests(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    conn: &rusqlite::Connection,
+) {
+    let Ok(requests) = db::get_pending_spawn_requests(conn) else {
+        return;
+    };
+    for request in requests {
+        handle_spawn_request(app, terminals, event_tx, shell, &request);
+        let _ = db::mark_messages_read(conn, &[request.id]);
+    }
+}
+
+fn handle_spawn_request(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    request: &db::SpawnRequestRow,
+) {
+    let Some(project_name) = request.to_project.as_deref() else {
+        app.show_error("spawn_request の project が未指定です".to_string());
+        return;
+    };
+    let Some(project_index) = app.projects.iter().position(|p| p.name == project_name) else {
+        app.show_error(format!("spawn_request の project が見つかりません: {}", project_name));
+        return;
+    };
+    let payload = match serde_json::from_str::<SpawnRequestPayload>(&request.content) {
+        Ok(payload) => payload,
+        Err(e) => {
+            app.show_error(format!("spawn_request のJSON解析に失敗: {}", e));
+            return;
+        }
+    };
+    if !app.projects[project_index]
+        .worktrees
+        .iter()
+        .any(|w| w.name == payload.parent)
+    {
+        app.show_error(format!("spawn_request の親worktreeが見つかりません: {}", payload.parent));
+        return;
+    }
+    let worktree_name = resolve_spawn_worktree_name(app, project_index, payload.worktree_name);
+    if spawn_worktree_name_exists(app, project_index, &worktree_name) {
+        app.show_error(format!("spawn_request のworktree名が重複しています: {}", worktree_name));
+        return;
+    }
+    if let Err(e) = create_worktree_internal(
+        app, terminals, event_tx, shell,
+        project_index, &worktree_name, &payload.branch, None, false, None, Some(&payload.parent),
+    ) {
+        app.show_error(e);
+    }
+}
+
+fn resolve_spawn_worktree_name(
+    app: &app::App,
+    project_index: usize,
+    requested: Option<String>,
+) -> String {
+    if let Some(name) = requested {
+        return name;
+    }
+    let existing_names: Vec<String> = app.projects[project_index]
+        .worktrees
+        .iter()
+        .map(|w| w.name.clone())
+        .collect();
+    config::generate_worktree_name(&existing_names)
+}
+
+fn spawn_worktree_name_exists(app: &app::App, project_index: usize, worktree_name: &str) -> bool {
+    let project = &app.projects[project_index];
+    project.worktrees.iter().any(|w| w.name == worktree_name)
+        || config::worktree_path(&project.name, worktree_name).exists()
+}
+
+fn detach_children_of_removed_worktree(app: &mut app::App, pi: usize, removed_name: &str) {
+    let Some(project) = app.projects.get(pi) else {
+        return;
+    };
+    let project_name = project.name.clone();
+    let Some(meta) = config::load_project_meta(&project_name) else {
+        return;
+    };
+
+    let children: Vec<String> = meta
+        .worktrees
+        .iter()
+        .filter(|(_, wt_meta)| wt_meta.parent.as_deref() == Some(removed_name))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    for child_name in &children {
+        // EDGE-002（同時競合の整合性）はスコープ外。ここでは panic しないことのみ担保する。
+        let _ = config::save_worktree_parent(&project_name, child_name, None);
+    }
+
+    for worktree in &mut app.projects[pi].worktrees {
+        if children.iter().any(|child_name| child_name == &worktree.name) {
+            worktree.parent = None;
+        }
+    }
+}
 
 /// reader thread が spawn 時に保持した tab_index/worktree_id に対応する terminals の key を返す。
 ///
@@ -233,6 +395,7 @@ async fn main() -> Result<()> {
     let mut terminals: HashMap<TerminalKey, terminal::TerminalEmulator> = HashMap::new();
     let mut claude_terms: HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator> =
         HashMap::new();
+    let mut dispatch_retry_counts: HashMap<i64, u32> = HashMap::new();
     let mut siki_init_terminal: Option<terminal::TerminalEmulator> = None;
 
     // セッションレジストリ・DB・broker の起動
@@ -410,6 +573,7 @@ async fn main() -> Result<()> {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &event_tx,
             &shell,
@@ -443,6 +607,7 @@ async fn handle_event(
     sessions: &mut HashMap<app::WorktreeId, claude::ClaudeSession>,
     terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
     claude_terms: &mut HashMap<(app::WorktreeId, usize), terminal::TerminalEmulator>,
+    dispatch_retry_counts: &mut HashMap<i64, u32>,
     siki_init_terminal: &mut Option<terminal::TerminalEmulator>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
     shell: &str,
@@ -615,6 +780,10 @@ async fn handle_event(
             }
             if app.show_archive_confirm {
                 handle_archive_confirm_key(app, sessions, terminals, claude_terms, event_tx, shell, left_panel, key);
+                return;
+            }
+            if app.show_move_worktree_popup {
+                handle_move_worktree_popup_key(app, key);
                 return;
             }
             if app.show_remove_project_confirm {
@@ -955,7 +1124,7 @@ async fn handle_event(
                 return;
             }
             // その他のポップアップ表示中はマウスイベント無視
-            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings || app.show_context_list || app.show_context_name_popup || app.show_context_url_popup {
+            if app.show_message_popup || app.show_add_worktree_popup || app.show_add_project_popup || app.show_rename_project_popup || app.show_archive_confirm || app.show_move_worktree_popup || app.show_remove_project_confirm || app.show_siki_json_confirm || app.show_skill_name_popup || app.show_skill_edit_popup || app.show_skill_list || app.show_symlink_settings || app.show_context_list || app.show_context_name_popup || app.show_context_url_popup {
                 return;
             }
             match mouse.kind {
@@ -1247,7 +1416,7 @@ async fn handle_event(
                                 if target_index < entries.len() {
                                     left_panel.cursor_index = target_index;
                                     match &entries[target_index] {
-                                        ui::left_panel::ListEntry::Worktree { project_index, worktree_index } => {
+                                        ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. } => {
                                             let wt_id = (*project_index, *worktree_index);
                                             app.selected_worktree = Some(wt_id);
                                             app.focused_panel = app::Panel::Main;
@@ -1787,6 +1956,60 @@ async fn handle_event(
                     }
                 }
             }
+            // project.json の親リンク変更（MCP move_worktree 等の別プロセス由来）を
+            // インメモリへ反映する（毎Tickでは IO 過剰なため間引く）
+            app.parent_sync_counter = app.parent_sync_counter.wrapping_add(1);
+            if app.parent_sync_counter >= PARENT_SYNC_INTERVAL_TICKS {
+                app.parent_sync_counter = 0;
+                sync_worktree_parents_from_meta(app);
+            }
+            if let Ok(conn) = broker_db.lock() {
+                if let Ok(dispatches) = db::get_pending_dispatches(&conn) {
+                    for d in dispatches {
+                        let (Some(to_wt), Some(to_proj)) = (&d.to_worktree, &d.to_project) else {
+                            continue;
+                        };
+                        let mut is_resolved = false;
+                        let mut is_alive = false;
+                        let mut write_ok = false;
+                        if let Some(wt_id) = app.find_worktree_id(to_proj, to_wt) {
+                            is_resolved = true;
+                            if let Some(emu) = claude_terms.get_mut(&(wt_id, 0)) {
+                                is_alive = emu.is_alive();
+                                if is_alive {
+                                    let msg = format!("{}\n", d.content);
+                                    write_ok = emu.write(msg.as_bytes()).is_ok();
+                                }
+                            }
+                        }
+                        let retry_count = *dispatch_retry_counts.get(&d.id).unwrap_or(&0);
+                        match decide_dispatch_action(
+                            is_resolved,
+                            is_alive,
+                            write_ok,
+                            retry_count,
+                            DISPATCH_RETRY_LIMIT,
+                        ) {
+                            DispatchAction::MarkReadAndClear => {
+                                let _ = db::mark_messages_read(&conn, &[d.id]);
+                                dispatch_retry_counts.remove(&d.id);
+                            }
+                            DispatchAction::IncrementRetry(next_count) => {
+                                dispatch_retry_counts.insert(d.id, next_count);
+                            }
+                            DispatchAction::MarkReadAndAlert => {
+                                let _ = db::mark_messages_read(&conn, &[d.id]);
+                                dispatch_retry_counts.remove(&d.id);
+                                app.show_error(format!(
+                                    "dispatch配送に失敗しました（{}回リトライ後に断念）: {} -> {}",
+                                    DISPATCH_RETRY_LIMIT, to_proj, to_wt
+                                ));
+                            }
+                        }
+                    }
+                }
+                process_spawn_requests(app, terminals, event_tx, shell, &conn);
+            }
         }
     }
 }
@@ -2191,50 +2414,19 @@ fn trimmed_or_none(input: &str) -> Option<String> {
     }
 }
 
-/// worktree 作成の共通処理（モード問わず）
-fn finalize_add_worktree(
-    app: &mut app::App,
-    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
-    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
-    shell: &str,
-    branch: &str,
-    start_point: Option<&str>,
-    no_track: bool,
+fn new_worktree_entry(
+    wt_name: &str,
     display_name: Option<&str>,
-) {
-    let pi = app.add_worktree_project_index;
-    let wt_name = app.add_worktree_name.clone();
-
-    let project_name = app.projects[pi].name.clone();
-    let project_path = app.projects[pi].path.clone();
-    let wt_path = config::worktree_path(&project_name, &wt_name);
-
-    let shared_dirs = config::load_effective_shared_dirs(&project_name);
-
-    if let Err(e) = git::WorktreeManager::create_worktree_from_ref(
-        &project_path,
-        &wt_path,
-        branch,
-        start_point,
-        no_track,
-        &shared_dirs,
-    ) {
-        app.show_error(format!("worktree の作成に失敗: {}", e));
-        app.show_add_worktree_popup = false;
-        app.add_worktree_input.clear();
-        app.add_worktree_branch_filter.clear();
-        app.add_worktree_display_input.clear();
-        app.add_worktree_display_focus = false;
-        app.add_worktree_mode = app::AddWorktreeMode::NewBranch;
-        return;
-    }
-
-    // メモリ上に worktree を追加
-    app.projects[pi].worktrees.push(app::Worktree {
-        name: wt_name.clone(),
+    parent: Option<&str>,
+    branch: &str,
+    wt_path: std::path::PathBuf,
+) -> app::Worktree {
+    app::Worktree {
+        name: wt_name.to_string(),
         display_name: display_name.map(|s| s.to_string()),
+        parent: parent.map(|s| s.to_string()),
         branch: branch.to_string(),
-        path: wt_path.clone(),
+        path: wt_path,
         chat_history: Vec::new(),
         open_files: Vec::new(),
         active_tab: 0,
@@ -2249,7 +2441,49 @@ fn finalize_add_worktree(
         claude_session_id: None,
         context_items: Vec::new(),
         context_cursor: 0,
-    });
+    }
+}
+
+/// worktree 作成のコア処理（状態レス）
+fn create_worktree_internal(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    project_index: usize,
+    worktree_name: &str,
+    branch: &str,
+    start_point: Option<&str>,
+    no_track: bool,
+    display_name: Option<&str>,
+    parent: Option<&str>,
+) -> std::result::Result<(), String> {
+    let pi = project_index;
+    let wt_name = worktree_name.to_string();
+    let project_name = app.projects[pi].name.clone();
+    let project_path = app.projects[pi].path.clone();
+    let wt_path = config::worktree_path(&project_name, &wt_name);
+    let shared_dirs = config::load_effective_shared_dirs(&project_name);
+
+    if let Err(e) = git::WorktreeManager::create_worktree_from_ref(
+        &project_path,
+        &wt_path,
+        branch,
+        start_point,
+        no_track,
+        &shared_dirs,
+    ) {
+        return Err(format!("worktree の作成に失敗: {}", e));
+    }
+
+    // メモリ上に worktree を追加
+    app.projects[pi].worktrees.push(new_worktree_entry(
+        &wt_name,
+        display_name,
+        parent,
+        branch,
+        wt_path.clone(),
+    ));
 
     // PR 情報を非同期取得
     let wi = app.projects[pi].worktrees.len() - 1;
@@ -2277,6 +2511,15 @@ fn finalize_add_worktree(
         }
     }
 
+    // 親リンクが指定されていれば project.json に永続化
+    if let Some(parent_name) = parent {
+        if let Err(e) =
+            config::save_worktree_parent(&project_name, &wt_name, Some(parent_name))
+        {
+            app.show_error(format!("親リンクの保存に失敗: {}", e));
+        }
+    }
+
     // setup スクリプトがあれば実行（siki.json 優先、なければ project.json）
     let wi = app.projects[pi].worktrees.len() - 1;
     let wt_id = (pi, wi);
@@ -2288,6 +2531,30 @@ fn finalize_add_worktree(
                 wt_id, setup_script, &wt_name, &wt_path,
             );
         }
+    }
+
+    Ok(())
+}
+
+/// worktree 作成の共通処理（モード問わず）
+fn finalize_add_worktree(
+    app: &mut app::App,
+    terminals: &mut HashMap<TerminalKey, terminal::TerminalEmulator>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<event::AppEvent>,
+    shell: &str,
+    branch: &str,
+    start_point: Option<&str>,
+    no_track: bool,
+    display_name: Option<&str>,
+) {
+    let pi = app.add_worktree_project_index;
+    let wt_name = app.add_worktree_name.clone();
+
+    if let Err(e) = create_worktree_internal(
+        app, terminals, event_tx, shell,
+        pi, &wt_name, branch, start_point, no_track, display_name, None,
+    ) {
+        app.show_error(e);
     }
 
     app.show_add_worktree_popup = false;
@@ -2825,7 +3092,7 @@ fn handle_left_panel_key(
         }
         KeyCode::Char('r') => {
             // worktree 行にカーソルがある場合のみ run スクリプトを実行
-            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) =
+            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) =
                 left_panel.current_entry(&entries)
             {
                 let pi = *project_index;
@@ -2853,7 +3120,7 @@ fn handle_left_panel_key(
         }
         KeyCode::Char('d') => {
             match left_panel.current_entry(&entries) {
-                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) => {
+                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) => {
                     app.archive_target = Some((*project_index, *worktree_index));
                     app.show_archive_confirm = true;
                 }
@@ -2862,6 +3129,26 @@ fn handle_left_panel_key(
                     app.show_remove_project_confirm = true;
                 }
                 None => {}
+            }
+        }
+        KeyCode::Char('M') => {
+            if let Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) =
+                left_panel.current_entry(&entries)
+            {
+                let pi = *project_index;
+                let wi = *worktree_index;
+                let mut candidates = vec![None];
+                candidates.extend(
+                    app.projects[pi]
+                        .worktrees
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, _)| if i == wi { None } else { Some(Some(i)) }),
+                );
+                app.move_worktree_target = Some((pi, wi));
+                app.move_worktree_candidates = candidates;
+                app.move_worktree_cursor = 0;
+                app.show_move_worktree_popup = true;
             }
         }
         KeyCode::Char('F') => {
@@ -3008,7 +3295,7 @@ fn handle_left_panel_key(
                     app.rename_project_input = current_display;
                     app.show_rename_project_popup = true;
                 }
-                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index }) => {
+                Some(ui::left_panel::ListEntry::Worktree { project_index, worktree_index, .. }) => {
                     let pi = *project_index;
                     let wi = *worktree_index;
                     let current_display = app.projects[pi].worktrees[wi]
@@ -4562,6 +4849,73 @@ fn handle_remove_project_confirm_key(
     }
 }
 
+/// worktree 親付け替えポップアップのキー処理
+fn handle_move_worktree_popup_key(
+    app: &mut app::App,
+    key: crossterm::event::KeyEvent,
+) {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if app.move_worktree_cursor + 1 < app.move_worktree_candidates.len() {
+                app.move_worktree_cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.move_worktree_cursor = app.move_worktree_cursor.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if move_worktree_to_selected_parent(app).is_ok() {
+                close_move_worktree_popup(app);
+            }
+        }
+        KeyCode::Esc => {
+            close_move_worktree_popup(app);
+        }
+        _ => {}
+    }
+}
+
+fn move_worktree_to_selected_parent(app: &mut app::App) -> anyhow::Result<()> {
+    let (pi, wi) = app
+        .move_worktree_target
+        .ok_or_else(|| anyhow::anyhow!("move target is missing"))?;
+    let Some(candidate) = app.move_worktree_candidates.get(app.move_worktree_cursor).cloned() else {
+        return Ok(());
+    };
+
+    let project_name = app.projects[pi].name.clone();
+    let child = app.projects[pi].worktrees[wi].name.clone();
+    let parent = candidate.map(|parent_wi| app.projects[pi].worktrees[parent_wi].name.clone());
+
+    if let Some(ref p) = parent {
+        if config::would_create_cycle(&project_name, &child, p) {
+            app.show_error(format!("circular parent link: {} -> {}", child, p));
+            return Err(anyhow::anyhow!("circular parent link"));
+        }
+    }
+
+    if let Err(err) = config::save_worktree_parent(&project_name, &child, parent.as_deref()) {
+        app.show_error(format!("親の付け替えに失敗: {}", err));
+        return Err(err);
+    }
+
+    app.projects[pi].worktrees[wi].parent = parent.clone();
+    match parent {
+        Some(p) => app.show_info(format!("{} を {} の配下に移動しました", child, p)),
+        None => app.show_info(format!("{} を独立化しました", child)),
+    }
+    Ok(())
+}
+
+fn close_move_worktree_popup(app: &mut app::App) {
+    app.show_move_worktree_popup = false;
+    app.move_worktree_target = None;
+    app.move_worktree_candidates.clear();
+    app.move_worktree_cursor = 0;
+}
+
 /// アーカイブ確認ダイアログのキー処理
 fn handle_archive_confirm_key(
     app: &mut app::App,
@@ -4616,6 +4970,8 @@ fn handle_archive_confirm_key(
                 for key in claude_keys {
                     claude_terms.remove(&key);
                 }
+
+                detach_children_of_removed_worktree(app, pi, &wt_name);
 
                 // project.json から worktree メタデータを削除
                 let _ = config::save_worktree_display_name(&app.projects[pi].name, &wt_name, None);
@@ -5730,6 +6086,308 @@ mod tests {
         Arc::new(Mutex::new(db::init(std::path::Path::new(":memory:")).unwrap()))
     }
 
+    fn init_git_repo() -> tempfile::TempDir {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let project_path = temp_dir.path();
+        std::process::Command::new("git").args(["init"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["config", "user.name", "Test"]).current_dir(project_path).output().unwrap();
+        std::fs::write(project_path.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git").args(["add", "."]).current_dir(project_path).output().unwrap();
+        std::process::Command::new("git").args(["commit", "-m", "initial"]).current_dir(project_path).output().unwrap();
+        temp_dir
+    }
+
+    struct TestProjectMeta {
+        name: String,
+    }
+
+    impl TestProjectMeta {
+        fn new(suffix: &str) -> Self {
+            let name = format!("task-0006-main-{}-{}", std::process::id(), suffix);
+            let _ = config::remove_project_meta(&name);
+            config::save_project_meta(&name, std::path::Path::new("/tmp/siki-task-0006-main")).unwrap();
+            Self { name }
+        }
+    }
+
+    impl Drop for TestProjectMeta {
+        fn drop(&mut self) {
+            let _ = config::remove_project_meta(&self.name);
+        }
+    }
+
+    fn config_with_worktrees(project_name: &str, worktree_names: &[&str]) -> Config {
+        Config {
+            siki: SikiConfig::default(),
+            projects: vec![ProjectConfig {
+                name: project_name.to_string(),
+                path: "/tmp/siki-task-0006-main".to_string(),
+                display_name: None,
+                worktrees: worktree_names
+                    .iter()
+                    .map(|name| WorktreeConfig {
+                        name: name.to_string(),
+                        branch: format!("feature/{}", name),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn config_with_project_path(project_name: &str, project_path: String) -> Config {
+        Config {
+            siki: SikiConfig::default(),
+            projects: vec![ProjectConfig {
+                name: project_name.to_string(),
+                path: project_path,
+                display_name: None,
+                worktrees: vec![WorktreeConfig {
+                    name: "feature".to_string(),
+                    branch: "main".to_string(),
+                }],
+            }],
+        }
+    }
+
+    fn worktree_parent(app: &app::App, name: &str) -> Option<String> {
+        app.projects[0]
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.name == name)
+            .and_then(|worktree| worktree.parent.clone())
+    }
+
+    #[tokio::test]
+    async fn create_worktree_internal_works_without_popup_state_and_sets_parent() {
+        let temp_dir = init_git_repo();
+        let project_name = format!("task-0009-create-parent-{}", std::process::id());
+        let _ = config::remove_project_meta(&project_name);
+        config::save_project_meta(&project_name, temp_dir.path()).unwrap();
+        let config = config_with_project_path(&project_name, temp_dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = create_worktree_internal(
+            &mut app, &mut terminals, &tx, "/bin/sh",
+            0, "child", "feature/child", None, false, None, Some("feature"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(app.projects[0].worktrees.len(), 2);
+        let child = app.projects[0].worktrees.last().unwrap();
+        assert_eq!(child.name, "child");
+        assert_eq!(child.parent.as_deref(), Some("feature"));
+        let meta = config::load_worktree_meta(&project_name, "child").unwrap();
+        assert_eq!(meta.parent.as_deref(), Some("feature"));
+        let _ = git::WorktreeManager::remove_worktree(temp_dir.path(), &config::worktree_path(&project_name, "child"));
+        let _ = config::remove_project_meta(&project_name);
+    }
+
+    #[tokio::test]
+    async fn create_worktree_internal_with_no_parent_does_not_write_parent_meta() {
+        let temp_dir = init_git_repo();
+        let project_name = format!("task-0009-create-no-parent-{}", std::process::id());
+        let _ = config::remove_project_meta(&project_name);
+        config::save_project_meta(&project_name, temp_dir.path()).unwrap();
+        let config = config_with_project_path(&project_name, temp_dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = create_worktree_internal(
+            &mut app, &mut terminals, &tx, "/bin/sh",
+            0, "child", "feature/no-parent", None, false, None, None,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(worktree_parent(&app, "child"), None);
+        assert!(config::load_worktree_meta(&project_name, "child").is_none());
+        let _ = git::WorktreeManager::remove_worktree(temp_dir.path(), &config::worktree_path(&project_name, "child"));
+        let _ = config::remove_project_meta(&project_name);
+    }
+
+    #[tokio::test]
+    async fn create_worktree_internal_returns_err_without_pushing_on_git_failure() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let project_name = format!("task-0009-create-fail-{}", std::process::id());
+        let _ = config::remove_project_meta(&project_name);
+        config::save_project_meta(&project_name, temp_dir.path()).unwrap();
+        let config = config_with_project_path(&project_name, temp_dir.path().to_string_lossy().to_string());
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let initial_count = app.projects[0].worktrees.len();
+
+        let result = create_worktree_internal(
+            &mut app, &mut terminals, &tx, "/bin/sh",
+            0, "child", "feature/fail", None, false, None, Some("feature"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(app.projects[0].worktrees.len(), initial_count);
+        assert!(config::load_worktree_meta(&project_name, "child").is_none());
+        let _ = config::remove_project_meta(&project_name);
+    }
+
+    #[test]
+    fn process_spawn_requests_marks_read_for_unknown_project() {
+        let conn = db::init(std::path::Path::new(":memory:")).unwrap();
+        db::insert_message(
+            &conn,
+            "s1",
+            None,
+            None,
+            Some("missing-project"),
+            r#"{"parent":"feature","branch":"feature/x","worktree_name":"child"}"#,
+            "spawn_request",
+            None,
+        )
+        .unwrap();
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        process_spawn_requests(&mut app, &mut terminals, &tx, "/bin/sh", &conn);
+
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, app::StatusLevel::Error);
+        assert!(msg.text.contains("project が見つかりません"));
+    }
+
+    #[test]
+    fn process_spawn_requests_marks_read_for_invalid_json() {
+        let conn = db::init(std::path::Path::new(":memory:")).unwrap();
+        db::insert_message(
+            &conn,
+            "s1",
+            None,
+            None,
+            Some("test-project"),
+            "{not-json",
+            "spawn_request",
+            None,
+        )
+        .unwrap();
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        process_spawn_requests(&mut app, &mut terminals, &tx, "/bin/sh", &conn);
+
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, app::StatusLevel::Error);
+        assert!(msg.text.contains("JSON解析に失敗"));
+    }
+
+    #[test]
+    fn process_spawn_requests_marks_read_for_missing_parent() {
+        let conn = db::init(std::path::Path::new(":memory:")).unwrap();
+        db::insert_message(
+            &conn,
+            "s1",
+            None,
+            None,
+            Some("test-project"),
+            r#"{"parent":"missing","branch":"feature/x","worktree_name":"child"}"#,
+            "spawn_request",
+            None,
+        )
+        .unwrap();
+        let config = sample_config();
+        let mut app = app::App::new(&config);
+        let mut terminals = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        process_spawn_requests(&mut app, &mut terminals, &tx, "/bin/sh", &conn);
+
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+        assert_eq!(app.projects[0].worktrees.len(), 1);
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, app::StatusLevel::Error);
+        assert!(msg.text.contains("親worktreeが見つかりません"));
+    }
+
+    #[test]
+    fn detach_children_of_removed_worktree_clears_project_meta_and_memory() {
+        let project = TestProjectMeta::new("detach-children");
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        let config = config_with_worktrees(&project.name, &["A", "B", "C"]);
+        let mut app = app::App::new(&config);
+
+        detach_children_of_removed_worktree(&mut app, 0, "A");
+
+        let b_meta = config::load_worktree_meta(&project.name, "B").unwrap();
+        let c_meta = config::load_worktree_meta(&project.name, "C").unwrap();
+        assert_eq!(b_meta.parent, None);
+        assert_eq!(c_meta.parent, None);
+        assert_eq!(worktree_parent(&app, "B"), None);
+        assert_eq!(worktree_parent(&app, "C"), None);
+    }
+
+    #[test]
+    fn detach_children_of_removed_worktree_keeps_unrelated_parents() {
+        let project = TestProjectMeta::new("keep-unrelated");
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        config::save_worktree_parent(&project.name, "D", None).unwrap();
+        let config = config_with_worktrees(&project.name, &["A", "B", "C", "D"]);
+        let mut app = app::App::new(&config);
+
+        detach_children_of_removed_worktree(&mut app, 0, "D");
+
+        assert_eq!(
+            config::load_worktree_meta(&project.name, "B").unwrap().parent.as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            config::load_worktree_meta(&project.name, "C").unwrap().parent.as_deref(),
+            Some("B")
+        );
+        assert_eq!(worktree_parent(&app, "B").as_deref(), Some("A"));
+        assert_eq!(worktree_parent(&app, "C").as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn test_decide_dispatch_action_marks_read_on_success() {
+        assert_eq!(
+            decide_dispatch_action(true, true, true, 0, DISPATCH_RETRY_LIMIT),
+            DispatchAction::MarkReadAndClear
+        );
+    }
+
+    #[test]
+    fn test_decide_dispatch_action_increments_retry_for_unresolved_target() {
+        assert_eq!(
+            decide_dispatch_action(false, false, false, 0, DISPATCH_RETRY_LIMIT),
+            DispatchAction::IncrementRetry(1)
+        );
+    }
+
+    #[test]
+    fn test_decide_dispatch_action_alerts_on_retry_limit_boundary() {
+        assert_eq!(
+            decide_dispatch_action(true, false, false, 29, DISPATCH_RETRY_LIMIT),
+            DispatchAction::MarkReadAndAlert
+        );
+    }
+
+    #[test]
+    fn test_decide_dispatch_action_alerts_if_limit_reached_state_remains() {
+        assert_eq!(
+            decide_dispatch_action(false, false, false, 30, DISPATCH_RETRY_LIMIT),
+            DispatchAction::MarkReadAndAlert
+        );
+    }
+
     // --- グローバルキーの状態遷移テスト ---
 
     #[tokio::test]
@@ -5744,6 +6402,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5758,6 +6417,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5782,6 +6442,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5796,6 +6457,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5820,6 +6482,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5834,6 +6497,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5858,6 +6522,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5873,6 +6538,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5898,6 +6564,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5912,6 +6579,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5936,6 +6604,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5950,6 +6619,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -5975,6 +6645,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -5989,6 +6660,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6013,6 +6685,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6027,6 +6700,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6053,6 +6727,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6068,6 +6743,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6093,6 +6769,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6108,6 +6785,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -6133,6 +6811,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6148,6 +6827,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6172,6 +6852,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6187,6 +6868,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6214,6 +6896,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6229,6 +6912,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6253,6 +6937,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6268,6 +6953,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6294,6 +6980,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6312,6 +6999,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6336,6 +7024,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6351,6 +7040,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6378,6 +7068,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6391,6 +7082,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6427,6 +7119,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6440,6 +7133,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6497,6 +7191,7 @@ mod tests {
         sessions.insert((0, 1), claude::ClaudeSession::new_for_test(2));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6510,6 +7205,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6577,6 +7273,7 @@ mod tests {
         sessions.insert((1, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6597,6 +7294,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6652,6 +7350,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6665,6 +7364,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6696,6 +7396,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6711,6 +7412,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6751,6 +7453,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6764,6 +7467,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6839,6 +7543,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6854,6 +7559,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6897,6 +7603,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6910,6 +7617,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -6944,6 +7652,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -6957,6 +7666,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7012,6 +7722,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7025,6 +7736,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7060,6 +7772,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7073,6 +7786,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7128,6 +7842,7 @@ mod tests {
         sessions.insert((0, 0), claude::ClaudeSession::new_for_test(1));
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7141,6 +7856,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7181,6 +7897,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7195,6 +7912,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7219,6 +7937,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7235,6 +7954,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7267,6 +7987,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7287,6 +8008,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7316,6 +8038,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7341,6 +8064,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7365,6 +8089,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7389,6 +8114,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7418,6 +8144,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7433,6 +8160,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7461,6 +8189,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7476,6 +8205,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7503,6 +8233,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7516,6 +8247,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7543,6 +8275,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7556,6 +8289,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7580,6 +8314,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7595,6 +8330,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7620,6 +8356,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7635,6 +8372,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -7660,6 +8398,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7675,6 +8414,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7699,6 +8439,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7715,6 +8456,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7741,6 +8483,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7756,6 +8499,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7806,6 +8550,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7826,6 +8571,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7861,6 +8607,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7878,6 +8625,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7900,6 +8648,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7923,6 +8672,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7946,6 +8696,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7971,6 +8722,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -7999,6 +8751,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8018,6 +8771,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8046,6 +8800,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8064,6 +8819,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8091,6 +8847,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8109,6 +8866,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8136,6 +8894,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8157,6 +8916,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8180,6 +8940,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8205,6 +8966,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8228,6 +8990,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -8256,6 +9019,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8274,6 +9038,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8325,6 +9090,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8346,6 +9112,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8379,6 +9146,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8395,6 +9163,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8418,6 +9187,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8445,6 +9215,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8459,6 +9230,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8485,6 +9257,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8500,6 +9273,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8525,6 +9299,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8540,6 +9315,7 @@ mod tests {
                 &mut sessions,
                 &mut terminals,
                 &mut claude_terms,
+                &mut dispatch_retry_counts,
                 &mut siki_init_terminal,
                 &tx,
                 "/bin/sh",
@@ -8565,6 +9341,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8581,6 +9358,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8606,6 +9384,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8622,6 +9401,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8652,6 +9432,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8669,6 +9450,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8697,6 +9479,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8711,6 +9494,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8736,6 +9520,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let mut terminals = HashMap::new();
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -8758,6 +9543,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8862,6 +9648,7 @@ mod tests {
         let mut terminals = HashMap::new();
         terminals.insert((wt_new, 0), emu);
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
 
         handle_event(
@@ -8874,6 +9661,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8915,6 +9703,7 @@ mod tests {
         let mut terminals = HashMap::new();
         terminals.insert((wt_id, 0), emu);
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
 
         handle_event(
@@ -8927,6 +9716,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",
@@ -8966,6 +9756,7 @@ mod tests {
         let mut terminals = HashMap::new();
         terminals.insert((wt_new, 0), emu);
         let mut claude_terms = HashMap::new();
+        let mut dispatch_retry_counts = HashMap::new();
         let mut siki_init_terminal = None;
 
         handle_event(
@@ -8978,6 +9769,7 @@ mod tests {
             &mut sessions,
             &mut terminals,
             &mut claude_terms,
+            &mut dispatch_retry_counts,
             &mut siki_init_terminal,
             &tx,
             "/bin/sh",

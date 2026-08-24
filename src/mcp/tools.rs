@@ -32,6 +32,9 @@ pub fn execute_tool(
         "save_skill" => save_skill(params),
         "list_skills" => list_skills(params),
         "summarize_history" => summarize_history(conn, params, session_id),
+        "dispatch" => dispatch(conn, params, session_id),
+        "move_worktree" => move_worktree(conn, params, session_id),
+        "spawn_child_worktree" => spawn_child_worktree(conn, params, session_id),
         _ => anyhow::bail!("Unknown tool: {}", tool_name),
     }
 }
@@ -78,6 +81,11 @@ fn list_sessions_with_cwd(
             }
         }
     };
+    let descendants = if scope == "children" && !proj.is_empty() && !wt.is_empty() {
+        crate::config::get_descendants(&proj, &wt)
+    } else {
+        Vec::new()
+    };
 
     // scope に応じてフィルタ。enum 外の値はサイレントに machine 扱いにせず拒否する
     // （broadcast と同じコントラクト。タイポが全件返却で気付かれないのを防ぐ）。
@@ -85,6 +93,10 @@ fn list_sessions_with_cwd(
         "worktree" => all_sessions
             .iter()
             .filter(|s| !wt.is_empty() && s.worktree_name == wt && s.project_name == proj)
+            .collect(),
+        "children" => all_sessions
+            .iter()
+            .filter(|s| !proj.is_empty() && s.project_name == proj && descendants.contains(&s.worktree_name))
             .collect(),
         "project" => all_sessions
             .iter()
@@ -290,6 +302,130 @@ fn broadcast(conn: &Connection, params: &Value, from_session: &str) -> Result<Va
 
     let effective_scope = if to_project.is_some() { "project" } else { "machine" };
     Ok(json!({ "delivered": true, "scope": effective_scope }))
+}
+
+/// 指揮者worktreeから対象worktreeのClaudeターミナルへプロンプトを自動投入する。
+///
+/// DB へ message_type='dispatch' の行を INSERT するのみで、実際の PTY 書き込みは
+/// TUI 本体の Tick が担う（人間の承認ステップは挟まない）。
+fn dispatch(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
+    let target = params.get("target").ok_or_else(|| anyhow::anyhow!("target is required"))?;
+    let target_type = target
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("target.type is required"))?;
+    let target_id = target
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("target.id is required"))?;
+    let prompt = params
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("prompt is required"))?;
+
+    // 呼び出し元セッションの project_name を自己解決（list_sessions と同じパターン）
+    let all_sessions = db::list_sessions(conn)?;
+    let project_name = all_sessions
+        .iter()
+        .find(|s| s.session_id == from_session)
+        .map(|s| s.project_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("caller session not found"))?;
+
+    let targets: Vec<String> = match target_type {
+        "worktree" => vec![target_id.to_string()],
+        "subtree" => crate::config::get_descendants(&project_name, target_id),
+        _ => anyhow::bail!("Invalid target type: {}", target_type),
+    };
+
+    for wt_name in &targets {
+        db::insert_message(conn, from_session, None, Some(wt_name), Some(&project_name), prompt, "dispatch", None)?;
+    }
+
+    Ok(json!({ "dispatched": targets.len(), "targets": targets }))
+}
+
+/// 呼び出し元project内でworktreeの親リンクを付け替える。
+fn move_worktree(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
+    let child = params
+        .get("child")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("child is required"))?;
+    let parent = params.get("parent").and_then(|v| v.as_str());
+
+    let all_sessions = db::list_sessions(conn)?;
+    let project_name = all_sessions
+        .iter()
+        .find(|s| s.session_id == from_session)
+        .map(|s| s.project_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("caller session not found"))?;
+
+    if !crate::config::worktree_path(&project_name, child).exists() {
+        anyhow::bail!("child worktree not found: {}", child);
+    }
+    if let Some(p) = parent {
+        if !crate::config::worktree_path(&project_name, p).exists() {
+            anyhow::bail!("parent worktree not found: {}", p);
+        }
+        if crate::config::would_create_cycle(&project_name, child, p) {
+            anyhow::bail!("circular parent link: {} -> {}", child, p);
+        }
+    }
+
+    crate::config::save_worktree_parent(&project_name, child, parent)?;
+
+    Ok(json!({ "child": child, "parent": parent }))
+}
+
+/// 呼び出し元project内に子worktree生成要求を投入する。
+fn spawn_child_worktree(conn: &Connection, params: &Value, from_session: &str) -> Result<Value> {
+    let parent = params
+        .get("parent")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("parent is required"))?;
+    let branch = params
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("branch is required"))?;
+    let worktree_name = params.get("worktree_name").and_then(|v| v.as_str());
+
+    let all_sessions = db::list_sessions(conn)?;
+    let project_name = all_sessions
+        .iter()
+        .find(|s| s.session_id == from_session)
+        .map(|s| s.project_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("caller session not found"))?;
+
+    if !crate::config::worktree_path(&project_name, parent).exists() {
+        anyhow::bail!("parent worktree not found: {}", parent);
+    }
+    if let Some(name) = worktree_name {
+        if crate::config::worktree_path(&project_name, name).exists() {
+            anyhow::bail!("worktree already exists: {}", name);
+        }
+    }
+
+    let content = json!({
+        "parent": parent,
+        "branch": branch,
+        "worktree_name": worktree_name,
+    });
+    db::insert_message(
+        conn,
+        from_session,
+        None,
+        None,
+        Some(&project_name),
+        &content.to_string(),
+        "spawn_request",
+        None,
+    )?;
+
+    Ok(json!({
+        "requested": true,
+        "parent": parent,
+        "branch": branch,
+        "worktree_name": worktree_name,
+    }))
 }
 
 fn set_summary(conn: &Connection, params: &Value, session_id: &str) -> Result<Value> {
@@ -685,10 +821,44 @@ fn list_skills(params: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use std::path::Path;
 
     fn test_db() -> Connection {
         db::init(Path::new(":memory:")).unwrap()
+    }
+
+    fn session_worktrees(result: &Value) -> Vec<String> {
+        let mut names: Vec<String> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["worktree_name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    struct TestProject {
+        name: String,
+    }
+
+    impl TestProject {
+        fn new(suffix: &str, worktrees: &[&str]) -> Self {
+            let name = format!("task-0004-{}-{}", std::process::id(), suffix);
+            let _ = config::remove_project_meta(&name);
+            config::save_project_meta(&name, Path::new("/tmp/siki-task-0004")).unwrap();
+            for worktree in worktrees {
+                std::fs::create_dir_all(config::worktree_path(&name, worktree)).unwrap();
+            }
+            Self { name }
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = config::remove_project_meta(&self.name);
+        }
     }
 
     #[test]
@@ -988,6 +1158,51 @@ mod tests {
     }
 
     #[test]
+    fn test_list_sessions_scope_children_filters_descendants() {
+        let conn = test_db();
+        let project = TestProject::new("children-scope", &["A", "B", "C", "D"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "D", None).unwrap();
+        db::upsert_session(&conn, "sA", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        db::upsert_session(&conn, "sB", "default", "B", &project.name, "/tmp/B", "idle").unwrap();
+        db::upsert_session(&conn, "sC", "default", "C", &project.name, "/tmp/C", "idle").unwrap();
+        db::upsert_session(&conn, "sD", "default", "D", &project.name, "/tmp/D", "idle").unwrap();
+
+        let result = list_sessions(&conn, "sA", &json!({"scope": "children"})).unwrap();
+
+        assert_eq!(session_worktrees(&result), vec!["B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
+    fn test_list_sessions_scope_children_empty_for_leaf() {
+        let conn = test_db();
+        let project = TestProject::new("children-empty", &["A", "B"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        db::upsert_session(&conn, "sA", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        db::upsert_session(&conn, "sB", "default", "B", &project.name, "/tmp/B", "idle").unwrap();
+
+        let result = list_sessions(&conn, "sB", &json!({"scope": "children"})).unwrap();
+
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_list_sessions_scope_children_includes_grandchildren() {
+        let conn = test_db();
+        let project = TestProject::new("children-grandchild", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        db::upsert_session(&conn, "sA", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        db::upsert_session(&conn, "sB", "default", "B", &project.name, "/tmp/B", "idle").unwrap();
+        db::upsert_session(&conn, "sC", "default", "C", &project.name, "/tmp/C", "idle").unwrap();
+
+        let result = list_sessions(&conn, "sA", &json!({"scope": "children"})).unwrap();
+
+        assert_eq!(session_worktrees(&result), vec!["B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
     fn test_send_message_to_session() {
         let conn = test_db();
         let params = json!({
@@ -1137,6 +1352,318 @@ mod tests {
         let bg = result.get("background").expect("background pointer expected");
         // 2000 bytes → (2000 + 512) / 1024 = 2 KB
         assert_eq!(bg["conversation_summary_kb"], 2);
+    }
+
+    #[test]
+    fn test_dispatch_to_worktree_inserts_dispatch_message() {
+        let conn = test_db();
+        db::upsert_session(&conn, "parent", "default", "main", "myapp", "/tmp/main", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "worktree", "id": "child-a" },
+            "prompt": "do X"
+        });
+
+        let result = dispatch(&conn, &params, "parent").unwrap();
+        assert_eq!(result, json!({"dispatched": 1, "targets": ["child-a"]}));
+
+        let dispatches = db::get_pending_dispatches(&conn).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].to_worktree.as_deref(), Some("child-a"));
+        assert_eq!(dispatches[0].to_project.as_deref(), Some("myapp"));
+        assert_eq!(dispatches[0].content, "do X");
+
+        let message_type: String = conn
+            .query_row("SELECT message_type FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_type, "dispatch");
+    }
+
+    #[test]
+    fn test_dispatch_subtree_fans_out_to_descendants() {
+        let conn = test_db();
+        let project = TestProject::new("subtree-dispatch", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        db::upsert_session(&conn, "parent", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "subtree", "id": "A" },
+            "prompt": "do X"
+        });
+
+        let result = dispatch(&conn, &params, "parent").unwrap();
+        let mut targets: Vec<String> = result["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        targets.sort();
+
+        assert_eq!(result["dispatched"], 2);
+        assert_eq!(targets, vec!["B".to_string(), "C".to_string()]);
+        let dispatches = db::get_pending_dispatches(&conn).unwrap();
+        let mut rows: Vec<(String, String)> = dispatches
+            .iter()
+            .map(|d| (d.to_worktree.clone().unwrap(), d.content.clone()))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![
+            ("B".to_string(), "do X".to_string()),
+            ("C".to_string(), "do X".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn test_dispatch_subtree_with_no_descendants_is_noop() {
+        let conn = test_db();
+        let project = TestProject::new("subtree-empty", &["A"]);
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        db::upsert_session(&conn, "parent", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "subtree", "id": "A" },
+            "prompt": "do X"
+        });
+
+        let result = dispatch(&conn, &params, "parent").unwrap();
+
+        assert_eq!(result, json!({"dispatched": 0, "targets": []}));
+        assert!(db::get_pending_dispatches(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_dispatch_subtree_rows_are_independently_readable() {
+        let conn = test_db();
+        let project = TestProject::new("subtree-independent", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("A")).unwrap();
+        db::upsert_session(&conn, "parent", "default", "A", &project.name, "/tmp/A", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "subtree", "id": "A" },
+            "prompt": "do X"
+        });
+        dispatch(&conn, &params, "parent").unwrap();
+        let dispatches = db::get_pending_dispatches(&conn).unwrap();
+        let read_id = dispatches
+            .iter()
+            .find(|d| d.to_worktree.as_deref() == Some("B"))
+            .unwrap()
+            .id;
+
+        db::mark_messages_read(&conn, &[read_id]).unwrap();
+
+        let remaining = db::get_pending_dispatches(&conn).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].to_worktree.as_deref(), Some("C"));
+        assert_eq!(remaining[0].content, "do X");
+    }
+
+    #[test]
+    fn test_dispatch_rejects_invalid_target_type() {
+        let conn = test_db();
+        db::upsert_session(&conn, "parent", "default", "main", "myapp", "/tmp/main", "idle").unwrap();
+        let params = json!({
+            "target": { "type": "invalid", "id": "child-a" },
+            "prompt": "do X"
+        });
+        let err = dispatch(&conn, &params, "parent").unwrap_err();
+
+        assert!(
+            err.to_string().contains("Invalid target type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_requires_target_and_prompt() {
+        let conn = test_db();
+        db::upsert_session(&conn, "parent", "default", "main", "myapp", "/tmp/main", "idle").unwrap();
+
+        let missing_target = dispatch(&conn, &json!({"prompt": "do X"}), "parent").unwrap_err();
+        assert!(missing_target.to_string().contains("target is required"));
+
+        let missing_prompt = dispatch(
+            &conn,
+            &json!({"target": { "type": "worktree", "id": "child-a" }}),
+            "parent",
+        )
+        .unwrap_err();
+        assert!(missing_prompt.to_string().contains("prompt is required"));
+    }
+
+    #[test]
+    fn test_dispatch_rejects_unknown_caller_session() {
+        let conn = test_db();
+        let params = json!({
+            "target": { "type": "worktree", "id": "child-a" },
+            "prompt": "do X"
+        });
+
+        let err = dispatch(&conn, &params, "missing").unwrap_err();
+        assert!(err.to_string().contains("caller session not found"));
+    }
+
+    #[test]
+    fn test_move_worktree_sets_parent() {
+        let conn = test_db();
+        let project = TestProject::new("sets-parent", &["child", "parent"]);
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let result = move_worktree(&conn, &json!({"child": "child", "parent": "parent"}), "s1").unwrap();
+
+        assert_eq!(result, json!({"child": "child", "parent": "parent"}));
+        let meta = config::load_worktree_meta(&project.name, "child").unwrap();
+        assert_eq!(meta.parent.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn test_move_worktree_rejects_self_parent() {
+        let conn = test_db();
+        let project = TestProject::new("self-parent", &["X"]);
+        config::save_worktree_parent(&project.name, "X", None).unwrap();
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = move_worktree(&conn, &json!({"child": "X", "parent": "X"}), "s1").unwrap_err();
+
+        assert!(err.to_string().contains("circular parent link: X -> X"));
+        let meta = config::load_worktree_meta(&project.name, "X").unwrap();
+        assert_eq!(meta.parent, None);
+    }
+
+    #[test]
+    fn test_move_worktree_rejects_transitive_cycle() {
+        let conn = test_db();
+        let project = TestProject::new("transitive-cycle", &["A", "B", "C"]);
+        config::save_worktree_parent(&project.name, "A", None).unwrap();
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        config::save_worktree_parent(&project.name, "C", Some("B")).unwrap();
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = move_worktree(&conn, &json!({"child": "A", "parent": "C"}), "s1").unwrap_err();
+
+        assert!(err.to_string().contains("circular parent link: A -> C"));
+        let meta = config::load_worktree_meta(&project.name, "A").unwrap();
+        assert_eq!(meta.parent, None);
+    }
+
+    #[test]
+    fn test_move_worktree_detaches_with_null_parent() {
+        let conn = test_db();
+        let project = TestProject::new("detach", &["A", "B"]);
+        config::save_worktree_parent(&project.name, "B", Some("A")).unwrap();
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let result = move_worktree(&conn, &json!({"child": "B", "parent": null}), "s1").unwrap();
+
+        assert_eq!(result, json!({"child": "B", "parent": null}));
+        let meta = config::load_worktree_meta(&project.name, "B").unwrap();
+        assert_eq!(meta.parent, None);
+    }
+
+    #[test]
+    fn test_move_worktree_rejects_missing_child_without_creating_meta() {
+        let conn = test_db();
+        let project = TestProject::new("missing-child", &["X"]);
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = move_worktree(&conn, &json!({"child": "Y", "parent": "X"}), "s1").unwrap_err();
+
+        assert!(err.to_string().contains("child worktree not found: Y"));
+        assert!(config::load_worktree_meta(&project.name, "Y").is_none());
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_inserts_spawn_request() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-ok", &["parent"]);
+        db::upsert_session(&conn, "s1", "default", "parent", &project.name, "/tmp/parent", "idle").unwrap();
+
+        let result = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "parent", "branch": "feature/child", "worktree_name": "child"}),
+            "s1",
+        )
+        .unwrap();
+
+        assert_eq!(result, json!({
+            "requested": true,
+            "parent": "parent",
+            "branch": "feature/child",
+            "worktree_name": "child",
+        }));
+        let rows = db::get_pending_spawn_requests(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].to_project.as_deref(), Some(project.name.as_str()));
+        let content: Value = serde_json::from_str(&rows[0].content).unwrap();
+        assert_eq!(content["parent"], "parent");
+        assert_eq!(content["branch"], "feature/child");
+        assert_eq!(content["worktree_name"], "child");
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_allows_omitted_worktree_name() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-auto-name", &["parent"]);
+        db::upsert_session(&conn, "s1", "default", "parent", &project.name, "/tmp/parent", "idle").unwrap();
+
+        let result = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "parent", "branch": "feature/child"}),
+            "s1",
+        )
+        .unwrap();
+
+        assert_eq!(result["worktree_name"], Value::Null);
+        let content: Value =
+            serde_json::from_str(&db::get_pending_spawn_requests(&conn).unwrap()[0].content).unwrap();
+        assert_eq!(content["worktree_name"], Value::Null);
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_requires_parent_and_branch() {
+        let conn = test_db();
+        db::upsert_session(&conn, "s1", "default", "parent", "myapp", "/tmp/parent", "idle").unwrap();
+
+        let missing_parent = spawn_child_worktree(&conn, &json!({"branch": "feature/x"}), "s1")
+            .unwrap_err();
+        assert!(missing_parent.to_string().contains("parent is required"));
+
+        let missing_branch = spawn_child_worktree(&conn, &json!({"parent": "parent"}), "s1")
+            .unwrap_err();
+        assert!(missing_branch.to_string().contains("branch is required"));
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_rejects_missing_parent() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-missing-parent", &["main"]);
+        db::upsert_session(&conn, "s1", "default", "main", &project.name, "/tmp/main", "idle").unwrap();
+
+        let err = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "missing", "branch": "feature/x"}),
+            "s1",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("parent worktree not found: missing"));
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_spawn_child_worktree_rejects_existing_worktree_name() {
+        let conn = test_db();
+        let project = TestProject::new("spawn-existing", &["parent", "child"]);
+        db::upsert_session(&conn, "s1", "default", "parent", &project.name, "/tmp/parent", "idle").unwrap();
+
+        let err = spawn_child_worktree(
+            &conn,
+            &json!({"parent": "parent", "branch": "feature/x", "worktree_name": "child"}),
+            "s1",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("worktree already exists: child"));
+        assert!(db::get_pending_spawn_requests(&conn).unwrap().is_empty());
     }
 
     #[test]

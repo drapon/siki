@@ -228,6 +228,7 @@ pub struct PrInfo {
 pub struct Worktree {
     pub name: String,
     pub display_name: Option<String>,
+    pub parent: Option<String>,
     pub branch: String,
     pub path: PathBuf,
     pub chat_history: Vec<ChatMessage>,
@@ -304,6 +305,14 @@ pub struct App {
     pub grep_cursor: usize,
     pub show_archive_confirm: bool,
     pub archive_target: Option<WorktreeId>,
+    /// worktree 親付け替えポップアップ表示フラグ
+    pub show_move_worktree_popup: bool,
+    /// 親付け替え対象の worktree
+    pub move_worktree_target: Option<WorktreeId>,
+    /// 親候補リスト（None は親なし）
+    pub move_worktree_candidates: Vec<Option<usize>>,
+    /// 親候補リストのカーソル位置
+    pub move_worktree_cursor: usize,
     pub show_remove_project_confirm: bool,
     pub remove_project_target: Option<usize>,
     pub show_siki_json_confirm: bool,
@@ -429,6 +438,8 @@ pub struct App {
     pub blink_counter: u8,
     /// 点滅フェーズ（true: 表示、false: 非表示）
     pub blink_phase: bool,
+    /// worktree親リンク同期の間引きカウンタ（Tick毎にインクリメント）
+    pub parent_sync_counter: u8,
 }
 
 impl App {
@@ -473,6 +484,10 @@ impl App {
             grep_cursor: 0,
             show_archive_confirm: false,
             archive_target: None,
+            show_move_worktree_popup: false,
+            move_worktree_target: None,
+            move_worktree_candidates: Vec::new(),
+            move_worktree_cursor: 0,
             show_remove_project_confirm: false,
             remove_project_target: None,
             show_siki_json_confirm: false,
@@ -539,6 +554,7 @@ impl App {
             running: true,
             blink_counter: 0,
             blink_phase: true,
+            parent_sync_counter: 0,
         }
     }
 
@@ -573,6 +589,21 @@ impl App {
     pub fn selected_worktree_mut(&mut self) -> Option<&mut Worktree> {
         let (pi, wi) = self.selected_worktree?;
         self.projects.get_mut(pi)?.worktrees.get_mut(wi)
+    }
+
+    /// (project_name, worktree_name) から現在の WorktreeId を解決する（REQ-002）。
+    /// WorktreeId は add/remove で再インデックスされ不安定なため、呼び出しの都度解決すること
+    /// （キャッシュしてはならない）。
+    pub fn find_worktree_id(&self, project_name: &str, worktree_name: &str) -> Option<WorktreeId> {
+        self.projects.iter().enumerate().find_map(|(pi, p)| {
+            if p.name != project_name {
+                return None;
+            }
+            p.worktrees
+                .iter()
+                .position(|w| w.name == worktree_name)
+                .map(|wi| (pi, wi))
+        })
     }
 
     /// ステータスメッセージの自動クリア時間
@@ -700,11 +731,13 @@ impl Project {
             .worktrees
             .iter()
             .map(|wc| {
-                let display_name = config::load_worktree_meta(&pc.name, &wc.name)
-                    .and_then(|m| m.display_name);
+                let wt_meta = config::load_worktree_meta(&pc.name, &wc.name);
+                let display_name = wt_meta.as_ref().and_then(|m| m.display_name.clone());
+                let parent = wt_meta.and_then(|m| m.parent);
                 Worktree {
                 name: wc.name.clone(),
                 display_name,
+                parent,
                 branch: wc.branch.clone(),
                 path: config::worktree_path(&pc.name, &wc.name),
                 chat_history: Vec::new(),
@@ -739,6 +772,26 @@ impl Project {
 mod tests {
     use super::*;
     use crate::config::{SikiConfig, WorktreeConfig};
+    use std::path::Path;
+
+    struct TestProject {
+        name: String,
+    }
+
+    impl TestProject {
+        fn new(suffix: &str) -> Self {
+            let name = format!("task-0003-app-{}-{}", std::process::id(), suffix);
+            let _ = config::remove_project_meta(&name);
+            config::save_project_meta(&name, Path::new("/tmp/siki-task-0003-app")).unwrap();
+            Self { name }
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = config::remove_project_meta(&self.name);
+        }
+    }
 
     fn sample_config() -> Config {
         Config {
@@ -818,6 +871,28 @@ mod tests {
     }
 
     #[test]
+    fn test_project_from_config_loads_worktree_parent() {
+        let project = TestProject::new("parent-load");
+        config::save_worktree_parent(&project.name, "child", Some("A")).unwrap();
+        let config = Config {
+            siki: SikiConfig::default(),
+            projects: vec![ProjectConfig {
+                name: project.name.clone(),
+                path: "/tmp/siki-task-0003-app".to_string(),
+                display_name: None,
+                worktrees: vec![WorktreeConfig {
+                    name: "child".to_string(),
+                    branch: "feature/child".to_string(),
+                }],
+            }],
+        };
+
+        let app = App::new(&config);
+
+        assert_eq!(app.projects[0].worktrees[0].parent.as_deref(), Some("A"));
+    }
+
+    #[test]
     fn test_project_not_collapsed_by_default() {
         let config = sample_config();
         let app = App::new(&config);
@@ -888,6 +963,41 @@ mod tests {
 
         let wt = app.selected_worktree().unwrap();
         assert_eq!(wt.branch, "modified-branch");
+    }
+
+    #[test]
+    fn test_find_worktree_id_resolves_existing_worktree() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("webapp", "fix-bug"), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_find_worktree_id_returns_none_for_unknown_worktree() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("webapp", "unknown"), None);
+    }
+
+    #[test]
+    fn test_find_worktree_id_returns_none_for_unknown_project() {
+        let config = sample_config();
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("unknown-project", "feature-auth"), None);
+    }
+
+    #[test]
+    fn test_find_worktree_id_returns_none_for_empty_projects() {
+        let config = Config {
+            siki: SikiConfig::default(),
+            projects: vec![],
+        };
+        let app = App::new(&config);
+
+        assert_eq!(app.find_worktree_id("webapp", "feature-auth"), None);
     }
 
     #[test]
